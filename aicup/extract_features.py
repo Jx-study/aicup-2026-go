@@ -1,8 +1,7 @@
 """在本機 CPU 抽取棋力預測特徵，輸出 bit 打包的 .npz 分片（格式見 packed.py）
 
-產出 rank-features/{train,val}/*.npz，上傳到 Drive 的 aicup-2026/rank-features/
-後由 train_rank.py 讀取。特徵內容與切分方式和 rank-prediction.ipynb 相同，
-但檔案格式不同，教學 notebook 讀不了這些分片。
+產出 rank-features/{train,val}/*.npz。特徵內容與切分方式同 rank-prediction.ipynb，
+但檔案格式不同，notebook 讀不了。
 
 用法（在 repo 根目錄）：
     python -m aicup.extract_features                 # 全量，與 notebook 相同切分
