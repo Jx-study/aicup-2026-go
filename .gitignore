@@ -21,3 +21,6 @@ __pycache__/
 .ipynb_checkpoints/
 .vscode/
 .DS_Store
+
+# 筆記
+Note/
