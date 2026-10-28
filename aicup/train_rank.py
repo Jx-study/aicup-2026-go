@@ -1,7 +1,7 @@
 """棋力預測訓練：整份打包資料放進 GPU 記憶體，每個 batch 在 GPU 上解包。
 
 模型與預設超參數同 rank-prediction.ipynb。每個 epoch 存 last.pt，重跑自動接續。
-best_model.pth 依 val_score_pick 挑選，只存 state_dict。
+best_model.pth 依 val_score_pick 挑選，只存 state_dict；同時存 val_probs.npz 供事後分析。
 
 用法（在 repo 根目錄）：
     python -m aicup.train_rank
@@ -44,14 +44,17 @@ def parse_args():
 
 
 def load_to(split_dir, data_device):
-    """載入一個 split，打包特徵與標籤搬到 data_device，numpy 副本隨即釋放。"""
+    """載入一個 split，打包特徵與標籤搬到 data_device，特徵的 numpy 副本隨即釋放。
+
+    回傳 (x, y, meta)，meta 是 key、player_id 等其餘欄位的 numpy 陣列，順序和 x 相同。
+    """
     t0 = time.time()
     d = packed.load_split(split_dir)
     x = torch.from_numpy(d.pop('features')).to(data_device)
     y = torch.from_numpy(d['rank_idx'].astype(np.int64)).to(data_device)
     print('  %s：%s 筆，%.1f GB，%.1f 秒' % (split_dir, format(len(y), ','),
                                           x.numel() / 1024 ** 3, time.time() - t0), flush=True)
-    return x, y
+    return x, y, d
 
 
 def pick_data_device(args, device, n_bytes):
@@ -90,6 +93,7 @@ def batches(x, y, batch_size, device, order=None):
 
 
 def validate(model, x, y, args, device, amp, criterion):
+    """回傳 (指標 dict, 逐局機率 (N, 10) float32)。"""
     model.eval()
     loss_sum, batches_n, probs = 0.0, 0, []
     with torch.no_grad():
@@ -101,19 +105,32 @@ def validate(model, x, y, args, device, amp, criterion):
             probs.append(torch.softmax(out.float(), 1).cpu().numpy())
     model.train()
     probs, labels = np.concatenate(probs), y.cpu().numpy()
-    return {
+    metrics = {
         'val_loss': loss_sum / max(batches_n, 1),
         'val_acc': float((probs.argmax(1) == labels).mean() * 100),
         'val_score_argmax': score_strength(labels, probs.argmax(1)),
         'val_score_pick': score_strength(labels, pick_level(probs)),
         'val_n': len(labels),
     }
+    return metrics, probs.astype(np.float32)
 
 
 def save_atomic(obj, path):
     """先寫暫存檔再改名，存到一半斷線不會毀掉上一份 checkpoint。"""
     tmp = path + '.tmp'
     torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def save_val_probs(path, probs, meta, epoch):
+    """寫出 val 逐局機率與對應的 rank_idx、key、player_id，同樣先寫暫存檔。
+
+    epoch 是產生這份機率的 epoch（從 1 起算），和 best_model.pth 對應。
+    """
+    tmp = path + '.tmp'
+    with open(tmp, 'wb') as f:  # 傳檔案物件，避免 numpy 自動補 .npz 副檔名
+        np.savez(f, probs=probs, rank_idx=meta['rank_idx'], key=meta['key'],
+                 player_id=meta['player_id'], epoch=np.int64(epoch))
     os.replace(tmp, path)
 
 
@@ -131,8 +148,8 @@ def main():
     val_dir = os.path.join(args.feat_dir, 'val')
     data_device = pick_data_device(args, device, split_bytes(train_dir) + split_bytes(val_dir))
     print('載入資料到 %s' % data_device, flush=True)
-    x_val, y_val = load_to(val_dir, data_device)
-    x_train, y_train = load_to(train_dir, data_device)
+    x_val, y_val, val_meta = load_to(val_dir, data_device)
+    x_train, y_train, _ = load_to(train_dir, data_device)
 
     model = GoRankResNet(num_channels=args.channels, num_blocks=args.blocks,
                          num_classes=NUM_CLASSES).to(device)
@@ -153,6 +170,19 @@ def main():
         optimizer.load_state_dict(ckpt['optimizer'])
         start_epoch, history, best_score = ckpt['epoch'], ckpt['history'], ckpt['best_score']
         print('從 epoch %d 接續（目前最佳 val_score_pick %.4f）' % (start_epoch, best_score))
+
+    best_path = os.path.join(args.ckpt_dir, 'best_model.pth')
+    probs_path = os.path.join(args.ckpt_dir, 'val_probs.npz')
+    if history and os.path.exists(best_path) and not os.path.exists(probs_path):
+        # 缺 val_probs.npz 時用 best_model.pth 補寫
+        best = GoRankResNet(num_channels=args.channels, num_blocks=args.blocks,
+                            num_classes=NUM_CLASSES).to(device)
+        best.load_state_dict(torch.load(best_path, map_location=device, weights_only=True))
+        _, probs = validate(best, x_val, y_val, args, device, amp, criterion)
+        best_epoch = max(history, key=lambda r: r['val_score_pick'])['epoch']
+        save_val_probs(probs_path, probs, val_meta, best_epoch)
+        print('已用 best_model.pth（epoch %d）補寫 val_probs.npz' % best_epoch)
+        del best
 
     n_params = sum(p.numel() for p in model.parameters())
     print('device %s | data %s | amp %s | train %s / val %s | 參數量 %s'
@@ -190,7 +220,7 @@ def main():
                 break
 
         train_min = (time.time() - t0) / 60
-        metrics = validate(model, x_val, y_val, args, device, amp, criterion)
+        metrics, val_probs = validate(model, x_val, y_val, args, device, amp, criterion)
         row = {'epoch': epoch + 1, 'train_loss': loss_sum / max(steps, 1),
                'train_acc': 100 * correct / max(total, 1), **metrics,
                'train_minutes': train_min, 'total_minutes': (time.time() - t0) / 60}
@@ -202,7 +232,8 @@ def main():
         torch.save(model.state_dict(), os.path.join(args.ckpt_dir, 'epoch_%d.pth' % (epoch + 1)))
         if row['val_score_pick'] > best_score:
             best_score = row['val_score_pick']
-            save_atomic(model.state_dict(), os.path.join(args.ckpt_dir, 'best_model.pth'))
+            save_val_probs(probs_path, val_probs, val_meta, epoch + 1)
+            save_atomic(model.state_dict(), best_path)
             print('  更新 best_model.pth')
         pd.DataFrame(history).to_csv(os.path.join(args.ckpt_dir, 'history.csv'), index=False)
         # last.pt 最後寫，確保它記錄的 epoch 之前的檔案都已存好

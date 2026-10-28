@@ -1,0 +1,96 @@
+import sys
+
+import numpy as np
+import torch
+
+from aicup import packed, train_rank
+from aicup.scoring import LEVELS
+from network import GoRankResNet
+
+
+def _write_split(split_dir, n, seed):
+    rng = np.random.default_rng(seed)
+    split_dir.mkdir(parents=True)
+    rows = [{'features': rng.integers(0, 256, packed.PACKED_LEN, dtype=np.uint8),
+             'rank_idx': i % len(LEVELS), 'color': i % 2,
+             'key': '%s_g%d' % (LEVELS[i % len(LEVELS)], i), 'player_id': 'p%d' % (i // 3)}
+            for i in range(n)]
+    # 分兩片，驗證多分片時順序仍對得上
+    packed.save_shard(str(split_dir / 'a.npz'), rows[:n // 2])
+    packed.save_shard(str(split_dir / 'b.npz'), rows[n // 2:])
+
+
+def _setup(tmp_path):
+    feat = tmp_path / 'feat'
+    _write_split(feat / 'train', 16, 0)
+    _write_split(feat / 'val', 10, 1)
+    return feat, tmp_path / 'ckpt'
+
+
+def _main(monkeypatch, feat, ckpt, *extra):
+    monkeypatch.setattr(sys, 'argv', [
+        'train_rank', '--feat-dir', str(feat), '--ckpt-dir', str(ckpt),
+        '--batch-size', '4', '--channels', '8', '--blocks', '1', *extra])
+    train_rank.main()
+
+
+def _load_probs(ckpt):
+    with np.load(ckpt / 'val_probs.npz', allow_pickle=False) as z:
+        return {k: z[k] for k in z.files}
+
+
+def _recompute(weights, feat):
+    model = GoRankResNet(num_channels=8, num_blocks=1, num_classes=len(LEVELS))
+    model.load_state_dict(torch.load(weights, weights_only=True))
+    model.eval()
+    val = packed.load_split(str(feat / 'val'))
+    with torch.no_grad():
+        x = packed.unpack_torch(torch.from_numpy(val['features']))
+        return torch.softmax(model(x), 1).numpy()
+
+
+def test_val_probs_written_with_best_model(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    _main(monkeypatch, feat, ckpt, '--epochs', '1', '--no-amp')
+    saved = _load_probs(ckpt)
+    val = packed.load_split(str(feat / 'val'))
+
+    assert saved['probs'].dtype == np.float32 and saved['probs'].shape == (10, len(LEVELS))
+    np.testing.assert_allclose(saved['probs'].sum(1), 1, atol=1e-5)
+    for k in ('rank_idx', 'key', 'player_id'):
+        np.testing.assert_array_equal(saved[k], val[k])
+    assert int(saved['epoch']) == 1
+    np.testing.assert_allclose(saved['probs'], _recompute(ckpt / 'best_model.pth', feat), atol=1e-5)
+
+
+def test_val_probs_follow_best_epoch(tmp_path, monkeypatch):
+    # validate 每個 epoch 先算 argmax 再算 pick；讓 epoch 1 的 pick 最高
+    scores = iter([0.1, 0.9, 0.1, 0.2, 0.1, 0.3])
+    monkeypatch.setattr(train_rank, 'score_strength', lambda *a: next(scores))
+    feat, ckpt = _setup(tmp_path)
+    _main(monkeypatch, feat, ckpt, '--epochs', '3', '--no-amp')
+    saved = _load_probs(ckpt)
+
+    assert int(saved['epoch']) == 1
+    np.testing.assert_allclose(saved['probs'], _recompute(ckpt / 'epoch_1.pth', feat), atol=1e-5)
+    assert not np.allclose(saved['probs'], _recompute(ckpt / 'epoch_3.pth', feat), atol=1e-5)
+
+
+def test_val_probs_backfilled_on_resume(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    _main(monkeypatch, feat, ckpt, '--epochs', '1', '--no-amp')
+    (ckpt / 'val_probs.npz').unlink()
+    _main(monkeypatch, feat, ckpt, '--epochs', '1', '--no-amp')
+    saved = _load_probs(ckpt)
+
+    assert int(saved['epoch']) == 1
+    np.testing.assert_allclose(saved['probs'], _recompute(ckpt / 'best_model.pth', feat), atol=1e-5)
+
+
+def test_val_probs_with_amp(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    _main(monkeypatch, feat, ckpt, '--epochs', '1')
+    saved = _load_probs(ckpt)
+
+    assert saved['probs'].dtype == np.float32 and saved['probs'].shape == (10, len(LEVELS))
+    np.testing.assert_allclose(saved['probs'].sum(1), 1, atol=1e-3)
