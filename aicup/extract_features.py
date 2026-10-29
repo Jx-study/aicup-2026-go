@@ -52,7 +52,7 @@ def split_by_player(df, val_size):
     """
     player = df['rank'].astype(str) + '/' + df['player_id'].astype(str)
     counts = player.value_counts(sort=False)
-    order = counts.index.to_numpy()
+    order = counts.index.to_numpy().copy()  # to_numpy 和 index 共用記憶體，原地 shuffle 會打亂 counts
     np.random.default_rng(SEED).shuffle(order)
     cum = counts.loc[order].cumsum().to_numpy()
     val_players = set(order[:int(np.searchsorted(cum, val_size)) + 1])

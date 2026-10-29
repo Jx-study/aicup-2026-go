@@ -29,6 +29,16 @@ def test_split_by_player_no_overlap():
     assert 300 <= len(val) < 300 + 20  # 最多多出一位玩家的局數
 
 
+def test_split_by_player_size_with_uneven_players():
+    # 每位玩家局數不同時，累計局數要對到正確的玩家
+    rows = [{'player_id': 'p%d' % p, 'game_id': 'g_%d_%d' % (p, g),
+             'rank': 'D', 'color': 'B', 'sgf_content': ''}
+            for p in range(200) for g in range(1 + p % 7 * 30)]
+    df = pd.DataFrame(rows).sample(frac=1.0, random_state=0).reset_index(drop=True)
+    val, _ = split_by_player(df, 2000)
+    assert 2000 <= len(val) < 2000 + 181  # 最多多出一位玩家的局數
+
+
 def test_split_by_player_whole_players():
     df = _fake_df()
     val, _ = split_by_player(df, 300)
