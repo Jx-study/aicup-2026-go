@@ -1,12 +1,12 @@
 """在本機 CPU 抽取棋力預測特徵，輸出 bit 打包的 .npz 分片（格式見 packed.py）
 
-產出 rank-features/{train,val}/*.npz。特徵內容與切分方式同 rank-prediction.ipynb，
-但檔案格式不同，notebook 讀不了。
+產出 rank-features/{train,val}/*.npz。特徵內容與教學 baseline 一致，但檔案格式不同，
+教學 notebook 讀不了。預設以玩家切分驗證集，val 的玩家不會出現在 train。
 
 用法（在 repo 根目錄）：
-    python -m aicup.extract_features                 # 全量，與 notebook 相同切分
+    python -m aicup.extract_features                 # 全量，以玩家切分
     python -m aicup.extract_features --frac 0.1      # 先抽 10% 測速度
-    python -m aicup.extract_features --val-by player # 以玩家切分驗證集
+    python -m aicup.extract_features --val-by game   # 逐局切分，與教學 baseline 一致
 
 中斷後重跑同一個指令會跳過已完成的分片。換參數前要先刪除輸出目錄。
 """
@@ -22,7 +22,7 @@ import pandas as pd
 
 from aicup import packed
 
-# 與 rank-prediction.ipynb 一致
+# 與教學 baseline 一樣
 LEVELS = ['D', 'C', 'B', 'A', '1D', '2D', '3D', '4D', '5D', '6D']
 RANK_TO_ID = {lv: i for i, lv in enumerate(LEVELS)}
 COLOR_TO_ID = {'B': 0, 'W': 1}
@@ -41,7 +41,7 @@ def load_dataframe(train_dir):
 
 
 def split_by_game(df, val_size):
-    """與 notebook 相同：打亂後取前 val_size 局。"""
+    """逐局切分，與教學 baseline 一樣：打亂後取前 val_size 局，同一位玩家可能同時在 train 與 val。"""
     return df.iloc[:val_size], df.iloc[val_size:]
 
 
@@ -138,7 +138,7 @@ def main():
     ap.add_argument('--nproc', type=int, default=max(1, (os.cpu_count() or 2) - 2))
     ap.add_argument('--per-shard', type=int, default=5000)
     ap.add_argument('--frac', type=float, default=1.0, help='只取打亂後的前一部分，用來測速度')
-    ap.add_argument('--val-by', choices=('game', 'player'), default='game')
+    ap.add_argument('--val-by', choices=('game', 'player'), default='player')
     args = ap.parse_args()
 
     config = {'format': FORMAT, 'frac': args.frac, 'val_by': args.val_by, 'nproc': args.nproc,
