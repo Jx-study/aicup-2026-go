@@ -82,3 +82,46 @@ def test_load_val_probs_roundtrip(tmp_path):
     for k in meta:
         np.testing.assert_array_equal(loaded[k], meta[k])
     assert loaded['epoch'] == 3
+
+
+def test_apply_temperature():
+    p = _data()['probs']
+    np.testing.assert_allclose(eval_posthoc.apply_temperature(p, 1.0), p, rtol=1e-5)
+    flat = eval_posthoc.apply_temperature(p, 1e6)
+    np.testing.assert_allclose(flat, 1 / len(LEVELS), rtol=1e-4)
+    sharp = eval_posthoc.apply_temperature(p, 0.5)
+    np.testing.assert_array_equal(sharp.argmax(1), p.argmax(1))  # 溫度不改變單局 argmax
+    with pytest.raises(ValueError):
+        eval_posthoc.apply_temperature(p, 0)
+
+
+def test_split_players_keeps_player_together():
+    d = _data(n_players=10)
+    first = eval_posthoc.split_players(d['player_id'], d['rank_idx'], np.random.default_rng(0))
+    for p in set(d['player_id']):
+        assert len(set(first[d['player_id'] == p].tolist())) == 1
+    assert first.sum() == len(first) // 2
+
+
+def test_calibrate_log_argmax_unaffected():
+    cal = eval_posthoc.calibrate(_data(n_players=20), (0.5, 1.0, 3.0), 5, 10, 2, 0)
+    assert set(cal) == {(a, s) for a in eval_posthoc.AGGS for s in eval_posthoc.SELECTS}
+    r = cal[('log', 'argmax')]  # log 相加整體除以溫度，argmax 不變
+    assert r['after'] == pytest.approx(r['before'])
+    assert all(len(r['temps']) == 2 for r in cal.values())
+
+
+def test_calibrate_flattens_overconfident_pick():
+    # 真實等級都是 4，每局都很有把握地猜 3 或 5；log 合併在溫度 1 時被多數方帶走
+    lean_low = np.zeros(len(LEVELS))
+    lean_low[[3, 4, 5]] = [0.8, 0.15, 0.05]
+    lean_high = lean_low.copy()
+    lean_high[[3, 5]] = [0.05, 0.8]
+    rows = [lean_low, lean_low, lean_low, lean_high, lean_high] * 40
+    data = {'probs': np.clip(np.array(rows), 1e-6, None).astype(np.float32),
+            'rank_idx': np.full(len(rows), 4, np.int8), 'key': np.array(['g%d' % i for i in range(len(rows))]),
+            'player_id': np.repeat(['p%d' % i for i in range(40)], 5)}
+    cal = eval_posthoc.calibrate(data, eval_posthoc.TEMPS, 5, 5, 1, 0)
+    r = cal[('log', 'pick')]
+    assert r['before'] < 0.5 and r['after'] == pytest.approx(1.0)
+    assert all(t > 1 for t in r['temps'])
