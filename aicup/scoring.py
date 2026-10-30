@@ -67,3 +67,16 @@ def aggregate_games(game_probs, method='mean'):
         q = np.exp(logp)
         return q / q.sum()
     raise ValueError('未知的 method：%s' % method)
+
+
+def apply_temperature(probs, temp):
+    """每局機率改為 softmax(log p / temp)。
+
+    temp > 1 縮小各等級機率的差距，temp < 1 放大差距，最高的等級不變。
+    """
+    if temp <= 0:
+        raise ValueError('溫度要大於 0，收到 %g' % temp)
+    logp = np.log(np.clip(np.asarray(probs, np.float64), 1e-12, None)) / temp
+    logp -= logp.max(axis=-1, keepdims=True)
+    q = np.exp(logp)
+    return q / q.sum(axis=-1, keepdims=True)

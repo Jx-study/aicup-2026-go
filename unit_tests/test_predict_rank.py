@@ -94,3 +94,14 @@ def test_main_rejects_stale_cache(tmp_path, monkeypatch):
         '--probs', str(tmp_path / 'probs.npz')])
     with pytest.raises(SystemExit):
         predict_rank.main()
+
+
+def test_decide_temperature_changes_log_pick():
+    # 真實等級 4，每局都很有把握地猜 3 或 5；溫度 1 時被多數方帶走，調高溫度後選中間
+    lean_low = np.zeros(10)
+    lean_low[[3, 4, 5]] = [0.8, 0.15, 0.05]
+    lean_high = lean_low.copy()
+    lean_high[[3, 5]] = [0.05, 0.8]
+    probs = np.array([lean_low] * 3 + [lean_high] * 2, np.float32)
+    assert predict_rank.decide(1, [0] * 5, probs, 'log', 'pick', temp=1.0).tolist() == [3]
+    assert predict_rank.decide(1, [0] * 5, probs, 'log', 'pick', temp=8.0).tolist() == [4]

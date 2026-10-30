@@ -20,7 +20,7 @@ import itertools
 
 import numpy as np
 
-from aicup.scoring import aggregate_games, pick_level, score_strength
+from aicup.scoring import aggregate_games, apply_temperature, pick_level, score_strength
 
 AGGS = ('mean', 'log')
 SELECTS = ('argmax', 'pick')
@@ -86,16 +86,6 @@ def evaluate(data, min_games, max_games, repeats, seed):
     return {'single': single,
             'questions': {k: (float(np.mean(v)), float(np.std(v))) for k, v in scores.items()},
             'n_questions': float(np.mean(n_questions))}
-
-
-def apply_temperature(probs, temp):
-    """每局機率改為 softmax(log p / temp)；temp > 1 讓分布變平。"""
-    if temp <= 0:
-        raise ValueError('溫度要大於 0，收到 %g' % temp)
-    logp = np.log(np.clip(np.asarray(probs, np.float64), 1e-12, None)) / temp
-    logp -= logp.max(axis=-1, keepdims=True)
-    q = np.exp(logp)
-    return q / q.sum(axis=-1, keepdims=True)
 
 
 def split_players(player_id, rank_idx, rng):

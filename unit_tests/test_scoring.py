@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 
-from aicup.scoring import (LEVELS, NEAR_SCORE, aggregate_games, expected_scores,
-                     pick_level, score_strength)
+from aicup.scoring import (LEVELS, NEAR_SCORE, aggregate_games, apply_temperature,
+                     expected_scores, pick_level, score_strength)
 
 
 def test_score_exact_near_far():
@@ -79,3 +79,12 @@ def test_aggregate_mean_and_log():
 
 def test_levels_count():
     assert len(LEVELS) == 10
+
+
+def test_apply_temperature():
+    p = np.array([[0.8, 0.15, 0.05] + [0.0] * 7, [0.1] * 10])
+    np.testing.assert_allclose(apply_temperature(p, 1.0), p, atol=1e-9)
+    np.testing.assert_allclose(apply_temperature(p, 1e6), 0.1, rtol=1e-4)
+    np.testing.assert_array_equal(apply_temperature(p, 0.5).argmax(1), p.argmax(1))  # 溫度不改變單局 argmax
+    with pytest.raises(ValueError):
+        apply_temperature(p, 0)

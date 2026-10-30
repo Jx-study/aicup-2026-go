@@ -84,17 +84,6 @@ def test_load_val_probs_roundtrip(tmp_path):
     assert loaded['epoch'] == 3
 
 
-def test_apply_temperature():
-    p = _data()['probs']
-    np.testing.assert_allclose(eval_posthoc.apply_temperature(p, 1.0), p, rtol=1e-5)
-    flat = eval_posthoc.apply_temperature(p, 1e6)
-    np.testing.assert_allclose(flat, 1 / len(LEVELS), rtol=1e-4)
-    sharp = eval_posthoc.apply_temperature(p, 0.5)
-    np.testing.assert_array_equal(sharp.argmax(1), p.argmax(1))  # 溫度不改變單局 argmax
-    with pytest.raises(ValueError):
-        eval_posthoc.apply_temperature(p, 0)
-
-
 def test_split_players_keeps_player_together():
     d = _data(n_players=10)
     first = eval_posthoc.split_players(d['player_id'], d['rank_idx'], np.random.default_rng(0))

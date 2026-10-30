@@ -5,7 +5,7 @@ public 與 private 兩份題目都要預測，串接成同一份提交檔，ques
 
 用法（在 repo 根目錄）：
     !python -m aicup.predict_rank --ckpt rank-trained-models/<commit hash>/best_model.pth
-    !python -m aicup.predict_rank --ckpt ... --agg log --select argmax --probs game_probs.npz
+    !python -m aicup.predict_rank --ckpt ... --agg mean --select argmax --temp 1 --probs game_probs.npz
 """
 import argparse
 import os
@@ -15,7 +15,7 @@ from multiprocessing import Pool
 import numpy as np
 import pandas as pd
 
-from aicup.scoring import LEVELS, aggregate_games, pick_level
+from aicup.scoring import LEVELS, aggregate_games, apply_temperature, pick_level
 
 NUM_CLASSES = len(LEVELS)
 SPLITS = ('public', 'private')
@@ -87,8 +87,8 @@ def predict_games(model, sgfs, device, amp, batch_size=64, nproc=1):
     return probs
 
 
-def decide(n_questions, game_q, game_probs, agg='mean', select='pick'):
-    """合併同一題各局的機率並選等級，回傳每題的等級 index。
+def decide(n_questions, game_q, game_probs, agg='log', select='pick', temp=1.0):
+    """各局機率先以 temp 縮放，合併同一題後選等級，回傳每題的等級 index。
 
     整題的局都解析失敗時，回傳最弱等級。
     """
@@ -99,7 +99,7 @@ def decide(n_questions, game_q, game_probs, agg='mean', select='pick'):
         p = p[~np.isnan(p).any(axis=1)]
         if len(p) == 0:
             continue
-        dist = aggregate_games(p, agg)
+        dist = aggregate_games(apply_temperature(p, temp), agg)
         preds[q] = int(dist.argmax()) if select == 'argmax' else int(pick_level(dist))
     return preds
 
@@ -119,8 +119,10 @@ def main():
     ap.add_argument('--test-dir', default='tests')
     ap.add_argument('--out', default='submission_rank.csv')
     ap.add_argument('--probs', default='game_probs.npz', help='每局機率的快取檔，存在就直接讀')
-    ap.add_argument('--agg', choices=('mean', 'log'), default='mean')
+    ap.add_argument('--agg', choices=('mean', 'log'), default='log')
     ap.add_argument('--select', choices=('argmax', 'pick'), default='pick')
+    ap.add_argument('--temp', type=float, default=3.0,
+                    help='合併前的機率溫度；換 checkpoint 時用 eval_posthoc --calibrate 重新挑')
     ap.add_argument('--channels', type=int, default=256)
     ap.add_argument('--blocks', type=int, default=20)
     ap.add_argument('--batch-size', type=int, default=64)
@@ -151,10 +153,10 @@ def main():
     failed = int(np.isnan(probs).any(axis=1).sum())
     if failed:
         print('解析失敗 %d 局（%.2f%%）' % (failed, 100 * failed / max(len(games), 1)))
-    preds = decide(len(qids), game_q, probs, args.agg, args.select)
+    preds = decide(len(qids), game_q, probs, args.agg, args.select, args.temp)
     sub = pd.DataFrame({'question_id': qids, 'pred_rank': [LEVELS[i] for i in preds]})
     sub.to_csv(args.out, index=False)
-    print('寫出 %s（%d 列），合併 %s、選法 %s' % (args.out, len(sub), args.agg, args.select))
+    print('寫出 %s（%d 列），合併 %s、選法 %s、溫度 %g' % (args.out, len(sub), args.agg, args.select, args.temp))
     print('預測分布:', sub['pred_rank'].value_counts().to_dict())
 
 
