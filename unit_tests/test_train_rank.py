@@ -110,10 +110,11 @@ def test_lr_at_cosine():
     assert train_rank.lr_at(50, 100, 1e-3, 'constant', 10) == 1e-3
 
 
-def test_cosine_resume_matches_single_run(tmp_path, monkeypatch):
+@pytest.mark.parametrize('extra', [(), ('--augment',)], ids=['plain', 'augment'])
+def test_cosine_resume_matches_single_run(tmp_path, monkeypatch, extra):
     feat, _ = _setup(tmp_path)
     once, twice = tmp_path / 'once', tmp_path / 'twice'
-    args = ('--epochs', '2', '--no-amp', '--schedule', 'cosine', '--warmup-steps', '2')
+    args = ('--epochs', '2', '--no-amp', '--schedule', 'cosine', '--warmup-steps', '2', *extra)
     _main(monkeypatch, feat, once, *args)
 
     validate, calls = train_rank.validate, []
@@ -171,6 +172,23 @@ def test_patience_stops_and_stays_stopped(tmp_path, monkeypatch):
     assert len(pd.read_csv(ckpt / 'history.csv')) == 3
     _main(monkeypatch, feat, ckpt, *args)  # 重跑不會繼續訓練
     assert len(pd.read_csv(ckpt / 'history.csv')) == 3
+
+
+def test_augment_changes_training_and_is_deterministic(tmp_path, monkeypatch):
+    feat, _ = _setup(tmp_path)
+    runs = {}
+    for name, extra in (('plain', ()), ('aug1', ('--augment',)), ('aug2', ('--augment',))):
+        _main(monkeypatch, feat, tmp_path / name, '--epochs', '2', '--no-amp', *extra)
+        runs[name] = pd.read_csv(tmp_path / name / 'history.csv')['train_loss']
+    pd.testing.assert_series_equal(runs['aug1'], runs['aug2'])
+    assert not runs['plain'].equals(runs['aug1'])
+
+
+def test_augment_rejects_resume_without_augment(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    _main(monkeypatch, feat, ckpt, '--epochs', '1', '--no-amp', '--augment')
+    with pytest.raises(SystemExit):
+        _main(monkeypatch, feat, ckpt, '--epochs', '2', '--no-amp')
 
 
 def test_patience_off_by_default(tmp_path, monkeypatch):

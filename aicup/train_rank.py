@@ -9,6 +9,7 @@ best_model.pth 依 val_score_pick 挑選，只存 state_dict；同時存 val_pro
     python -m aicup.train_rank
     python -m aicup.train_rank --epochs 10   # 已跑完 5 個 epoch 時接續到第 10 個
     python -m aicup.train_rank --schedule cosine --epochs 15   # warmup 後 cosine 降到 0
+    python -m aicup.train_rank --augment      # 每個 batch 隨機套 8 種盤面對稱之一
     python -m aicup.train_rank --patience 3   # 跑滿 --min-epochs 後，連續 3 個 epoch 沒超過最佳就停
     python -m aicup.train_rank --fresh       # 忽略既有 checkpoint 從頭訓練
 """
@@ -25,7 +26,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from aicup import packed
+from aicup import packed, symmetry
 from aicup.scoring import LEVELS, pick_level, score_strength
 from network import GoRankResNet
 
@@ -49,6 +50,7 @@ def parse_args():
     ap.add_argument('--data-device', choices=('auto', 'cuda', 'cpu'), default='auto',
                     help='打包資料放哪裡；auto 在 VRAM 足夠時放 GPU')
     ap.add_argument('--no-amp', action='store_true', help='關閉 bf16，改用純 fp32')
+    ap.add_argument('--augment', action='store_true', help='每個 batch 隨機套 8 種盤面對稱之一')
     ap.add_argument('--patience', type=int, default=0,
                     help='val_score_pick 連續幾個 epoch 沒超過最佳就停，0 為不停')
     ap.add_argument('--min-epochs', type=int, default=6,
@@ -209,6 +211,8 @@ def main():
     config['amp'] = amp
     if args.schedule != 'constant':  # constant 不加欄位，舊的 last.pt 仍可接續
         config.update(schedule=args.schedule, warmup_steps=args.warmup_steps, epochs=args.epochs)
+    if args.augment:
+        config['augment'] = True
     start_epoch, history, best_score = 0, [], -1.0
     if os.path.exists(last_path) and not args.fresh:
         ckpt = torch.load(last_path, map_location=device, weights_only=False)
@@ -256,6 +260,7 @@ def main():
         torch.manual_seed(args.seed + epoch)  # dropout 的亂數也隨 epoch 固定
         gen = torch.Generator(device=data_device).manual_seed(args.seed + epoch)
         order = torch.randperm(len(y_train), generator=gen, device=data_device)
+        aug_gen = torch.Generator().manual_seed(args.seed + epoch)  # 對稱的選擇只由 seed 與 epoch 決定
         t0 = time.time()
         loss_sum, correct, total, steps = 0.0, 0, 0, 0
         for xb, yb in batches(x_train, y_train, args.batch_size, device, order):
@@ -263,6 +268,9 @@ def main():
                        args.warmup_steps)
             for group in optimizer.param_groups:
                 group['lr'] = lr
+            if args.augment:
+                k = int(torch.randint(symmetry.N_SYMMETRIES, (1,), generator=aug_gen))
+                xb = symmetry.apply(xb, k).contiguous()
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
                 out = model(xb)
