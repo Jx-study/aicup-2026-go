@@ -2,17 +2,23 @@
 
 模型與預設超參數同 rank-prediction.ipynb。每個 epoch 存 last.pt，重跑自動接續。
 best_model.pth 依 val_score_pick 挑選，只存 state_dict；同時存 val_probs.npz 供事後分析。
+--patience 預設關閉；啟用時跑滿 --min-epochs 後，val_score_pick 連續 --patience 個 epoch 沒超過最佳就提前停止。
+每次啟動在 runs.jsonl 追加一筆指令與環境，接續訓練時也會記錄。
 
 用法（在 repo 根目錄）：
     python -m aicup.train_rank
     python -m aicup.train_rank --epochs 10   # 已跑完 5 個 epoch 時接續到第 10 個
     python -m aicup.train_rank --schedule cosine --epochs 15   # warmup 後 cosine 降到 0
+    python -m aicup.train_rank --patience 3   # 跑滿 --min-epochs 後，連續 3 個 epoch 沒超過最佳就停
     python -m aicup.train_rank --fresh       # 忽略既有 checkpoint 從頭訓練
 """
 import argparse
+import datetime
 import json
 import math
 import os
+import subprocess
+import sys
 import time
 
 import numpy as np
@@ -43,6 +49,10 @@ def parse_args():
     ap.add_argument('--data-device', choices=('auto', 'cuda', 'cpu'), default='auto',
                     help='打包資料放哪裡；auto 在 VRAM 足夠時放 GPU')
     ap.add_argument('--no-amp', action='store_true', help='關閉 bf16，改用純 fp32')
+    ap.add_argument('--patience', type=int, default=0,
+                    help='val_score_pick 連續幾個 epoch 沒超過最佳就停，0 為不停')
+    ap.add_argument('--min-epochs', type=int, default=6,
+                    help='跑滿幾個 epoch 才檢查 --patience，lr 高的前期 val 跳動大')
     ap.add_argument('--fresh', action='store_true', help='忽略既有 last.pt')
     ap.add_argument('--max-steps', type=int, default=0, help='每個 epoch 最多幾步，0 為不限，用於冒煙測試')
     return ap.parse_args()
@@ -105,6 +115,28 @@ def lr_at(step, total_steps, base_lr, schedule, warmup_steps):
         return base_lr * (step + 1) / warmup_steps
     progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
     return base_lr * 0.5 * (1 + math.cos(math.pi * progress))
+
+
+def patience_exhausted(history, patience, min_epochs=0):
+    """history 至少有 min_epochs 筆，且最佳 epoch 之後已過 patience 個 epoch 時回傳 True。
+
+    結果由 history 推得，接續訓練時同樣成立。
+    """
+    if patience <= 0 or len(history) < max(min_epochs, 1):
+        return False
+    scores = [r['val_score_pick'] for r in history]
+    return len(scores) - 1 - int(np.argmax(scores)) >= patience
+
+
+def log_run(ckpt_dir, start_epoch, device):
+    """在 ckpt_dir/runs.jsonl 追加一筆這次執行的時間、commit、參數、GPU 與起始 epoch。"""
+    git = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True)
+    run = {'time': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+           'commit': git.stdout.strip() or 'unknown', 'argv': sys.argv[1:],
+           'gpu': torch.cuda.get_device_name(0) if device.type == 'cuda' else 'cpu',
+           'start_epoch': start_epoch}
+    with open(os.path.join(ckpt_dir, 'runs.jsonl'), 'a', encoding='utf-8') as f:
+        f.write(json.dumps(run, ensure_ascii=False) + '\n')
 
 
 def validate(model, x, y, args, device, amp, criterion):
@@ -209,7 +241,11 @@ def main():
     if start_epoch >= args.epochs:
         print('已完成 %d 個 epoch，要繼續訓練請加大 --epochs' % start_epoch)
         return
+    if patience_exhausted(history, args.patience, args.min_epochs):
+        print('已在 epoch %d 提前停止（patience %d），要繼續訓練請加 --patience 0' % (start_epoch, args.patience))
+        return
 
+    log_run(args.ckpt_dir, start_epoch, device)
     steps_per_epoch = math.ceil(len(y_train) / args.batch_size)
     if args.max_steps:
         steps_per_epoch = min(steps_per_epoch, args.max_steps)
@@ -266,6 +302,9 @@ def main():
         save_atomic({'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
                      'epoch': epoch + 1, 'history': history, 'best_score': best_score,
                      'config': config}, last_path)
+        if patience_exhausted(history, args.patience, args.min_epochs):
+            print('val_score_pick 連續 %d 個 epoch 沒超過最佳，提前停止' % args.patience)
+            break
 
     print('完成。最佳 val_score_pick %.4f' % best_score)
 

@@ -1,3 +1,4 @@
+import json
 import sys
 
 import numpy as np
@@ -142,3 +143,65 @@ def test_cosine_rejects_changed_epochs(tmp_path, monkeypatch):
     _main(monkeypatch, feat, ckpt, '--epochs', '1', *args)
     with pytest.raises(SystemExit):
         _main(monkeypatch, feat, ckpt, '--epochs', '2', *args)
+
+
+def test_patience_exhausted():
+    h = [{'val_score_pick': s} for s in (0.1, 0.3, 0.2, 0.25)]
+    assert not train_rank.patience_exhausted(h, 0)
+    assert not train_rank.patience_exhausted(h, 3)
+    assert train_rank.patience_exhausted(h, 2)
+    assert not train_rank.patience_exhausted([], 1)
+    tie = [{'val_score_pick': s} for s in (0.3, 0.3)]
+    assert train_rank.patience_exhausted(tie, 1)  # 平手不算超過，和 best_model.pth 的更新條件一致
+
+
+def test_patience_stops_and_stays_stopped(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    scores = iter([0.5, 0.4, 0.3, 0.2, 0.1])
+    validate = train_rank.validate
+
+    def fake(*a, **k):  # val 分數逐 epoch 下降
+        metrics, probs = validate(*a, **k)
+        metrics['val_score_pick'] = next(scores)
+        return metrics, probs
+
+    monkeypatch.setattr(train_rank, 'validate', fake)
+    args = ('--epochs', '5', '--no-amp', '--patience', '2', '--min-epochs', '0')
+    _main(monkeypatch, feat, ckpt, *args)
+    assert len(pd.read_csv(ckpt / 'history.csv')) == 3
+    _main(monkeypatch, feat, ckpt, *args)  # 重跑不會繼續訓練
+    assert len(pd.read_csv(ckpt / 'history.csv')) == 3
+
+
+def test_patience_off_by_default(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    scores = iter([0.5, 0.4, 0.3, 0.2, 0.1])
+    validate = train_rank.validate
+
+    def fake(*a, **k):
+        metrics, probs = validate(*a, **k)
+        metrics['val_score_pick'] = next(scores)
+        return metrics, probs
+
+    monkeypatch.setattr(train_rank, 'validate', fake)
+    _main(monkeypatch, feat, ckpt, '--epochs', '5', '--no-amp', '--min-epochs', '0')
+    assert len(pd.read_csv(ckpt / 'history.csv')) == 5
+
+
+def test_runs_log_records_each_start(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    _main(monkeypatch, feat, ckpt, '--epochs', '1', '--no-amp')
+    _main(monkeypatch, feat, ckpt, '--epochs', '2', '--no-amp')
+    _main(monkeypatch, feat, ckpt, '--epochs', '2', '--no-amp')  # 已跑完，沒有訓練就不記錄
+    runs = [json.loads(s) for s in (ckpt / 'runs.jsonl').read_text(encoding='utf-8').splitlines()]
+    assert [r['start_epoch'] for r in runs] == [0, 1]
+    assert runs[1]['argv'][-3:] == ['--epochs', '2', '--no-amp'] and runs[1]['commit']
+
+
+def test_min_epochs_delays_patience():
+    # 前 3 個 epoch 下跌，第 4 個回升，對應前期 val 跳動
+    h = [{'val_score_pick': s} for s in (0.31, 0.29, 0.27, 0.35)]
+    assert train_rank.patience_exhausted(h[:3], 2)
+    assert not train_rank.patience_exhausted(h[:3], 2, min_epochs=6)
+    late = [{'val_score_pick': s} for s in (0.1, 0.2, 0.3, 0.3, 0.3, 0.3)]
+    assert train_rank.patience_exhausted(late, 3, min_epochs=6)
