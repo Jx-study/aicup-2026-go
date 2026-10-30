@@ -6,10 +6,12 @@ best_model.pth 依 val_score_pick 挑選，只存 state_dict；同時存 val_pro
 用法（在 repo 根目錄）：
     python -m aicup.train_rank
     python -m aicup.train_rank --epochs 10   # 已跑完 5 個 epoch 時接續到第 10 個
+    python -m aicup.train_rank --schedule cosine --epochs 15   # warmup 後 cosine 降到 0
     python -m aicup.train_rank --fresh       # 忽略既有 checkpoint 從頭訓練
 """
 import argparse
 import json
+import math
 import os
 import time
 
@@ -32,6 +34,9 @@ def parse_args():
     ap.add_argument('--epochs', type=int, default=5)
     ap.add_argument('--batch-size', type=int, default=256)
     ap.add_argument('--lr', type=float, default=1e-3)
+    ap.add_argument('--schedule', choices=('constant', 'cosine'), default='constant',
+                    help='cosine 在 --warmup-steps 內線性升到 --lr，之後依總步數降到 0')
+    ap.add_argument('--warmup-steps', type=int, default=1000)
     ap.add_argument('--channels', type=int, default=256)
     ap.add_argument('--blocks', type=int, default=20)
     ap.add_argument('--seed', type=int, default=42)
@@ -90,6 +95,16 @@ def batches(x, y, batch_size, device, order=None):
             xb, yb = x[idx], y[idx]
         xb = xb.to(device, non_blocking=True)
         yield packed.unpack_torch(xb), yb.to(device, non_blocking=True)
+
+
+def lr_at(step, total_steps, base_lr, schedule, warmup_steps):
+    """第 step 步（從 0 起算）的 lr；只由步數決定，接續訓練不需要另存 scheduler 狀態。"""
+    if schedule == 'constant':
+        return base_lr
+    if step < warmup_steps:
+        return base_lr * (step + 1) / warmup_steps
+    progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+    return base_lr * 0.5 * (1 + math.cos(math.pi * progress))
 
 
 def validate(model, x, y, args, device, amp, criterion):
@@ -160,6 +175,8 @@ def main():
     last_path = os.path.join(args.ckpt_dir, 'last.pt')
     config = {k: getattr(args, k) for k in ('batch_size', 'lr', 'channels', 'blocks', 'seed')}
     config['amp'] = amp
+    if args.schedule != 'constant':  # constant 不加欄位，舊的 last.pt 仍可接續
+        config.update(schedule=args.schedule, warmup_steps=args.warmup_steps, epochs=args.epochs)
     start_epoch, history, best_score = 0, [], -1.0
     if os.path.exists(last_path) and not args.fresh:
         ckpt = torch.load(last_path, map_location=device, weights_only=False)
@@ -193,6 +210,11 @@ def main():
         print('已完成 %d 個 epoch，要繼續訓練請加大 --epochs' % start_epoch)
         return
 
+    steps_per_epoch = math.ceil(len(y_train) / args.batch_size)
+    if args.max_steps:
+        steps_per_epoch = min(steps_per_epoch, args.max_steps)
+    total_steps = steps_per_epoch * args.epochs
+
     model.train()
     for epoch in range(start_epoch, args.epochs):
         torch.manual_seed(args.seed + epoch)  # dropout 的亂數也隨 epoch 固定
@@ -201,6 +223,10 @@ def main():
         t0 = time.time()
         loss_sum, correct, total, steps = 0.0, 0, 0, 0
         for xb, yb in batches(x_train, y_train, args.batch_size, device, order):
+            lr = lr_at(epoch * steps_per_epoch + steps, total_steps, args.lr, args.schedule,
+                       args.warmup_steps)
+            for group in optimizer.param_groups:
+                group['lr'] = lr
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
                 out = model(xb)
@@ -222,7 +248,7 @@ def main():
         train_min = (time.time() - t0) / 60
         metrics, val_probs = validate(model, x_val, y_val, args, device, amp, criterion)
         row = {'epoch': epoch + 1, 'train_loss': loss_sum / max(steps, 1),
-               'train_acc': 100 * correct / max(total, 1), **metrics,
+               'train_acc': 100 * correct / max(total, 1), 'lr': lr, **metrics,
                'train_minutes': train_min, 'total_minutes': (time.time() - t0) / 60}
         history.append(row)
         print('Epoch %d/%d  train acc %.2f%% | val acc %.2f%%  score argmax %.4f  pick %.4f | %.1f 分'

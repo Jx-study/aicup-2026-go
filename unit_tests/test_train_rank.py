@@ -1,6 +1,8 @@
 import sys
 
 import numpy as np
+import pandas as pd
+import pytest
 import torch
 
 from aicup import packed, train_rank
@@ -94,3 +96,49 @@ def test_val_probs_with_amp(tmp_path, monkeypatch):
 
     assert saved['probs'].dtype == np.float32 and saved['probs'].shape == (10, len(LEVELS))
     np.testing.assert_allclose(saved['probs'].sum(1), 1, atol=1e-3)
+
+
+def test_lr_at_cosine():
+    lr = lambda s: train_rank.lr_at(s, 100, 1.0, 'cosine', 10)
+    assert lr(0) == pytest.approx(0.1)
+    assert lr(9) == pytest.approx(1.0)
+    assert lr(10) == pytest.approx(1.0)
+    assert lr(55) == pytest.approx(0.5)
+    assert lr(100) == pytest.approx(0.0)
+    assert all(lr(s) >= lr(s + 1) for s in range(10, 100))
+    assert train_rank.lr_at(50, 100, 1e-3, 'constant', 10) == 1e-3
+
+
+def test_cosine_resume_matches_single_run(tmp_path, monkeypatch):
+    feat, _ = _setup(tmp_path)
+    once, twice = tmp_path / 'once', tmp_path / 'twice'
+    args = ('--epochs', '2', '--no-amp', '--schedule', 'cosine', '--warmup-steps', '2')
+    _main(monkeypatch, feat, once, *args)
+
+    validate, calls = train_rank.validate, []
+
+    def fail_second(*a, **k):  # 第 2 個 epoch 存檔前中斷
+        calls.append(1)
+        if len(calls) == 2:
+            raise KeyboardInterrupt
+        return validate(*a, **k)
+
+    monkeypatch.setattr(train_rank, 'validate', fail_second)
+    with pytest.raises(KeyboardInterrupt):
+        _main(monkeypatch, feat, twice, *args)
+    monkeypatch.setattr(train_rank, 'validate', validate)
+    _main(monkeypatch, feat, twice, *args)
+
+    a, b = pd.read_csv(once / 'history.csv'), pd.read_csv(twice / 'history.csv')
+    cols = ['train_loss', 'lr', 'val_loss']
+    pd.testing.assert_frame_equal(a[cols], b[cols])
+    # 16 局、batch 4、2 個 epoch 共 8 步，最後一步是第 7 步
+    assert a['lr'].iloc[-1] == pytest.approx(train_rank.lr_at(7, 8, 1e-3, 'cosine', 2))
+
+
+def test_cosine_rejects_changed_epochs(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    args = ('--no-amp', '--schedule', 'cosine', '--warmup-steps', '2')
+    _main(monkeypatch, feat, ckpt, '--epochs', '1', *args)
+    with pytest.raises(SystemExit):
+        _main(monkeypatch, feat, ckpt, '--epochs', '2', *args)
