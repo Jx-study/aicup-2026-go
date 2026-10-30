@@ -101,7 +101,7 @@ def test_calibrate_log_argmax_unaffected():
 
 
 def test_calibrate_flattens_overconfident_pick():
-    # 真實等級都是 4，每局都很有把握地猜 3 或 5；log 合併在溫度 1 時被多數方帶走
+    # 真實等級都是 4，每局猜 3 或 5，溫度 1 時被多數方帶走
     lean_low = np.zeros(len(LEVELS))
     lean_low[[3, 4, 5]] = [0.8, 0.15, 0.05]
     lean_high = lean_low.copy()

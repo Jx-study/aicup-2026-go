@@ -1,6 +1,7 @@
 """棋力預測推論：讀測試 CSV，逐局預測等級機率，合併同一題的各局後選等級，輸出 submission_rank.csv
 
 每局的機率存成 .npz 快取，換合併方式或選法時加 --probs 指向同一個檔案即可，不必重新推論。
+快取記錄 checkpoint 的 SHA-256，傳入不同的 --ckpt 時拒絕執行。
 public 與 private 兩份題目都要預測，串接成同一份提交檔，question_id 原樣保留。
 
 用法（在 repo 根目錄）：
@@ -8,6 +9,7 @@ public 與 private 兩份題目都要預測，串接成同一份提交檔，ques
     !python -m aicup.predict_rank --ckpt ... --agg mean --select argmax --temp 1 --probs game_probs.npz
 """
 import argparse
+import hashlib
 import os
 import time
 from multiprocessing import Pool
@@ -113,6 +115,14 @@ def load_model(ckpt, channels, blocks, device):
     return model.to(device).eval()
 
 
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--ckpt', help='train_rank.py 存的 best_model.pth；有 --probs 且檔案存在時可省略')
@@ -136,6 +146,10 @@ def main():
 
     if os.path.exists(args.probs):
         z = np.load(args.probs, allow_pickle=False)
+        if 'ckpt_sha256' not in z.files:
+            raise SystemExit('%s 沒有 checkpoint 紀錄，請刪除後重跑' % args.probs)
+        if args.ckpt and file_sha256(args.ckpt) != str(z['ckpt_sha256']):
+            raise SystemExit('%s 不是 %s 產生的，請刪除或改用其他 --probs' % (args.probs, args.ckpt))
         if len(z['probs']) != len(games) or not np.array_equal(z['game_q'], game_q):
             raise SystemExit('%s 與目前的測試資料對不上，請刪除後重跑' % args.probs)
         probs = z['probs']
@@ -148,7 +162,7 @@ def main():
         amp = device.type == 'cuda' and not args.no_amp and torch.cuda.is_bf16_supported()
         model = load_model(args.ckpt, args.channels, args.blocks, device)
         probs = predict_games(model, [s for _, s in games], device, amp, args.batch_size, args.nproc)
-        np.savez(args.probs, probs=probs, game_q=game_q)
+        np.savez(args.probs, probs=probs, game_q=game_q, ckpt_sha256=file_sha256(args.ckpt))
 
     failed = int(np.isnan(probs).any(axis=1).sum())
     if failed:

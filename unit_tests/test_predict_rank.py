@@ -88,16 +88,42 @@ def test_main_writes_submission(tmp_path, monkeypatch):
 def test_main_rejects_stale_cache(tmp_path, monkeypatch):
     _write_tests(tmp_path, [[SGF]], [[SGF]])
     np.savez(tmp_path / 'probs.npz', probs=np.zeros((5, 10), np.float32),
-             game_q=np.zeros(5, np.int64))
+             game_q=np.zeros(5, np.int64), ckpt_sha256='x')
     monkeypatch.setattr('sys.argv', [
         'predict_rank', '--test-dir', str(tmp_path), '--out', str(tmp_path / 's.csv'),
         '--probs', str(tmp_path / 'probs.npz')])
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit, match='測試資料'):
+        predict_rank.main()
+
+
+def test_main_rejects_cache_without_ckpt_record(tmp_path, monkeypatch):
+    _write_tests(tmp_path, [[SGF]], [[SGF]])
+    np.savez(tmp_path / 'probs.npz', probs=np.zeros((2, 10), np.float32), game_q=np.arange(2))
+    monkeypatch.setattr('sys.argv', [
+        'predict_rank', '--test-dir', str(tmp_path), '--out', str(tmp_path / 's.csv'),
+        '--probs', str(tmp_path / 'probs.npz')])
+    with pytest.raises(SystemExit, match='刪除後重跑'):
+        predict_rank.main()
+
+
+def test_main_rejects_cache_from_other_ckpt(tmp_path, monkeypatch):
+    _write_tests(tmp_path, [[SGF]], [[SGF]])
+    ckpt = _tiny_ckpt(tmp_path)
+    argv = ['predict_rank', '--test-dir', str(tmp_path), '--out', str(tmp_path / 's.csv'),
+            '--probs', str(tmp_path / 'probs.npz'), '--channels', '8', '--blocks', '1', '--nproc', '1']
+    monkeypatch.setattr('sys.argv', argv + ['--ckpt', ckpt])
+    predict_rank.main()
+    predict_rank.main()  # 同一個 checkpoint 可以沿用快取
+
+    other = tmp_path / 'other.pth'
+    other.write_bytes(open(ckpt, 'rb').read() + b'x')
+    monkeypatch.setattr('sys.argv', argv + ['--ckpt', str(other)])
+    with pytest.raises(SystemExit, match='不是'):
         predict_rank.main()
 
 
 def test_decide_temperature_changes_log_pick():
-    # 真實等級 4，每局都很有把握地猜 3 或 5；溫度 1 時被多數方帶走，調高溫度後選中間
+    # 真實等級 4，每局猜 3 或 5，溫度 1 時被多數方帶走，調高後選中間
     lean_low = np.zeros(10)
     lean_low[[3, 4, 5]] = [0.8, 0.15, 0.05]
     lean_high = lean_low.copy()
