@@ -38,6 +38,48 @@ def test_parse_game_default_komi_and_handicap():
     assert len(g['moves']) == 1
 
 
+def test_sgf_point_matches_sgfmill():
+    from sgfmill import sgf
+    node = sgf.Sgf_game.from_string('(;SZ[19];B[pd])').get_main_sequence()[1]
+    assert ah.sgf_point('pd') == node.get_move()[1]
+
+
+def test_parse_game_even_game_keeps_colors_and_komi():
+    g = ah.parse_game('(;SZ[19]HD[0];B[pd];W[dp])')
+    assert g['hd'] == 0 and g['komi'] == 6.5
+    assert [c for c, _ in g['moves']] == ['B', 'W'] and g['initial_stones'] == []
+
+
+def test_parse_game_no_hd_uses_default_komi():
+    g = ah.parse_game('(;SZ[19];B[pd])')
+    assert g['hd'] is None and g['komi'] == 6.5
+
+
+def test_parse_game_hd1_no_komi_keeps_colors():
+    g = ah.parse_game('(;SZ[19]HD[1];B[pd];W[dp])')
+    assert g['komi'] == 0.0
+    assert [c for c, _ in g['moves']] == ['B', 'W'] and g['initial_stones'] == []
+
+
+def test_parse_game_handicap_matches_official_example():
+    g = ah.parse_game('(;SZ[19]HD[2];B[pp];W[dd])')
+    assert g['komi'] == 0.0
+    assert [(c, ah.to_gtp(p)) for c, p in g['moves']] == [('W', 'Q4'), ('B', 'D16')]
+    assert [(c, ah.to_gtp(p)) for c, p in g['initial_stones']] == [('B', 'Q16'), ('B', 'D4')]
+
+
+@pytest.mark.parametrize('hd', range(2, 10))
+def test_handicap_stone_counts(hd):
+    g = ah.parse_game('(;SZ[19]HD[%d];B[aa])' % hd)
+    assert len({p for _, p in g['initial_stones']}) == hd
+
+
+def test_handicap_target_turns_use_actual_color():
+    # color 欄位是實際顏色，目標執白時是棋譜標 B 的著手
+    g = ah.parse_game('(;SZ[19]HD[2];B[pp];W[dd];B[qq])')
+    assert ah.target_turns(g['moves'], 'W') == [0, 2]
+
+
 def test_parse_game_rejects_other_board_size():
     with pytest.raises(ValueError):
         ah.parse_game('(;GM[1]SZ[9];B[dd])')
@@ -121,7 +163,7 @@ def test_analyze_group_collects_probs():
     # 兩手都落在左上角 A19，政策機率固定為 0.25
     g = {'key': 'D_1', 'rank_idx': 0, 'player_id': 'p1', 'color': 'B',
          'parsed': {'moves': [('B', (18, 0)), ('W', (18, 1)), ('B', (18, 0))],
-                    'initial_stones': [], 'komi': 7.5}}
+                    'initial_stones': [], 'komi': 7.5, 'hd': 0}}
     rows = ah.analyze_group(FakeEngine(0.25), [g], 'chinese', 0)
     assert len(rows) == 1
     r = rows[0]
@@ -130,7 +172,7 @@ def test_analyze_group_collects_probs():
 
 
 THREE_MOVES = {'moves': [('B', (18, 0)), ('W', (18, 1)), ('B', (18, 2))],
-               'initial_stones': [], 'komi': 7.5}
+               'initial_stones': [], 'komi': 7.5, 'hd': 0}
 
 
 def test_analyze_group_records_losses_aligned_with_turns():
@@ -138,6 +180,7 @@ def test_analyze_group_records_losses_aligned_with_turns():
     engine = FakeEngine(0.25)
     r = ah.analyze_group(engine, [g], 'chinese', 0, eval_visits=8)[0]
     assert r['turns'] == [0, 2] and r['eval_visits'] == 8 and r['player_id'] == 'p1'
+    assert r['hd'] == 0
     assert r['score_loss'] == pytest.approx([2.0, 0.0])
     assert r['winrate_loss'] == pytest.approx([0.1, 0.0])
     assert [q['maxVisits'] for q in engine.queries if q['id'] == 'D_1|eval'] == [8]
@@ -246,18 +289,18 @@ def test_done_keys_rejects_mismatched_or_old_rows(tmp_path, row):
 
 def test_analyze_group_skips_failed_game():
     g = {'key': 'D_1', 'rank_idx': 0, 'player_id': 'p1', 'color': 'B',
-         'parsed': {'moves': [('B', (18, 0))], 'initial_stones': [], 'komi': 7.5}}
+         'parsed': {'moves': [('B', (18, 0))], 'initial_stones': [], 'komi': 7.5, 'hd': 0}}
     assert ah.analyze_group(FakeEngine(0.5, fail_ids=['D_1|3']), [g], 'chinese', 0) == []
 
 
 def test_analyze_group_skips_game_when_eval_fails():
     g = {'key': 'D_1', 'rank_idx': 0, 'player_id': 'p1', 'color': 'B',
-         'parsed': {'moves': [('B', (18, 0))], 'initial_stones': [], 'komi': 7.5}}
+         'parsed': {'moves': [('B', (18, 0))], 'initial_stones': [], 'komi': 7.5, 'hd': 0}}
     assert ah.analyze_group(FakeEngine(0.5, fail_ids=['D_1|eval']), [g], 'chinese', 0) == []
 
 
 def test_analyze_group_marks_illegal_as_nan():
     g = {'key': 'D_1', 'rank_idx': 0, 'player_id': 'p1', 'color': 'B',
-         'parsed': {'moves': [('B', (18, 0))], 'initial_stones': [], 'komi': 7.5}}
+         'parsed': {'moves': [('B', (18, 0))], 'initial_stones': [], 'komi': 7.5, 'hd': 0}}
     rows = ah.analyze_group(FakeEngine(-1.0), [g], 'chinese', 0)
     assert np.isnan(np.array(rows[0]['probs'], dtype=float)).all()

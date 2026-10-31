@@ -27,6 +27,10 @@ PROFILES = ['rank_11k', 'rank_8k', 'rank_5k', 'rank_2k',
 BOARD = 19
 GTP_COLS = 'ABCDEFGHJKLMNOPQRST'  # GTP 座標沒有 I
 PASS_INDEX = BOARD * BOARD
+# 讓子數對應的標準星位，SGF 座標
+HANDICAP_STONES = {2: 'pd dp', 3: 'pd dp dd', 4: 'pd dp dd pp', 5: 'pd dp dd pp jj',
+                   6: 'pd dp dd pp dj pj', 7: 'pd dp dd pp dj pj jj',
+                   8: 'pd dp dd pp dj pj jd jp', 9: 'pd dp dd pp dj pj jd jp jj'}
 
 
 def to_gtp(point):
@@ -45,8 +49,18 @@ def policy_index(point):
     return (BOARD - 1 - row) * BOARD + col
 
 
-def parse_game(sgf_content, default_komi=7.5):
-    """解析一局，回傳 dict：moves、initial_stones、komi。非 19 路棋盤丟 ValueError。"""
+def sgf_point(s):
+    """SGF 座標（aa 在左上角）轉成 sgfmill 的 (row, col)。"""
+    return BOARD - 1 - (ord(s[1]) - ord('a')), ord(s[0]) - ord('a')
+
+
+def parse_game(sgf_content, default_komi=6.5):
+    """解析一局，回傳 dict：moves、initial_stones、komi、hd。非 19 路棋盤丟 ValueError。
+
+    HD[n] 是讓子資訊，沒有這個屬性時 hd 為 None。n >= 1 不貼目。
+    n >= 2 的棋譜沒記錄讓子石，著手黑白標記與實際相反，這裡補上讓子石並對調，
+    moves 一律是實際顏色。color 欄位已是實際顏色，不用對調。
+    """
     from sgfmill import sgf  # 只有解析時才需要 sgfmill
     game = sgf.Sgf_game.from_string(sgf_content)
     if game.get_size() != BOARD:
@@ -61,9 +75,16 @@ def parse_game(sgf_content, default_komi=7.5):
         color, point = node.get_move()
         if color is not None:
             moves.append((color.upper(), point))
+    hd = int(root.get_raw('HD')) if root.has_property('HD') else None
+    if hd is not None and hd >= 2:
+        stones += [('B', sgf_point(s)) for s in HANDICAP_STONES[hd].split()]
+        moves = [('W' if c == 'B' else 'B', p) for c, p in moves]
     # get_komi() 在沒有 KM 時回傳 0，要先看屬性是否存在
-    komi = float(game.get_komi()) if root.has_property('KM') else default_komi
-    return {'moves': moves, 'initial_stones': stones, 'komi': komi}
+    if root.has_property('KM'):
+        komi = float(game.get_komi())
+    else:
+        komi = 0.0 if hd else default_komi
+    return {'moves': moves, 'initial_stones': stones, 'komi': komi, 'hd': hd}
 
 
 def target_turns(moves, color, max_turns=0):
@@ -114,7 +135,7 @@ class Engine:
 
     def __init__(self, katago_dir, model, human_model, config=None, override=''):
         env = dict(os.environ)
-        # Colab 系統只有 CUDA 13 的函式庫，KataGo 的 CUDA 12 版要從 pip 的 nvidia 套件找
+        # KataGo 的 CUDA 12 版要用 pip nvidia 套件的函式庫
         libs = [d for d in glob.glob('/usr/local/lib/python3*/dist-packages/nvidia/*/lib')
                 if '/cu13/' not in d]
         if libs:
@@ -191,6 +212,7 @@ def analyze_group(engine, games, rules, max_turns, eval_visits=1):
         score_loss, winrate_loss = move_losses({t: r['rootInfo'] for t, r in evals.items()},
                                                turns, g['color'])
         rows.append({'key': key, 'rank_idx': g['rank_idx'], 'player_id': g['player_id'],
+                     'hd': g['parsed']['hd'],
                      'color': g['color'],
                      'turns': turns, 'eval_visits': eval_visits,
                      'probs': np.round(probs, 6).tolist(),
@@ -255,12 +277,12 @@ def main():
     ap.add_argument('--model-dir', default='/content/drive/MyDrive/aicup-2026/katago')
     ap.add_argument('--model', default='kata1-b28c512nbt-s13255194368-d5935380940.bin.gz')
     ap.add_argument('--human-model', default='b18c384nbt-humanv0.bin.gz')
-    ap.add_argument('--rules', default='chinese')
-    ap.add_argument('--default-komi', type=float, default=7.5, help='SGF 沒有 KM 時使用')
+    ap.add_argument('--rules', default='japanese')
+    ap.add_argument('--default-komi', type=float, default=6.5, help='SGF 沒有 KM 且不是讓先、讓子時使用')
     ap.add_argument('--max-turns', type=int, default=0, help='每局最多分析目標玩家的前幾手，0 為全部')
     ap.add_argument('--eval-visits', type=int, default=1, help='算每手損失的 query 用的 maxVisits')
     ap.add_argument('--group', type=int, default=8, help='同時送出幾局')
-    # maxVisits 為 1 時每個 query 只有一次網路評估，搜尋執行緒用不到，改成多個 query 並行來填滿 GPU 批次
+    # 1 visit 用不到搜尋執行緒，改用多個 query 並行填滿 GPU 批次
     ap.add_argument('--override-config', default='numAnalysisThreads=32,numSearchThreadsPerAnalysisThread=1',
                     help='passed to katago as -override-config; empty string keeps the config file values')
     args = ap.parse_args()

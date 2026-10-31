@@ -1,5 +1,6 @@
 # 官方發佈的資料集：訓練集與測試集一律不進版控
 training/
+training-v1.1
 tests/
 dataset/
 
