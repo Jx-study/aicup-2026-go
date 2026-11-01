@@ -10,6 +10,7 @@ best_model.pth 依 val_score_pick 挑選，只存 state_dict；同時存 val_pro
     python -m aicup.train_rank --epochs 10   # 已跑完 5 個 epoch 時接續到第 10 個
     python -m aicup.train_rank --schedule cosine --epochs 15   # warmup 後 cosine 降到 0
     python -m aicup.train_rank --augment      # 每個 batch 隨機套 8 種盤面對稱之一
+    python -m aicup.train_rank --color both   # 目標玩家的顏色資訊，需要 <feat-dir>/hd.npz
     python -m aicup.train_rank --patience 3   # 跑滿 --min-epochs 後，連續 3 個 epoch 沒超過最佳就停
     python -m aicup.train_rank --fresh       # 忽略既有 checkpoint 從頭訓練
 """
@@ -26,7 +27,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from aicup import packed, symmetry
+from aicup import color, packed, symmetry
 from aicup.scoring import LEVELS, pick_level, score_strength
 from network import GoRankResNet
 
@@ -51,6 +52,10 @@ def parse_args():
                     help='打包資料放哪裡；auto 在 VRAM 足夠時放 GPU')
     ap.add_argument('--no-amp', action='store_true', help='關閉 bf16，改用純 fp32')
     ap.add_argument('--augment', action='store_true', help='每個 batch 隨機套 8 種盤面對稱之一')
+    ap.add_argument('--color', choices=color.MODES, default='none',
+                    help='swap 依目標玩家對調黑白平面，plane 加 color plane，both 兩者都做')
+    ap.add_argument('--raw-color', action='store_true',
+                    help='不修正讓子局，直接用 color 欄位，不需要 hd.npz')
     ap.add_argument('--patience', type=int, default=0,
                     help='val_score_pick 連續幾個 epoch 沒超過最佳就停，0 為不停')
     ap.add_argument('--min-epochs', type=int, default=6,
@@ -72,6 +77,23 @@ def load_to(split_dir, data_device):
     print('  %s：%s 筆，%.1f GB，%.1f 秒' % (split_dir, format(len(y), ','),
                                           x.numel() / 1024 ** 3, time.time() - t0), flush=True)
     return x, y, d
+
+
+def load_colors(meta, args, data_device):
+    """回傳一個 split 的特徵顏色 tensor，--color none 時回傳 None。"""
+    if args.color == 'none':
+        return None
+    c = meta['color']
+    if not args.raw_color:
+        c = color.feature_color(c, color.load_hd(os.path.join(args.feat_dir, 'hd.npz'), meta['key']))
+    return torch.from_numpy(c.astype(np.int64)).to(data_device)
+
+
+def use_amp(device, no_amp):
+    """是否開 bf16；GPU 上只算硬體支援，不算模擬。"""
+    if no_amp:
+        return False
+    return device.type == 'cpu' or torch.cuda.is_bf16_supported(including_emulation=False)
 
 
 def pick_data_device(args, device, n_bytes):
@@ -96,17 +118,15 @@ def split_bytes(split_dir):
     return n * packed.PACKED_LEN
 
 
-def batches(x, y, batch_size, device, order=None):
-    """依 order（預設為原順序）切 batch，在 device 上解包成 float。"""
+def batches(x, y, batch_size, device, order=None, c=None, mode='none'):
+    """依 order（預設為原順序）切 batch，在 device 上解包成 float，c 不為 None 時套用顏色資訊。"""
     n = len(y)
     for i in range(0, n, batch_size):
-        if order is None:
-            xb, yb = x[i:i + batch_size], y[i:i + batch_size]
-        else:
-            idx = order[i:i + batch_size]
-            xb, yb = x[idx], y[idx]
-        xb = xb.to(device, non_blocking=True)
-        yield packed.unpack_torch(xb), yb.to(device, non_blocking=True)
+        idx = slice(i, i + batch_size) if order is None else order[i:i + batch_size]
+        xb = packed.unpack_torch(x[idx].to(device, non_blocking=True))
+        if c is not None:
+            xb = color.apply_color(xb, c[idx].to(device, non_blocking=True), mode)
+        yield xb, y[idx].to(device, non_blocking=True)
 
 
 def lr_at(step, total_steps, base_lr, schedule, warmup_steps):
@@ -141,12 +161,12 @@ def log_run(ckpt_dir, start_epoch, device):
         f.write(json.dumps(run, ensure_ascii=False) + '\n')
 
 
-def validate(model, x, y, args, device, amp, criterion):
+def validate(model, x, y, args, device, amp, criterion, c=None):
     """回傳 (指標 dict, 逐局機率 (N, 10) float32)。"""
     model.eval()
     loss_sum, batches_n, probs = 0.0, 0, []
     with torch.no_grad():
-        for xb, yb in batches(x, y, args.batch_size, device):
+        for xb, yb in batches(x, y, args.batch_size, device, c=c, mode=args.color):
             with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
                 out = model(xb)
             loss_sum += criterion(out.float(), yb).item()
@@ -186,7 +206,7 @@ def save_val_probs(path, probs, meta, epoch):
 def main():
     args = parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    amp = not args.no_amp and (device.type == 'cpu' or torch.cuda.is_bf16_supported())
+    amp = use_amp(device, args.no_amp)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
@@ -198,9 +218,12 @@ def main():
     data_device = pick_data_device(args, device, split_bytes(train_dir) + split_bytes(val_dir))
     print('載入資料到 %s' % data_device, flush=True)
     x_val, y_val, val_meta = load_to(val_dir, data_device)
-    x_train, y_train, _ = load_to(train_dir, data_device)
+    c_val = load_colors(val_meta, args, data_device)
+    x_train, y_train, train_meta = load_to(train_dir, data_device)
+    c_train = load_colors(train_meta, args, data_device)
 
-    model = GoRankResNet(num_channels=args.channels, num_blocks=args.blocks,
+    in_channels = color.in_channels(args.color)
+    model = GoRankResNet(in_channels=in_channels, num_channels=args.channels, num_blocks=args.blocks,
                          num_classes=NUM_CLASSES).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     criterion = torch.nn.CrossEntropyLoss()
@@ -213,6 +236,8 @@ def main():
         config.update(schedule=args.schedule, warmup_steps=args.warmup_steps, epochs=args.epochs)
     if args.augment:
         config['augment'] = True
+    if args.color != 'none':
+        config.update(color=args.color, raw_color=args.raw_color)
     start_epoch, history, best_score = 0, [], -1.0
     if os.path.exists(last_path) and not args.fresh:
         ckpt = torch.load(last_path, map_location=device, weights_only=False)
@@ -224,14 +249,18 @@ def main():
         start_epoch, history, best_score = ckpt['epoch'], ckpt['history'], ckpt['best_score']
         print('從 epoch %d 接續（目前最佳 val_score_pick %.4f）' % (start_epoch, best_score))
 
+    # 通過設定比對才寫，被拒絕的執行不能改掉既有 checkpoint 的設定
+    with open(os.path.join(args.ckpt_dir, 'train_config.json'), 'w', encoding='utf-8') as f:
+        json.dump({'color': args.color, 'raw_color': args.raw_color}, f)  # predict_rank 依此設定輸入
+
     best_path = os.path.join(args.ckpt_dir, 'best_model.pth')
     probs_path = os.path.join(args.ckpt_dir, 'val_probs.npz')
     if history and os.path.exists(best_path) and not os.path.exists(probs_path):
         # 缺 val_probs.npz 時用 best_model.pth 補寫
-        best = GoRankResNet(num_channels=args.channels, num_blocks=args.blocks,
+        best = GoRankResNet(in_channels=in_channels, num_channels=args.channels, num_blocks=args.blocks,
                             num_classes=NUM_CLASSES).to(device)
         best.load_state_dict(torch.load(best_path, map_location=device, weights_only=True))
-        _, probs = validate(best, x_val, y_val, args, device, amp, criterion)
+        _, probs = validate(best, x_val, y_val, args, device, amp, criterion, c_val)
         best_epoch = max(history, key=lambda r: r['val_score_pick'])['epoch']
         save_val_probs(probs_path, probs, val_meta, best_epoch)
         print('已用 best_model.pth（epoch %d）補寫 val_probs.npz' % best_epoch)
@@ -263,7 +292,7 @@ def main():
         aug_gen = torch.Generator().manual_seed(args.seed + epoch)  # 對稱的選擇只由 seed 與 epoch 決定
         t0 = time.time()
         loss_sum, correct, total, steps = 0.0, 0, 0, 0
-        for xb, yb in batches(x_train, y_train, args.batch_size, device, order):
+        for xb, yb in batches(x_train, y_train, args.batch_size, device, order, c_train, args.color):
             lr = lr_at(epoch * steps_per_epoch + steps, total_steps, args.lr, args.schedule,
                        args.warmup_steps)
             for group in optimizer.param_groups:
@@ -290,7 +319,7 @@ def main():
                 break
 
         train_min = (time.time() - t0) / 60
-        metrics, val_probs = validate(model, x_val, y_val, args, device, amp, criterion)
+        metrics, val_probs = validate(model, x_val, y_val, args, device, amp, criterion, c_val)
         row = {'epoch': epoch + 1, 'train_loss': loss_sum / max(steps, 1),
                'train_acc': 100 * correct / max(total, 1), 'lr': lr, **metrics,
                'train_minutes': train_min, 'total_minutes': (time.time() - t0) / 60}

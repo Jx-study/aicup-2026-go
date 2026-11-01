@@ -2,6 +2,7 @@
 
 每局的機率存成 .npz 快取，換合併方式或選法時加 --probs 指向同一個檔案即可，不必重新推論。
 快取記錄 checkpoint 的 SHA-256，傳入不同的 --ckpt 時拒絕執行。
+顏色設定讀 checkpoint 目錄的 train_config.json，沒有這個檔案時視為沒有顏色資訊。
 public 與 private 兩份題目都要預測，串接成同一份提交檔，question_id 原樣保留。
 
 用法（在 repo 根目錄）：
@@ -10,6 +11,7 @@ public 與 private 兩份題目都要預測，串接成同一份提交檔，ques
 """
 import argparse
 import hashlib
+import json
 import os
 import time
 from multiprocessing import Pool
@@ -17,6 +19,8 @@ from multiprocessing import Pool
 import numpy as np
 import pandas as pd
 
+from aicup import color
+from aicup.extract_features import COLOR_TO_ID
 from aicup.scoring import LEVELS, aggregate_games, apply_temperature, pick_level
 
 NUM_CLASSES = len(LEVELS)
@@ -36,9 +40,9 @@ def sgf_to_features(sgf_content):
 
 
 def read_questions(test_dir):
-    """讀 public 與 private 兩份測試 CSV，回傳 (question_id 清單, 逐局的 (題目 index, sgf))。
+    """讀 public 與 private 兩份測試 CSV，回傳 (question_id 清單, 逐局的 (題目 index, sgf, color))。
 
-    空的 sgf_ 欄位（NaN 或空字串）略過。
+    空的 sgf_ 欄位（NaN 或空字串）略過，沒有對應的 color_ 欄位時 color 為 None。
     """
     qids, games = [], []
     for split in SPLITS:
@@ -47,14 +51,42 @@ def read_questions(test_dir):
         for _, row in test.iterrows():
             q = len(qids)
             qids.append(str(row['question_id']))
-            for c in sgf_cols:
-                if pd.notna(row[c]) and str(row[c]).strip():
-                    games.append((q, str(row[c])))
+            for sgf_col in sgf_cols:
+                if pd.notna(row[sgf_col]) and str(row[sgf_col]).strip():
+                    game_color = row.get('color_' + sgf_col[len('sgf_'):])
+                    games.append((q, str(row[sgf_col]), str(game_color) if pd.notna(game_color) else None))
     return qids, games
 
 
-def predict_games(model, sgfs, device, amp, batch_size=64, nproc=1):
-    """逐局預測等級機率，形狀 (G, 10)；解析失敗的局整列填 NaN。"""
+def game_colors(games, raw_color):
+    """回傳逐局的特徵顏色；raw_color 時直接用 color_ 欄位，缺 HD 的局無法修正。"""
+    if any(c is None for _, _, c in games):
+        raise SystemExit('模型需要顏色資訊，但測試資料缺 color_ 欄位')
+    colors = np.array([COLOR_TO_ID[c] for _, _, c in games], np.uint8)
+    if raw_color:
+        return colors
+    hd = [color.parse_hd(s) for _, s, _ in games]
+    missing = sum(h is None for h in hd)
+    if missing:
+        print('%d/%d 局沒有 HD，無法修正讓子局' % (missing, len(games)), flush=True)
+    return color.feature_color(colors, [h or 0 for h in hd])
+
+
+def read_train_config(ckpt):
+    """回傳 checkpoint 目錄 train_config.json 的內容，沒有這個檔案時回傳無顏色設定。"""
+    path = os.path.join(os.path.dirname(ckpt), 'train_config.json')
+    if not os.path.exists(path):
+        print('警告：找不到 %s，視為沒有顏色資訊；--color swap 的模型必須連同這個檔案複製' % path, flush=True)
+        return {'color': 'none', 'raw_color': False}
+    with open(path, encoding='utf-8') as f:
+        return json.load(f)
+
+
+def predict_games(model, sgfs, device, amp, batch_size=64, nproc=1, colors=None, color_mode='none'):
+    """逐局預測等級機率，形狀 (G, 10)；解析失敗的局整列填 NaN。
+
+    colors 是逐局的特徵顏色，color_mode 不是 none 時必須提供。
+    """
     import torch
 
     probs = np.full((len(sgfs), NUM_CLASSES), np.nan, np.float32)
@@ -65,6 +97,9 @@ def predict_games(model, sgfs, device, amp, batch_size=64, nproc=1):
 
     def flush():
         x = torch.from_numpy(np.stack(buf)).to(device).float()
+        if color_mode != 'none':
+            c = torch.from_numpy(colors[idx].astype(np.int64)).to(device)
+            x = color.apply_color(x, c, color_mode)
         with torch.no_grad(), torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
             out = model(x)
         probs[idx] = torch.softmax(out.float(), 1).cpu().numpy()
@@ -106,11 +141,12 @@ def decide(n_questions, game_q, game_probs, agg='log', select='pick', temp=1.0):
     return preds
 
 
-def load_model(ckpt, channels, blocks, device):
+def load_model(ckpt, channels, blocks, device, in_channels=500):
     import torch
     from network import GoRankResNet
 
-    model = GoRankResNet(num_channels=channels, num_blocks=blocks, num_classes=NUM_CLASSES)
+    model = GoRankResNet(in_channels=in_channels, num_channels=channels, num_blocks=blocks,
+                         num_classes=NUM_CLASSES)
     model.load_state_dict(torch.load(ckpt, map_location='cpu', weights_only=True))
     return model.to(device).eval()
 
@@ -141,7 +177,7 @@ def main():
     args = ap.parse_args()
 
     qids, games = read_questions(args.test_dir)
-    game_q = np.array([q for q, _ in games], np.int64)
+    game_q = np.array([q for q, _, _ in games], np.int64)
     print('%d 題，%d 局' % (len(qids), len(games)), flush=True)
 
     if os.path.exists(args.probs):
@@ -158,10 +194,15 @@ def main():
         if not args.ckpt:
             raise SystemExit('沒有快取檔 %s，需要 --ckpt' % args.probs)
         import torch
+        from aicup.train_rank import use_amp
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        amp = device.type == 'cuda' and not args.no_amp and torch.cuda.is_bf16_supported()
-        model = load_model(args.ckpt, args.channels, args.blocks, device)
-        probs = predict_games(model, [s for _, s in games], device, amp, args.batch_size, args.nproc)
+        amp = device.type == 'cuda' and use_amp(device, args.no_amp)
+        cfg = read_train_config(args.ckpt)
+        print('顏色設定', cfg, flush=True)
+        colors = None if cfg['color'] == 'none' else game_colors(games, cfg['raw_color'])
+        model = load_model(args.ckpt, args.channels, args.blocks, device, color.in_channels(cfg['color']))
+        probs = predict_games(model, [s for _, s, _ in games], device, amp, args.batch_size, args.nproc,
+                              colors, cfg['color'])
         np.savez(args.probs, probs=probs, game_q=game_q, ckpt_sha256=file_sha256(args.ckpt))
 
     failed = int(np.isnan(probs).any(axis=1).sum())

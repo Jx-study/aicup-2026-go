@@ -1,13 +1,17 @@
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
 import torch
 
-from aicup import predict_rank
+from aicup import color, predict_rank
 from aicup.scoring import LEVELS
 from network import GoRankResNet
 
 SGF = '(;GM[1]SZ[19];B[pd];W[dp];B[dd];W[pp])'
+HD2_SGF = SGF.replace('SZ[19]', 'SZ[19]HD[2]')
+BOTH_CHANNELS = color.in_channels('both')
 
 
 def _write_tests(tmp_path, public, private):
@@ -22,9 +26,9 @@ def _write_tests(tmp_path, public, private):
         pd.DataFrame(rows).to_csv(tmp_path / ('rank_prediction_test_%s.csv' % split), index=False)
 
 
-def _tiny_ckpt(tmp_path):
+def _tiny_ckpt(tmp_path, in_channels=500):
     torch.manual_seed(0)
-    model = GoRankResNet(num_channels=8, num_blocks=1, num_classes=len(LEVELS))
+    model = GoRankResNet(in_channels=in_channels, num_channels=8, num_blocks=1, num_classes=len(LEVELS))
     path = tmp_path / 'tiny.pth'
     torch.save(model.state_dict(), path)
     return str(path)
@@ -34,7 +38,7 @@ def test_read_questions_skips_empty_columns(tmp_path):
     _write_tests(tmp_path, [[SGF, SGF, SGF]], [[SGF]])
     qids, games = predict_rank.read_questions(str(tmp_path))
     assert qids == ['pub_0', 'priv_0']
-    assert [q for q, _ in games] == [0, 0, 0, 1]
+    assert [q for q, _, _ in games] == [0, 0, 0, 1]
 
 
 def test_decide_aggregates_per_question():
@@ -131,3 +135,84 @@ def test_decide_temperature_changes_log_pick():
     probs = np.array([lean_low] * 3 + [lean_high] * 2, np.float32)
     assert predict_rank.decide(1, [0] * 5, probs, 'log', 'pick', temp=1.0).tolist() == [3]
     assert predict_rank.decide(1, [0] * 5, probs, 'log', 'pick', temp=8.0).tolist() == [4]
+
+
+def _write_colored(tmp_path, games):
+    """public、private 各一題，games 為 (sgf, color) 清單。"""
+    row = {'question_id': 'q_0'}
+    for k in range(1, 21):
+        sgf, c = games[k - 1] if k <= len(games) else ('', '')
+        row['sgf_%d' % k], row['color_%d' % k] = sgf, c
+    for split in ('public', 'private'):
+        pd.DataFrame([row]).to_csv(tmp_path / ('rank_prediction_test_%s.csv' % split), index=False)
+
+
+def test_read_questions_pairs_color_with_game(tmp_path):
+    _write_colored(tmp_path, [(SGF, 'W'), (SGF, 'B')])
+    _, games = predict_rank.read_questions(str(tmp_path))
+    assert [c for _, _, c in games[:2]] == ['W', 'B']
+
+
+def test_game_colors_flip_handicap_only():
+    hd1 = SGF.replace('SZ[19]', 'SZ[19]HD[1]')
+    games = [(0, HD2_SGF, 'W'), (0, hd1, 'W'), (0, SGF, 'B')]
+    assert predict_rank.game_colors(games, raw_color=False).tolist() == [0, 1, 0]
+    assert predict_rank.game_colors(games, raw_color=True).tolist() == [1, 1, 0]
+
+
+def test_game_colors_reject_missing_column():
+    with pytest.raises(SystemExit, match='color_'):
+        predict_rank.game_colors([(0, SGF, None)], raw_color=False)
+
+
+def test_predict_games_applies_color():
+    torch.manual_seed(0)
+    model = GoRankResNet(in_channels=BOTH_CHANNELS, num_channels=8, num_blocks=1,
+                         num_classes=len(LEVELS)).eval()
+    probs = predict_rank.predict_games(model, [SGF, SGF], torch.device('cpu'), amp=False, batch_size=2,
+                                       nproc=1, colors=np.array([0, 1]), color_mode='both')
+    feat = torch.from_numpy(predict_rank.sgf_to_features(SGF)[None]).float()
+    with torch.no_grad():
+        expect = torch.softmax(model(color.apply_color(feat, torch.tensor([1]), 'both')), 1).numpy()
+    np.testing.assert_allclose(probs[1], expect[0], atol=1e-5)
+    assert not np.allclose(probs[0], probs[1], atol=1e-6)
+
+
+def test_predict_games_keeps_color_after_bad_sgf():
+    torch.manual_seed(0)
+    model = GoRankResNet(in_channels=BOTH_CHANNELS, num_channels=8, num_blocks=1,
+                         num_classes=len(LEVELS)).eval()
+    probs = predict_rank.predict_games(model, [SGF, 'not an sgf', SGF], torch.device('cpu'), amp=False,
+                                       batch_size=2, nproc=1, colors=np.array([0, 0, 1]), color_mode='both')
+    feat = torch.from_numpy(predict_rank.sgf_to_features(SGF)[None]).float()
+    with torch.no_grad():
+        expect = torch.softmax(model(color.apply_color(feat, torch.tensor([1]), 'both')), 1).numpy()
+    np.testing.assert_allclose(probs[2], expect[0], atol=1e-5)
+
+
+@pytest.mark.parametrize('raw_color, expected', [(False, [0, 0]), (True, [1, 0])], ids=['fixed', 'raw'])
+def test_main_follows_train_config(tmp_path, monkeypatch, raw_color, expected):
+    _write_colored(tmp_path, [(HD2_SGF, 'W'), (SGF, 'B')])
+    ckpt = _tiny_ckpt(tmp_path, BOTH_CHANNELS)
+    (tmp_path / 'train_config.json').write_text(
+        json.dumps({'color': 'both', 'raw_color': raw_color}), encoding='utf-8')
+    real, seen = predict_rank.predict_games, {}
+
+    def spy(model, sgfs, device, amp, batch_size, nproc, colors, color_mode):
+        seen.update(colors=colors, mode=color_mode)
+        return real(model, sgfs, device, amp, batch_size, nproc, colors, color_mode)
+
+    monkeypatch.setattr(predict_rank, 'predict_games', spy)
+    monkeypatch.setattr('sys.argv', [
+        'predict_rank', '--ckpt', ckpt, '--test-dir', str(tmp_path), '--out', str(tmp_path / 's.csv'),
+        '--probs', str(tmp_path / 'p.npz'), '--channels', '8', '--blocks', '1', '--nproc', '1'])
+    predict_rank.main()
+    assert seen['mode'] == 'both'
+    assert seen['colors'].tolist() == expected * 2  # public、private 各一題
+    assert len(pd.read_csv(tmp_path / 's.csv')) == 2
+
+
+def test_read_train_config_warns_when_missing(tmp_path, capsys):
+    cfg = predict_rank.read_train_config(str(tmp_path / 'best_model.pth'))
+    assert cfg == {'color': 'none', 'raw_color': False}
+    assert 'train_config.json' in capsys.readouterr().out

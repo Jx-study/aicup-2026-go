@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 import torch
 
-from aicup import packed, train_rank
+from aicup import color, packed, train_rank
 from aicup.scoring import LEVELS
 from network import GoRankResNet
 
@@ -42,14 +42,16 @@ def _load_probs(ckpt):
         return {k: z[k] for k in z.files}
 
 
-def _recompute(weights, feat):
-    model = GoRankResNet(num_channels=8, num_blocks=1, num_classes=len(LEVELS))
+def _recompute(weights, feat, mode='none', hd=None):
+    model = GoRankResNet(in_channels=color.in_channels(mode), num_channels=8, num_blocks=1,
+                         num_classes=len(LEVELS))
     model.load_state_dict(torch.load(weights, weights_only=True))
     model.eval()
     val = packed.load_split(str(feat / 'val'))
+    c = val['color'] if hd is None else color.feature_color(val['color'], hd)
     with torch.no_grad():
         x = packed.unpack_torch(torch.from_numpy(val['features']))
-        return torch.softmax(model(x), 1).numpy()
+        return torch.softmax(model(color.apply_color(x, torch.from_numpy(c).long(), mode)), 1).numpy()
 
 
 def test_val_probs_written_with_best_model(tmp_path, monkeypatch):
@@ -223,3 +225,126 @@ def test_min_epochs_delays_patience():
     assert not train_rank.patience_exhausted(h[:3], 2, min_epochs=6)
     late = [{'val_score_pick': s} for s in (0.1, 0.2, 0.3, 0.3, 0.3, 0.3)]
     assert train_rank.patience_exhausted(late, 3, min_epochs=6)
+
+
+def _write_hd(feat):
+    """給 train、val 兩邊的局寫 hd.npz，每 4 局有 1 局讓子。"""
+    keys = np.concatenate([packed.load_split(str(feat / s))['key'] for s in ('train', 'val')])
+    hd = np.array([3 if int(k.split('_g')[1]) % 4 == 0 else 0 for k in keys], np.int8)
+    np.savez(feat / 'hd.npz', key=keys, hd=hd)
+
+
+def test_color_requires_hd_map(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    with pytest.raises(SystemExit, match='hd.npz'):
+        _main(monkeypatch, feat, ckpt, '--epochs', '1', '--no-amp', '--color', 'both')
+
+
+def test_color_val_uses_feature_color(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    _write_hd(feat)
+    _main(monkeypatch, feat, ckpt, '--epochs', '1', '--no-amp', '--color', 'both')
+    val = packed.load_split(str(feat / 'val'))
+    hd = color.load_hd(str(feat / 'hd.npz'), val['key'])
+    saved = _load_probs(ckpt)['probs']
+    np.testing.assert_allclose(saved, _recompute(ckpt / 'best_model.pth', feat, 'both', hd), atol=1e-5)
+    assert not np.allclose(saved, _recompute(ckpt / 'best_model.pth', feat, 'both'), atol=1e-5)
+
+
+def test_raw_color_ignores_handicap(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    _main(monkeypatch, feat, ckpt, '--epochs', '1', '--no-amp', '--color', 'swap', '--raw-color')
+    np.testing.assert_allclose(_load_probs(ckpt)['probs'],
+                               _recompute(ckpt / 'best_model.pth', feat, 'swap'), atol=1e-5)
+
+
+def test_color_written_to_train_config(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    _write_hd(feat)
+    _main(monkeypatch, feat, ckpt, '--epochs', '1', '--no-amp', '--color', 'plane')
+    cfg = json.loads((ckpt / 'train_config.json').read_text(encoding='utf-8'))
+    assert cfg == {'color': 'plane', 'raw_color': False}
+
+
+def test_color_rejects_resume_with_other_mode(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    _write_hd(feat)
+    _main(monkeypatch, feat, ckpt, '--epochs', '1', '--no-amp', '--color', 'swap')
+    written = (ckpt / 'train_config.json').read_text(encoding='utf-8')
+    with pytest.raises(SystemExit, match='設定'):
+        _main(monkeypatch, feat, ckpt, '--epochs', '2', '--no-amp')
+    assert (ckpt / 'train_config.json').read_text(encoding='utf-8') == written  # 被拒絕時不能改掉設定
+
+
+def test_color_with_augment_runs(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    _write_hd(feat)
+    _main(monkeypatch, feat, ckpt, '--epochs', '1', '--no-amp', '--color', 'both', '--augment')
+    assert (ckpt / 'best_model.pth').exists()
+
+
+def test_use_amp_ignores_emulated_bf16(monkeypatch):
+    calls = []
+
+    def supported(including_emulation=True):
+        calls.append(including_emulation)
+        return including_emulation
+
+    monkeypatch.setattr(torch.cuda, 'is_bf16_supported', supported)
+    assert train_rank.use_amp(torch.device('cuda'), no_amp=False) is False
+    assert calls == [False]
+    assert train_rank.use_amp(torch.device('cpu'), no_amp=False) is True
+    assert train_rank.use_amp(torch.device('cpu'), no_amp=True) is False
+
+
+def test_raw_color_written_to_train_config(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    _main(monkeypatch, feat, ckpt, '--epochs', '1', '--no-amp', '--color', 'plane', '--raw-color')
+    cfg = json.loads((ckpt / 'train_config.json').read_text(encoding='utf-8'))
+    assert cfg == {'color': 'plane', 'raw_color': True}
+
+
+def test_batches_keep_color_aligned_with_order():
+    n = 6
+    feats = np.zeros((n, *packed.FEATURE_SHAPE), np.uint8)
+    feats[np.arange(n), 0, 0, np.arange(n)] = 1  # 第 0 個黑面的第 i 格標記第 i 局
+    x = torch.from_numpy(np.stack([packed.pack(f) for f in feats]))
+    y, c = torch.arange(n), torch.tensor([0, 1, 1, 0, 1, 0])
+    order = torch.tensor([3, 1, 5, 0, 4, 2])
+    seen = []
+    for xb, yb in train_rank.batches(x, y, 4, torch.device('cpu'), order, c, 'both'):
+        for feat, game in zip(xb, yb.tolist()):
+            seen.append(game)
+            target = int(c[game])
+            assert feat[target, 0, game] == 1  # 黑面或白面取決於這一局自己的顏色
+            assert feat[500].sum() == (361 if target == 0 else 0)
+    assert seen == order.tolist()
+
+
+def test_train_batches_get_corrected_color(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    _write_hd(feat)
+    real, seen = train_rank.batches, []
+
+    def spy(x, y, batch_size, device, order=None, c=None, mode='none'):
+        if order is not None:
+            seen.append(c)
+        return real(x, y, batch_size, device, order, c, mode)
+
+    monkeypatch.setattr(train_rank, 'batches', spy)
+    _main(monkeypatch, feat, ckpt, '--epochs', '1', '--no-amp', '--color', 'both')
+    train = packed.load_split(str(feat / 'train'))
+    hd = color.load_hd(str(feat / 'hd.npz'), train['key'])
+    np.testing.assert_array_equal(seen[0].numpy(), color.feature_color(train['color'], hd))
+
+
+def test_val_probs_backfill_uses_color(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    _write_hd(feat)
+    args = ('--epochs', '1', '--no-amp', '--color', 'both')
+    _main(monkeypatch, feat, ckpt, *args)
+    (ckpt / 'val_probs.npz').unlink()
+    _main(monkeypatch, feat, ckpt, *args)
+    hd = color.load_hd(str(feat / 'hd.npz'), packed.load_split(str(feat / 'val'))['key'])
+    np.testing.assert_allclose(_load_probs(ckpt)['probs'],
+                               _recompute(ckpt / 'best_model.pth', feat, 'both', hd), atol=1e-5)
