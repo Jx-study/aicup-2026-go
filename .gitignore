@@ -10,6 +10,7 @@ rank-features-*/
 player-features/
 rank-trained-models/
 player-trained-models/
+humansl-analysis/
 *.pth
 
 # 執行產出
