@@ -1,14 +1,16 @@
 import json
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 import torch
 
-from aicup import color, packed, train_rank
+from aicup import color, packed, symmetry, train_rank
 from aicup.scoring import LEVELS
 from network import GoRankResNet
+from tta_helpers import sharp_model, tta_expect
 
 
 def _write_split(split_dir, n, seed):
@@ -348,3 +350,32 @@ def test_val_probs_backfill_uses_color(tmp_path, monkeypatch):
     hd = color.load_hd(str(feat / 'hd.npz'), packed.load_split(str(feat / 'val'))['key'])
     np.testing.assert_allclose(_load_probs(ckpt)['probs'],
                                _recompute(ckpt / 'best_model.pth', feat, 'both', hd), atol=1e-5)
+
+
+
+def test_forward_probs_tta_averages_symmetries():
+    model = sharp_model()
+    x = torch.rand(3, 500, 19, 19)
+    with torch.no_grad():
+        got = train_rank.forward_probs(model, x, amp=False, tta=True)
+        logit_mean = torch.softmax(torch.stack([model(symmetry.apply(x, k).contiguous())
+                                                for k in range(symmetry.N_SYMMETRIES)]).mean(0), 1)
+        plain = train_rank.forward_probs(model, x, amp=False)
+        torch.testing.assert_close(plain, torch.softmax(model(x), 1))
+    torch.testing.assert_close(got, tta_expect(model, x))
+    # 平均機率與平均 logits、單一方向都要分得開，測試才抓得到這兩種錯誤
+    assert (got - logit_mean).abs().max() > 1e-3
+    assert (got - plain).abs().max() > 1e-3
+
+
+def test_validate_tta_loss_is_nll_of_averaged_probs(tmp_path):
+    feat, _ = _setup(tmp_path)
+    val = packed.load_split(str(feat / 'val'))
+    x, y = torch.from_numpy(val['features']), torch.from_numpy(val['rank_idx'].astype(np.int64))
+    args = SimpleNamespace(batch_size=4, color='none')
+    metrics, probs = train_rank.validate(sharp_model(), x, y, args, torch.device('cpu'), False,
+                                         torch.nn.CrossEntropyLoss(), tta=True)
+    nll = -np.log(probs[np.arange(len(probs)), val['rank_idx']])
+    # validate 的 val_loss 是各 batch 平均的平均，batch 4、4、2
+    expect = np.mean([nll[:4].mean(), nll[4:8].mean(), nll[8:].mean()])
+    assert metrics['val_loss'] == pytest.approx(expect, rel=1e-5)

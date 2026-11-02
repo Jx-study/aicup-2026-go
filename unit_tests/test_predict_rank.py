@@ -8,9 +8,14 @@ import torch
 from aicup import color, predict_rank
 from aicup.scoring import LEVELS
 from network import GoRankResNet
+from tta_helpers import sharp_model, tta_expect
 
 SGF = '(;GM[1]SZ[19];B[pd];W[dp];B[dd];W[pp])'
 HD2_SGF = SGF.replace('SZ[19]', 'SZ[19]HD[2]')
+_POINTS = np.random.default_rng(0).permutation(361)[:60]
+# 60 手不重複的隨機落點，盤面不對稱，8 個方向的輸入差異夠大
+ASYM_SGF = '(;GM[1]SZ[19]' + ''.join(';%s[%s%s]' % ('BW'[i % 2], chr(97 + p % 19), chr(97 + p // 19))
+                                     for i, p in enumerate(_POINTS)) + ')'
 BOTH_CHANNELS = color.in_channels('both')
 
 
@@ -198,9 +203,9 @@ def test_main_follows_train_config(tmp_path, monkeypatch, raw_color, expected):
         json.dumps({'color': 'both', 'raw_color': raw_color}), encoding='utf-8')
     real, seen = predict_rank.predict_games, {}
 
-    def spy(model, sgfs, device, amp, batch_size, nproc, colors, color_mode):
+    def spy(model, sgfs, device, amp, batch_size, nproc, colors, color_mode, **kw):
         seen.update(colors=colors, mode=color_mode)
-        return real(model, sgfs, device, amp, batch_size, nproc, colors, color_mode)
+        return real(model, sgfs, device, amp, batch_size, nproc, colors, color_mode, **kw)
 
     monkeypatch.setattr(predict_rank, 'predict_games', spy)
     monkeypatch.setattr('sys.argv', [
@@ -216,3 +221,47 @@ def test_read_train_config_warns_when_missing(tmp_path, capsys):
     cfg = predict_rank.read_train_config(str(tmp_path / 'best_model.pth'))
     assert cfg == {'color': 'none', 'raw_color': False}
     assert 'train_config.json' in capsys.readouterr().out
+
+
+def test_predict_games_tta_averages_symmetries():
+    model = sharp_model()
+    probs = predict_rank.predict_games(model, [ASYM_SGF], torch.device('cpu'), amp=False, batch_size=2,
+                                       nproc=1, tta=True)
+    plain = predict_rank.predict_games(model, [ASYM_SGF], torch.device('cpu'), amp=False, batch_size=2, nproc=1)
+    feat = torch.from_numpy(predict_rank.sgf_to_features(ASYM_SGF)[None]).float()
+    np.testing.assert_allclose(probs, tta_expect(model, feat).numpy(), atol=1e-5)
+    assert np.abs(probs - plain).max() > 1e-3
+
+
+def test_predict_games_tta_with_color():
+    model = sharp_model(BOTH_CHANNELS)
+    probs = predict_rank.predict_games(model, [ASYM_SGF], torch.device('cpu'), amp=False, batch_size=2,
+                                       nproc=1, colors=np.array([1]), color_mode='both', tta=True)
+    feat = torch.from_numpy(predict_rank.sgf_to_features(ASYM_SGF)[None]).float()
+    expect = tta_expect(model, color.apply_color(feat, torch.tensor([1]), 'both')).numpy()
+    np.testing.assert_allclose(probs, expect, atol=1e-5)
+
+
+def test_main_rejects_cache_with_other_tta(tmp_path, monkeypatch):
+    _write_tests(tmp_path, [[SGF]], [[SGF]])
+    argv = ['predict_rank', '--ckpt', _tiny_ckpt(tmp_path), '--test-dir', str(tmp_path),
+            '--out', str(tmp_path / 's.csv'), '--probs', str(tmp_path / 'probs.npz'),
+            '--channels', '8', '--blocks', '1', '--nproc', '1']
+    monkeypatch.setattr('sys.argv', argv + ['--tta'])
+    predict_rank.main()
+    predict_rank.main()  # 同樣開 TTA 可以沿用快取
+    monkeypatch.setattr('sys.argv', argv)
+    with pytest.raises(SystemExit, match='TTA'):
+        predict_rank.main()
+
+
+def test_main_rejects_old_cache_without_tta_field(tmp_path, monkeypatch):
+    _write_tests(tmp_path, [[SGF]], [[SGF]])
+    ckpt = _tiny_ckpt(tmp_path)
+    np.savez(tmp_path / 'probs.npz', probs=np.full((2, 10), 0.1, np.float32), game_q=np.arange(2),
+             ckpt_sha256=predict_rank.file_sha256(ckpt))
+    monkeypatch.setattr('sys.argv', [
+        'predict_rank', '--ckpt', ckpt, '--test-dir', str(tmp_path), '--out', str(tmp_path / 's.csv'),
+        '--probs', str(tmp_path / 'probs.npz'), '--tta'])
+    with pytest.raises(SystemExit, match='TTA'):
+        predict_rank.main()

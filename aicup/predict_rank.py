@@ -8,6 +8,7 @@ public 與 private 兩份題目都要預測，串接成同一份提交檔，ques
 用法（在 repo 根目錄）：
     !python -m aicup.predict_rank --ckpt rank-trained-models/<commit hash>/best_model.pth
     !python -m aicup.predict_rank --ckpt ... --agg mean --select argmax --temp 1 --probs game_probs.npz
+    !python -m aicup.predict_rank --ckpt ... --tta --probs game_probs_tta.npz
 """
 import argparse
 import hashlib
@@ -82,12 +83,14 @@ def read_train_config(ckpt):
         return json.load(f)
 
 
-def predict_games(model, sgfs, device, amp, batch_size=64, nproc=1, colors=None, color_mode='none'):
+def predict_games(model, sgfs, device, amp, batch_size=64, nproc=1, colors=None, color_mode='none', tta=False):
     """逐局預測等級機率，形狀 (G, 10)；解析失敗的局整列填 NaN。
 
-    colors 是逐局的特徵顏色，color_mode 不是 none 時必須提供。
+    colors 是逐局的特徵顏色，color_mode 不是 none 時必須提供；tta 時平均 8 種對稱方向。
     """
     import torch
+
+    from aicup.train_rank import forward_probs
 
     probs = np.full((len(sgfs), NUM_CLASSES), np.nan, np.float32)
     pool = Pool(nproc) if nproc > 1 else None
@@ -100,9 +103,8 @@ def predict_games(model, sgfs, device, amp, batch_size=64, nproc=1, colors=None,
         if color_mode != 'none':
             c = torch.from_numpy(colors[idx].astype(np.int64)).to(device)
             x = color.apply_color(x, c, color_mode)
-        with torch.no_grad(), torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
-            out = model(x)
-        probs[idx] = torch.softmax(out.float(), 1).cpu().numpy()
+        with torch.no_grad():
+            probs[idx] = forward_probs(model, x, amp, tta).cpu().numpy()
         buf.clear()
         idx.clear()
 
@@ -174,6 +176,7 @@ def main():
     ap.add_argument('--batch-size', type=int, default=64)
     ap.add_argument('--nproc', type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument('--no-amp', action='store_true', help='關閉 bf16，改用純 fp32')
+    ap.add_argument('--tta', action='store_true', help='每局平均 8 種對稱方向的機率，推論時間約 8 倍')
     args = ap.parse_args()
 
     qids, games = read_questions(args.test_dir)
@@ -188,6 +191,9 @@ def main():
             raise SystemExit('%s 不是 %s 產生的，請刪除或改用其他 --probs' % (args.probs, args.ckpt))
         if len(z['probs']) != len(games) or not np.array_equal(z['game_q'], game_q):
             raise SystemExit('%s 與目前的測試資料對不上，請刪除後重跑' % args.probs)
+        cached_tta = bool(z['tta']) if 'tta' in z.files else False  # 舊快取沒有這個欄位，都是未開 TTA
+        if cached_tta != args.tta:
+            raise SystemExit('%s 的 TTA 設定是 %s，和這次不同，請刪除或改用其他 --probs' % (args.probs, cached_tta))
         probs = z['probs']
         print('讀取快取 %s' % args.probs)
     else:
@@ -202,8 +208,8 @@ def main():
         colors = None if cfg['color'] == 'none' else game_colors(games, cfg['raw_color'])
         model = load_model(args.ckpt, args.channels, args.blocks, device, color.in_channels(cfg['color']))
         probs = predict_games(model, [s for _, s, _ in games], device, amp, args.batch_size, args.nproc,
-                              colors, cfg['color'])
-        np.savez(args.probs, probs=probs, game_q=game_q, ckpt_sha256=file_sha256(args.ckpt))
+                              colors, cfg['color'], tta=args.tta)
+        np.savez(args.probs, probs=probs, game_q=game_q, ckpt_sha256=file_sha256(args.ckpt), tta=args.tta)
 
     failed = int(np.isnan(probs).any(axis=1).sum())
     if failed:

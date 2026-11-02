@@ -33,6 +33,7 @@ from network import GoRankResNet
 
 NUM_CLASSES = len(LEVELS)
 GPU_MARGIN_GB = 14  # 資料之外留給模型訓練的 VRAM，教學版設定約需 9 GB
+EPS = 1e-12  # log 前的下限，與 scoring.aggregate_games 一致
 
 
 def parse_args():
@@ -161,17 +162,28 @@ def log_run(ckpt_dir, start_epoch, device):
         f.write(json.dumps(run, ensure_ascii=False) + '\n')
 
 
-def validate(model, x, y, args, device, amp, criterion, c=None):
-    """回傳 (指標 dict, 逐局機率 (N, 10) float32)。"""
+def forward_probs(model, x, amp, tta=False):
+    """回傳等級機率 (B, 10)；tta 時平均 8 種對稱方向的機率。"""
+    views = range(symmetry.N_SYMMETRIES) if tta else (0,)
+    total = 0
+    for k in views:
+        with torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=amp):
+            out = model(symmetry.apply(x, k).contiguous() if k else x)
+        total = total + torch.softmax(out.float(), 1)
+    return total / len(views)
+
+
+def validate(model, x, y, args, device, amp, criterion, c=None, tta=False):
+    """回傳 (指標 dict, 逐局機率 (N, 10) float32)；tta 時機率與 val_loss 都用 8 種對稱方向的平均機率。"""
     model.eval()
     loss_sum, batches_n, probs = 0.0, 0, []
     with torch.no_grad():
         for xb, yb in batches(x, y, args.batch_size, device, c=c, mode=args.color):
-            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
-                out = model(xb)
-            loss_sum += criterion(out.float(), yb).item()
+            p = forward_probs(model, xb, amp, tta)
+            # 機率總和為 1，對 log p 取 cross entropy 等於 p 的 NLL
+            loss_sum += criterion(torch.log(p.clamp_min(EPS)), yb).item()
             batches_n += 1
-            probs.append(torch.softmax(out.float(), 1).cpu().numpy())
+            probs.append(p.cpu().numpy())
     model.train()
     probs, labels = np.concatenate(probs), y.cpu().numpy()
     metrics = {
