@@ -1,8 +1,8 @@
 """KataGo Human SL 分析：目標玩家每一手在各棋力 profile 下的落子機率
 
-每局對 PROFILES 的每個 profile 送一個 analysis query，analyzeTurns 列出目標玩家要落子的回合，
+每局對選定的每個 profile（預設是全部 PROFILES）送一個 analysis query，analyzeTurns 列出目標玩家要落子的回合，
 記錄實際落子在 humanPolicy 中的機率。每局另送一個不帶 profile 的 query，評估目標玩家落子前後的局面，
-記錄每手的目數損失與勝率損失。結果追加寫入 jsonl，每局一行，重跑會跳過已完成的局。
+記錄每手的目數損失與勝率損失，--no-eval 時不送。結果追加寫入 jsonl，每局一行，重跑會跳過已完成的局。
 
 用法（Colab，KataGo 執行檔在 --katago-dir，模型在 --model-dir）：
     !python -m aicup.analyze_humansl --players-per-rank 1 --games-per-player 10 --out humansl-analysis/pilot.jsonl
@@ -188,8 +188,11 @@ class Engine:
         self.proc.terminate()
 
 
-def analyze_group(engine, games, rules, max_turns, eval_visits=1):
-    """同時送出一組局的所有 query，回傳可寫入 jsonl 的 dict 清單，失敗的局略過。"""
+def analyze_group(engine, games, rules, max_turns, eval_visits=1, profiles=PROFILES):
+    """同時送出一組局的所有 query，回傳可寫入 jsonl 的 dict 清單，失敗的局略過。
+
+    probs 的列順序和 profiles 相同。eval_visits 為 0 時不送損失 query，輸出沒有損失欄位。
+    """
     queries, meta = [], {}
     for g in games:
         turns = target_turns(g['parsed']['moves'], g['color'], max_turns)
@@ -197,27 +200,30 @@ def analyze_group(engine, games, rules, max_turns, eval_visits=1):
             continue
         meta[g['key']] = (g, turns)
         queries += [build_query('%s|%d' % (g['key'], i), g['parsed'], turns, prof, rules)
-                    for i, prof in enumerate(PROFILES)]
-        queries.append(build_eval_query('%s|eval' % g['key'], g['parsed'], turns, rules, eval_visits))
+                    for i, prof in enumerate(profiles)]
+        if eval_visits:
+            queries.append(build_eval_query('%s|eval' % g['key'], g['parsed'], turns, rules, eval_visits))
     resp = engine.run(queries)
     rows = []
     for key, (g, turns) in meta.items():
-        per_profile = [resp['%s|%d' % (key, i)] for i in range(len(PROFILES))]
-        evals = resp['%s|eval' % key]
+        per_profile = [resp['%s|%d' % (key, i)] for i in range(len(profiles))]
+        evals = resp['%s|eval' % key] if eval_visits else {}
         if evals is None or any(r is None for r in per_profile):
             continue
         probs = np.array([[r[t]['humanPolicy'][policy_index(g['parsed']['moves'][t][1])] for t in turns]
                           for r in per_profile])
         probs[probs < 0] = np.nan  # -1 代表該點在這組規則下不合法
-        score_loss, winrate_loss = move_losses({t: r['rootInfo'] for t, r in evals.items()},
-                                               turns, g['color'])
-        rows.append({'key': key, 'rank_idx': g['rank_idx'], 'player_id': g['player_id'],
-                     'hd': g['parsed']['hd'],
-                     'color': g['color'],
-                     'turns': turns, 'eval_visits': eval_visits,
-                     'probs': np.round(probs, 6).tolist(),
-                     'score_loss': np.round(score_loss, 3).tolist(),
-                     'winrate_loss': np.round(winrate_loss, 5).tolist()})
+        row = {'key': key, 'rank_idx': g['rank_idx'], 'player_id': g['player_id'],
+               'hd': g['parsed']['hd'],
+               'color': g['color'],
+               'turns': turns, 'eval_visits': eval_visits, 'profiles': list(profiles),
+               'probs': np.round(probs, 6).tolist()}
+        if eval_visits:
+            score_loss, winrate_loss = move_losses({t: r['rootInfo'] for t, r in evals.items()},
+                                                   turns, g['color'])
+            row['score_loss'] = np.round(score_loss, 3).tolist()
+            row['winrate_loss'] = np.round(winrate_loss, 5).tolist()
+        rows.append(row)
     return rows
 
 
@@ -235,13 +241,40 @@ def sample_players(df, players_per_rank, games_per_player, seed):
             .sample(n=games_per_player, random_state=seed))
 
 
-def load_games(csv_glob, per_rank, seed, limit, players_per_rank=0, games_per_player=20):
-    """讀 CSV 並抽樣，回傳每局一個 dict。players_per_rank 非 0 時依玩家抽樣，忽略 per_rank。"""
+def sample_listed_players(df, players, games_per_player, seed):
+    """只留 players 內 (player_id, rank) 的局，每人抽 games_per_player 局，seed 用法同 sample_players()。
+
+    同一個 player_id 可能出現在不同等級，所以連同 rank 比對。局數不足的玩家以 SystemExit 拒絕。
+    回傳順序只由清單內容與 seed 決定，和清單的列順序無關。
+    """
+    listed = pd.MultiIndex.from_frame(players[['player_id', 'rank']].astype(str))
+    key = [df['player_id'].astype(str), df['rank'].astype(str)]
+    df = df[pd.MultiIndex.from_arrays(key).isin(listed)]
+    groups = df.groupby([df['player_id'].astype(str), df['rank'].astype(str)], group_keys=False)
+    counts = groups.size().reindex(listed, fill_value=0)
+    short = counts[counts < games_per_player]
+    if len(short):
+        raise SystemExit('局數不足 %d 的玩家：%s' % (games_per_player, short.to_dict()))
+    return groups.sample(n=games_per_player, random_state=seed)
+
+
+def load_games(csv_glob, per_rank, seed, limit, players_per_rank=0, games_per_player=20,
+               players_file=None):
+    """讀 CSV 並抽樣，回傳每局一個 dict。
+
+    players_file 是含 player_id、rank 欄位的 CSV，給定時只抽清單內的玩家，不能和 per_rank、players_per_rank 同時使用。
+    players_per_rank 非 0 時依玩家抽樣，忽略 per_rank。
+    """
+    if players_file and (per_rank or players_per_rank):
+        raise SystemExit('--players-file 不能和 --per-rank、--players-per-rank 同時使用')
     paths = sorted(glob.glob(csv_glob))
     if not paths:
         raise SystemExit('找不到 %s' % csv_glob)
     df = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
-    if players_per_rank:
+    if players_file:
+        # player_id 全是數字時預設會被讀成整數
+        df = sample_listed_players(df, pd.read_csv(players_file, dtype=str), games_per_player, seed)
+    elif players_per_rank:
         df = sample_players(df, players_per_rank, games_per_player, seed)
     elif per_rank:
         df = df.groupby('rank', group_keys=False).sample(n=per_rank, random_state=seed)
@@ -253,15 +286,26 @@ def load_games(csv_glob, per_rank, seed, limit, players_per_rank=0, games_per_pl
             for _, r in df.iterrows()]
 
 
-def done_keys(path, eval_visits):
-    """已完成的 key。檔案裡的 eval_visits 不同或沒有這個欄位時拒絕接續，避免混用兩種損失。"""
+def done_keys(path, eval_visits, profiles=PROFILES):
+    """已完成的 key。檔案裡的 eval_visits 或 profiles 和這次不同時拒絕接續，避免同一檔混用兩種設定。
+
+    沒有 eval_visits 欄位的列視為不同，沒有 profiles 欄位的列視為全部 PROFILES。
+    """
     if not os.path.exists(path):
         return set()
     with open(path, encoding='utf-8') as f:
         rows = [json.loads(line) for line in f if line.strip()]
     if any(r.get('eval_visits') != eval_visits for r in rows):
         raise SystemExit('%s 的 eval_visits 不是 %d，請換一個 --out' % (path, eval_visits))
+    if any(r.get('profiles', PROFILES) != list(profiles) for r in rows):
+        raise SystemExit('%s 的 profiles 不是 %s，請換一個 --out' % (path, ' '.join(profiles)))
     return {r['key'] for r in rows}
+
+
+def check_profiles(profiles):
+    unknown = [p for p in profiles if p not in PROFILES]
+    if unknown:
+        raise SystemExit('未知的 profile：%s，可用的有 %s' % (' '.join(unknown), ' '.join(PROFILES)))
 
 
 def main():
@@ -270,6 +314,7 @@ def main():
     ap.add_argument('--per-rank', type=int, default=0, help='每個等級抽幾局，0 為全部')
     ap.add_argument('--players-per-rank', type=int, default=0, help='每個等級抽幾位玩家，非 0 時忽略 --per-rank')
     ap.add_argument('--games-per-player', type=int, default=20, help='每位玩家抽幾局，局數不足的玩家不抽')
+    ap.add_argument('--players-file', help='含 player_id、rank 欄位的 CSV，只抽清單內的玩家，有人局數不足時拒絕')
     ap.add_argument('--limit', type=int, default=0, help='最多分析幾局，用於冒煙測試')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--out', default='humansl-analysis/humansl.jsonl')
@@ -281,17 +326,21 @@ def main():
     ap.add_argument('--default-komi', type=float, default=6.5, help='SGF 沒有 KM 且不是讓先、讓子時使用')
     ap.add_argument('--max-turns', type=int, default=0, help='每局最多分析目標玩家的前幾手，0 為全部')
     ap.add_argument('--eval-visits', type=int, default=1, help='算每手損失的 query 用的 maxVisits')
+    ap.add_argument('--no-eval', action='store_true', help='不送算損失的 query，eval_visits 記為 0')
+    ap.add_argument('--profiles', nargs='+', default=PROFILES, help='要送 query 的 profile，預設全部')
     ap.add_argument('--group', type=int, default=8, help='同時送出幾局')
     # 1 visit 用不到搜尋執行緒，改用多個 query 並行填滿 GPU 批次
     ap.add_argument('--override-config', default='numAnalysisThreads=32,numSearchThreadsPerAnalysisThread=1',
                     help='passed to katago as -override-config; empty string keeps the config file values')
     args = ap.parse_args()
+    check_profiles(args.profiles)
+    eval_visits = 0 if args.no_eval else args.eval_visits
 
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
-    done = done_keys(args.out, args.eval_visits)
+    done = done_keys(args.out, eval_visits, args.profiles)
     todo, bad = [], 0
     for g in load_games(args.csv, args.per_rank, args.seed, args.limit,
-                        args.players_per_rank, args.games_per_player):
+                        args.players_per_rank, args.games_per_player, args.players_file):
         if g['key'] in done:
             continue
         try:
@@ -311,7 +360,7 @@ def main():
         with open(args.out, 'a', encoding='utf-8') as f:
             for i in range(0, len(todo), args.group):
                 rows = analyze_group(engine, todo[i:i + args.group], args.rules, args.max_turns,
-                                     args.eval_visits)
+                                     eval_visits, args.profiles)
                 for r in rows:
                     f.write(json.dumps(r) + '\n')
                 f.flush()

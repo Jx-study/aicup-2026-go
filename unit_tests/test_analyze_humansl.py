@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from aicup import analyze_humansl as ah
+from aicup import fit_humansl
 
 
 def test_to_gtp_skips_letter_i():
@@ -200,6 +201,37 @@ def test_analyze_group_max_turns_limits_evals():
     assert [q['analyzeTurns'] for q in engine.queries if q['id'] == 'D_1|eval'] == [[0, 1]]
 
 
+P3 = ['rank_11k', 'rank_1d', 'rank_6d']
+
+
+def test_analyze_group_sends_only_selected_profiles():
+    g = {'key': 'D_1', 'rank_idx': 0, 'player_id': 'p1', 'color': 'B', 'parsed': THREE_MOVES}
+    engine = FakeEngine(0.25)
+    r = ah.analyze_group(engine, [g], 'chinese', 0, profiles=P3)[0]
+    sent = [q['overrideSettings']['humanSLProfile'] for q in engine.queries if 'overrideSettings' in q]
+    assert sent == P3
+    assert np.array(r['probs']).shape == (3, 2) and r['profiles'] == P3
+
+
+def test_analyze_group_default_records_all_profiles():
+    g = {'key': 'D_1', 'rank_idx': 0, 'player_id': 'p1', 'color': 'B', 'parsed': THREE_MOVES}
+    assert ah.analyze_group(FakeEngine(0.25), [g], 'chinese', 0)[0]['profiles'] == ah.PROFILES
+
+
+def test_analyze_group_no_eval_skips_eval_query_and_loss_fields():
+    g = {'key': 'D_1', 'rank_idx': 0, 'player_id': 'p1', 'color': 'B', 'parsed': THREE_MOVES}
+    engine = FakeEngine(0.25)
+    r = ah.analyze_group(engine, [g], 'chinese', 0, eval_visits=0)[0]
+    assert not any(q['id'].endswith('|eval') for q in engine.queries)
+    assert 'score_loss' not in r and 'winrate_loss' not in r and r['eval_visits'] == 0
+
+
+def test_check_profiles_rejects_unknown_name():
+    ah.check_profiles(P3)
+    with pytest.raises(SystemExit, match='rank_7d.*rank_11k'):
+        ah.check_profiles(['rank_1d', 'rank_7d'])
+
+
 def make_engine(responses):
     """不啟動 KataGo，回應預先放進 queue，讓 Engine.run 的迴圈可以直接測。"""
     engine = ah.Engine.__new__(ah.Engine)
@@ -268,6 +300,59 @@ def test_load_games_by_player_is_json_serializable(tmp_path):
     json.dumps(games)
 
 
+def listed_df():
+    # a 在 D 有 5 局、在 C 有 2 局，b 在 C 有 4 局，c 在 D 有 6 局
+    rows = [('a', 'D')] * 5 + [('a', 'C')] * 2 + [('b', 'C')] * 4 + [('c', 'D')] * 6
+    df = pd.DataFrame(rows, columns=['player_id', 'rank'])
+    df['game_id'] = range(len(df))
+    return df
+
+
+LISTED = pd.DataFrame({'player_id': ['b', 'a'], 'rank': ['C', 'D']})
+
+
+def test_sample_listed_players_keeps_only_listed_rank():
+    out = ah.sample_listed_players(listed_df(), LISTED, 4, seed=42)
+    assert out.groupby(['player_id', 'rank']).size().to_dict() == {('a', 'D'): 4, ('b', 'C'): 4}
+
+
+def test_sample_listed_players_order_ignores_list_order():
+    a = ah.sample_listed_players(listed_df(), LISTED, 3, seed=42)
+    b = ah.sample_listed_players(listed_df(), LISTED.iloc[::-1], 3, seed=42)
+    assert a['game_id'].tolist() == b['game_id'].tolist()
+
+
+def test_sample_listed_players_rejects_short_player():
+    players = pd.DataFrame({'player_id': ['a', 'b', 'x'], 'rank': ['C', 'C', 'D']})
+    with pytest.raises(SystemExit, match="'a', 'C'.*'x', 'D'"):
+        ah.sample_listed_players(listed_df(), players, 4, seed=42)
+
+
+def write_train_csv(tmp_path):
+    df = listed_df()
+    df['color'], df['sgf_content'] = 'B', '(;SZ[19])'
+    for rank, part in df.groupby('rank'):
+        part.to_csv(tmp_path / ('train_%s.csv' % rank), index=False)
+    LISTED.to_csv(tmp_path / 'players.csv', index=False)
+    return str(tmp_path / 'train_*.csv'), str(tmp_path / 'players.csv')
+
+
+def test_load_games_players_file(tmp_path):
+    csv_glob, players = write_train_csv(tmp_path)
+    games = ah.load_games(csv_glob, 0, 42, 0, games_per_player=4, players_file=players)
+    again = ah.load_games(csv_glob, 0, 42, 0, games_per_player=4, players_file=players)
+    assert len(games) == 8 and [g['key'] for g in games] == [g['key'] for g in again]
+    assert {(g['player_id'], ah.LEVELS[g['rank_idx']]) for g in games} == {('a', 'D'), ('b', 'C')}
+
+
+@pytest.mark.parametrize('per_rank, players_per_rank', [(1, 0), (0, 1)])
+def test_load_games_players_file_rejects_other_sampling(tmp_path, per_rank, players_per_rank):
+    csv_glob, players = write_train_csv(tmp_path)
+    with pytest.raises(SystemExit, match='--players-file'):
+        ah.load_games(csv_glob, per_rank, 42, 0, players_per_rank=players_per_rank,
+                      games_per_player=4, players_file=players)
+
+
 def write_jsonl(path, rows):
     path.write_text(''.join(json.dumps(r) + '\n' for r in rows), encoding='utf-8')
 
@@ -287,6 +372,27 @@ def test_done_keys_rejects_mismatched_or_old_rows(tmp_path, row):
         ah.done_keys(str(p), 1)
 
 
+def test_done_keys_resumes_same_profiles(tmp_path):
+    p = tmp_path / 'a.jsonl'
+    write_jsonl(p, [{'key': 'D_1', 'eval_visits': 0, 'profiles': P3}])
+    assert ah.done_keys(str(p), 0, P3) == {'D_1'}
+
+
+def test_done_keys_rejects_different_profiles(tmp_path):
+    p = tmp_path / 'a.jsonl'
+    write_jsonl(p, [{'key': 'D_1', 'eval_visits': 0, 'profiles': P3}])
+    with pytest.raises(SystemExit, match='--out'):
+        ah.done_keys(str(p), 0, ['rank_11k', 'rank_6d'])
+
+
+def test_done_keys_treats_missing_profiles_as_all(tmp_path):
+    p = tmp_path / 'a.jsonl'
+    write_jsonl(p, [{'key': 'D_1', 'eval_visits': 1}])
+    assert ah.done_keys(str(p), 1) == {'D_1'}
+    with pytest.raises(SystemExit):
+        ah.done_keys(str(p), 1, P3)
+
+
 def test_analyze_group_skips_failed_game():
     g = {'key': 'D_1', 'rank_idx': 0, 'player_id': 'p1', 'color': 'B',
          'parsed': {'moves': [('B', (18, 0))], 'initial_stones': [], 'komi': 7.5, 'hd': 0}}
@@ -304,3 +410,13 @@ def test_analyze_group_marks_illegal_as_nan():
          'parsed': {'moves': [('B', (18, 0))], 'initial_stones': [], 'komi': 7.5, 'hd': 0}}
     rows = ah.analyze_group(FakeEngine(-1.0), [g], 'chinese', 0)
     assert np.isnan(np.array(rows[0]['probs'], dtype=float)).all()
+
+
+def test_no_eval_rows_load_in_fit_humansl(tmp_path):
+    games = [{'key': 'D_%d' % i, 'rank_idx': 0, 'player_id': 'p1', 'color': 'B', 'parsed': THREE_MOVES}
+             for i in range(2)]
+    rows = ah.analyze_group(FakeEngine(0.25), games, 'chinese', 0, eval_visits=0, profiles=P3)
+    p = tmp_path / 'a.jsonl'
+    write_jsonl(p, rows)
+    out = fit_humansl.load_games(str(p))
+    assert out['n_profiles'] == 3 and out['has_loss'] is False
