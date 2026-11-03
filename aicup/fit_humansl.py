@@ -210,15 +210,20 @@ def evaluate_grid(data, splits, games, train_repeats, seed, only=None):
     return sorted(results, key=lambda r: -np.mean(list(player_means(r[1], players).values())))
 
 
+def read_val_probs(path):
+    """讀 val_probs.npz，回傳 (key 對應列號的 dict, 每局機率, rank_idx 或 None)。"""
+    with np.load(path, allow_pickle=False) as z:
+        val_keys, probs = z['key'], z['probs']
+        val_rank = z['rank_idx'] if 'rank_idx' in z.files else None
+    return {k: i for i, k in enumerate(val_keys)}, probs, val_rank
+
+
 def cnn_question_points(path, keys, questions, labels, temp):
     """CNN 在同一批題目上的 log + pick 得分。回傳 (題目遮罩, 得分)，遮罩標出全部局都在 val_probs 的題目。
 
     val_probs 有 rank_idx 時，檢查涵蓋的局和題目的等級一致，避免檔案版本對不上。
     """
-    with np.load(path, allow_pickle=False) as z:
-        val_keys, probs = z['key'], z['probs']
-        val_rank = z['rank_idx'] if 'rank_idx' in z.files else None
-    index = {k: i for i, k in enumerate(val_keys)}
+    index, probs, val_rank = read_val_probs(path)
     covered = np.array([all(keys[g] in index for g in q) for q in questions])
     if val_rank is not None:
         for q, y in zip(np.array(questions, dtype=object)[covered], np.asarray(labels)[covered]):
