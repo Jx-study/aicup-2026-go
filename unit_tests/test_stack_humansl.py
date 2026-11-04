@@ -158,6 +158,7 @@ def test_main_runs_end_to_end_on_toy_data(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     for name in ('stacking', 'CNN 重新擬合', 'Human SL avg A C=0.1', 'CNN', 'stacking - CNN', '暫定門檻'):
         assert name in out
-    # 玩具資料的 CNN 與 Human SL 都有訊號，stacking 應不輸 CNN，門檻判定要和印出的區間下限一致
+    # 門檻判定要和印出的區間下限一致
     lo = float(re.search(r'stacking - CNN：\S+，95% 區間 (\S+)～', out).group(1))
-    assert ('通過' in out.split('暫定門檻')[1].split('：')[1]) == (lo > 0)
+    verdict = out.split('暫定門檻')[1].split('：')[1].strip()
+    assert verdict == ('通過' if lo > 0 else '未通過')

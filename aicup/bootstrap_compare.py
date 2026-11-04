@@ -2,9 +2,9 @@
 
 做法：
     兩份 val_probs 的局必須相同（以 key 對齊）。
-    每次重抽 val 玩家（玩家以 (player_id, rank_idx) 區分，可重複抽到），兩個版本用同一批玩家與同一組切題。
+    每次重抽 val 玩家（玩家以 (player_id, rank_idx) 區分，可重複抽到），兩個版本用同一批玩家與同一組題目。
     單局分數：重抽後的各局得分平均。
-    模擬題分數：重抽後的玩家各自切題（切法同 eval_posthoc），兩版預測同一批題目。
+    模擬題分數：重抽到的玩家每抽到一次出 1 題（出題方式同 eval_posthoc），兩版預測同一批題目。
 
 用法（在 repo 根目錄）：
     python -m aicup.bootstrap_compare rank-trained-models/<A>/val_probs.npz rank-trained-models/<B>/val_probs.npz
@@ -16,7 +16,7 @@ import csv
 
 import numpy as np
 
-from aicup.eval_posthoc import load_val_probs
+from aicup.eval_posthoc import SIZES, check_sizes, load_val_probs, parse_sizes, pick_question, sizes_text
 from aicup.scoring import NEAR_SCORE, apply_temperature, pick_level
 
 EPS = 1e-12  # log 前的下限，與 scoring.aggregate_games 一致
@@ -48,23 +48,21 @@ def game_scores(labels, preds):
     return np.where(diff == 0, 1.0, np.where(diff == 1, NEAR_SCORE, 0.0))
 
 
-def cut_questions(members, draw, min_games, max_games, rng):
-    """對重抽到的玩家各自切題，回傳 (局 index 串接陣列, 每題起點, 每題所屬玩家的編號)。"""
+def cut_questions(members, draw, sizes, rng):
+    """重抽到的玩家每抽到一次出 1 題，回傳 (局 index 串接陣列, 每題起點, 每題所屬玩家的編號)。"""
+    sizes = check_sizes(sizes)
     flat, starts, owner = [], [], []
     pos = 0
     for c in draw:
-        idx = rng.permutation(members[c])
-        s = 0
-        while len(idx) - s >= min_games:
-            n = int(rng.integers(min_games, max_games + 1))
-            chunk = idx[s:s + n]  # 最後一題可能不足 n 局，與 eval_posthoc 相同
-            flat.append(chunk)
-            starts.append(pos)
-            owner.append(c)
-            pos += len(chunk)
-            s += n
+        chunk = pick_question(members[c], sizes, rng)
+        if chunk is None:
+            continue
+        flat.append(chunk)
+        starts.append(pos)
+        owner.append(c)
+        pos += len(chunk)
     if not flat:
-        raise ValueError('重抽的玩家都不足 %d 局，無法切題' % min_games)
+        raise ValueError('重抽的玩家都不足 %d 局，無法出題' % sizes[0])
     return np.concatenate(flat), np.array(starts), np.array(owner)
 
 
@@ -85,8 +83,7 @@ def single_preds(probs, select):
     return probs.argmax(1) if select == 'argmax' else pick_level(probs)
 
 
-def paired_bootstrap(probs_a, probs_b, player_id, rank_idx, repeats, min_games, max_games, agg, select, seed,
-                     temp=1.0):
+def paired_bootstrap(probs_a, probs_b, player_id, rank_idx, repeats, sizes, agg, select, seed, temp=1.0):
     """回傳 {'single': (A, B) 各次分數, 'questions': (A, B) 各次分數}，每個元素是長度 repeats 的陣列。
 
     單局分數用原始機率；模擬題先對每局機率做溫度縮放再合併，與 predict_rank 的推論一致。
@@ -112,7 +109,7 @@ def paired_bootstrap(probs_a, probs_b, player_id, rank_idx, repeats, min_games, 
         w = np.bincount(draw, minlength=n_players)
         for k in range(2):
             single[k, r] = (single_sum[k] * w).sum() / (counts * w).sum()
-        flat, starts, owner = cut_questions(members, draw, min_games, max_games, rng)
+        flat, starts, owner = cut_questions(members, draw, sizes, rng)
         q_labels = member_labels[owner]
         for k, probs in enumerate(q_probs):
             preds = predict_cut(probs, logp[k], flat, starts, agg, select)
@@ -143,8 +140,7 @@ def main():
     ap.add_argument('probs_a', help='比較對象的 val_probs.npz')
     ap.add_argument('probs_b', help='新版本的 val_probs.npz，差值為 B 減 A')
     ap.add_argument('--repeats', type=int, default=1000)
-    ap.add_argument('--min-games', type=int, default=5)
-    ap.add_argument('--max-games', type=int, default=20)
+    ap.add_argument('--sizes', type=parse_sizes, default=SIZES, help='每題局數，逗號分隔，預設 5,10,15,20')
     ap.add_argument('--agg', choices=('mean', 'log'), default='log')
     ap.add_argument('--select', choices=('argmax', 'pick'), default='pick')
     ap.add_argument('--temp', type=float, default=3.0, help='模擬題每局機率的溫度，預設同 predict_rank')
@@ -152,8 +148,6 @@ def main():
     ap.add_argument('--history-a', help='A 的 history.csv，用來比最後 4 個 epoch 的 val_score_pick 平均')
     ap.add_argument('--history-b', help='B 的 history.csv')
     args = ap.parse_args()
-    if not 1 <= args.min_games <= args.max_games:
-        ap.error('需要 1 <= min-games <= max-games')
     if bool(args.history_a) != bool(args.history_b):
         ap.error('--history-a 與 --history-b 要一起給')
 
@@ -161,9 +155,9 @@ def main():
     b = align(a, load_val_probs(args.probs_b))
     print('val_probs 來自 epoch：A %s，B %s' % (a.get('epoch', '?'), b.get('epoch', '?')))
     res = paired_bootstrap(a['probs'], b['probs'], a['player_id'], a['rank_idx'], args.repeats,
-                           args.min_games, args.max_games, args.agg, args.select, args.seed, args.temp)
-    print('配對 bootstrap（重抽玩家 %d 次，模擬題 %d～%d 局，%s + %s，溫度 %g，差為 B 減 A）：'
-          % (args.repeats, args.min_games, args.max_games, args.agg, args.select, args.temp))
+                           args.sizes, args.agg, args.select, args.seed, args.temp)
+    print('配對 bootstrap（重抽玩家 %d 次，模擬題每題 %s 局，%s + %s，溫度 %g，差為 B 減 A）：'
+          % (args.repeats, sizes_text(args.sizes), args.agg, args.select, args.temp))
     print('| 指標 | A | B | 差 | 標準差 | 95% 區間 | 差大於 0 |')
     print('|---|---|---|---|---|---|---|')
     for name, key in (('單局 %s' % args.select, 'single'), ('模擬題', 'questions')):

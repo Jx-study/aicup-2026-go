@@ -66,21 +66,21 @@ def make_data(wrong_games=0):
 
 
 def test_evaluate_perfect_when_all_games_vote_correctly():
-    res = eh.evaluate(make_data(), 5, 5, repeats=3, seed=42)
+    res = eh.evaluate(make_data(), (5,), repeats=3, seed=42)
     assert res['single']['argmax'] == pytest.approx(1.0)
     assert res['questions']['argmax'] == pytest.approx((1.0, 0.0))
-    assert res['n_questions'] == 4
+    assert res['n_questions'] == 2  # 每位玩家每輪 1 題
 
 
 def test_evaluate_question_sum_fixes_single_game_errors():
-    res = eh.evaluate(make_data(wrong_games=3), 10, 10, repeats=1, seed=42)
+    res = eh.evaluate(make_data(wrong_games=3), (10,), repeats=1, seed=42)
     assert res['single']['argmax'] == pytest.approx(0.7)
     assert res['questions']['argmax'][0] == pytest.approx(1.0)
 
 
 def test_evaluate_rejects_when_no_player_has_enough_games():
     with pytest.raises(ValueError):
-        eh.evaluate(make_data(), 11, 20, repeats=1, seed=42)
+        eh.evaluate(make_data(), (11, 20), repeats=1, seed=42)
 
 
 def test_load_rows_roundtrip_with_analyze_humansl_fields(tmp_path):

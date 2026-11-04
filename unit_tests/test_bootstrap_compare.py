@@ -40,7 +40,7 @@ def test_predict_cut_matches_eval_posthoc():
     d = _data()
     probs = d['probs'].astype(np.float64)
     logp = np.log(np.clip(probs, bc.EPS, None))
-    questions, _ = eval_posthoc.make_questions(d['player_id'], d['rank_idx'], 5, 7, np.random.default_rng(0))
+    questions, _ = eval_posthoc.make_questions(d['player_id'], d['rank_idx'], (5, 7), np.random.default_rng(0))
     flat = np.concatenate(questions)
     starts = np.cumsum([0] + [len(q) for q in questions[:-1]])
     for agg in ('mean', 'log'):
@@ -51,7 +51,7 @@ def test_predict_cut_matches_eval_posthoc():
 
 def test_identical_models_have_zero_diff():
     d = _data()
-    res = bc.paired_bootstrap(d['probs'], d['probs'], d['player_id'], d['rank_idx'], 20, 5, 7, 'log', 'pick', 0)
+    res = bc.paired_bootstrap(d['probs'], d['probs'], d['player_id'], d['rank_idx'], 20, (5, 7), 'log', 'pick', 0)
     for key in ('single', 'questions'):
         s = bc.summarize(*res[key])
         assert s['diff'] == 0 and s['sd'] == 0
@@ -61,7 +61,7 @@ def test_better_model_has_positive_diff():
     weak = _data(signal=0.2)
     strong = _data(signal=3.0)
     res = bc.paired_bootstrap(weak['probs'], strong['probs'], weak['player_id'], weak['rank_idx'],
-                              30, 5, 7, 'log', 'pick', 0)
+                              30, (5, 7), 'log', 'pick', 0)
     for key in ('single', 'questions'):
         s = bc.summarize(*res[key])
         assert s['lo'] > 0 and s['p_pos'] == 1.0
@@ -78,8 +78,8 @@ def test_tail_mean(tmp_path):
 def test_temperature_matches_scaled_predict_questions():
     d = _data()
     a, b = d['probs'].astype(np.float64), _data(seed=1)['probs'].astype(np.float64)
-    # 每位玩家只有 12 局且 min=max=12，切題固定為每人一題，不受隨機影響
-    res = bc.paired_bootstrap(a, b, d['player_id'], d['rank_idx'], 1, 12, 12, 'log', 'pick', 0, temp=3.0)
+    # 每位玩家只有 12 局且每題 12 局，題目固定為該玩家的全部局，不受隨機影響
+    res = bc.paired_bootstrap(a, b, d['player_id'], d['rank_idx'], 1, (12,), 'log', 'pick', 0, temp=3.0)
     members, member_labels = bc.player_groups(d['player_id'], d['rank_idx'])
     rng = np.random.default_rng(0)
     draw = rng.integers(0, len(members), len(members))

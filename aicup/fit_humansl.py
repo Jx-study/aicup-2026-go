@@ -2,7 +2,7 @@
 
 每局特徵是各 profile 的每手平均 log 機率、手數與前 N 手的損失統計，一題的特徵是各局特徵的算術平均。
 profile 數從 jsonl 推得；沒有損失欄位（analyze_humansl 不跑損失 query）時只有特徵組 A。
-訓練與驗證都用模擬題，切法與 eval_posthoc 相同，同一位玩家不跨折。
+訓練與驗證都用模擬題，出題方式與 eval_posthoc 相同，同一位玩家不跨折。
 方式 avg 先平均特徵再分類，方式 game 逐局分類後 log 合併。
 
 用法（在 repo 根目錄）：
@@ -21,7 +21,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 from aicup.eval_humansl import game_loglik
-from aicup.eval_posthoc import make_questions
+from aicup.eval_posthoc import SIZES, make_questions, parse_sizes
 from aicup.scoring import LEVELS, NEAR_SCORE, aggregate_games, apply_temperature, pick_level
 
 CUTS = (50, 100)  # 損失統計只取目標玩家的前 N 手
@@ -100,17 +100,17 @@ def player_keys(data):
     return np.array(['%d|%s' % (r, p) for r, p in zip(data['rank_idx'], data['player_id'])])
 
 
-def questions_of(data, mask, repeats, rng, min_games, max_games):
+def questions_of(data, mask, repeats, rng, sizes):
     """回傳 (questions, labels, players)，questions 的局 index 對應整份資料，players 是 player_keys 的值。"""
     idx = np.flatnonzero(mask)
     keys = player_keys(data)
     qs, labels = [], []
     for _ in range(repeats):
-        q, y = make_questions(data['player_id'][idx], data['rank_idx'][idx], min_games, max_games, rng)
+        q, y = make_questions(data['player_id'][idx], data['rank_idx'][idx], sizes, rng)
         qs += [idx[i] for i in q]
         labels.append(y)
     if not qs:
-        raise ValueError('沒有玩家有 %d 局以上，無法切題' % min_games)
+        raise ValueError('沒有玩家有 %d 局以上，無法出題' % min(sizes))
     return qs, np.concatenate(labels), keys[[q[0] for q in qs]]
 
 
@@ -118,10 +118,10 @@ def question_x(x, questions):
     return np.array([x[q].mean(axis=0) for q in questions])
 
 
-def predict_avg(data, columns, c, train, questions, rng, games, train_repeats):
-    """各局特徵平均後分類。games 是 (每題最少局數, 最多局數)。"""
+def predict_avg(data, columns, c, train, questions, rng, sizes, train_repeats):
+    """各局特徵平均後分類。sizes 是每題可用的局數，見 eval_posthoc.make_questions。"""
     x = data['x'][:, columns]
-    tr_q, tr_y, _ = questions_of(data, train, train_repeats, rng, *games)
+    tr_q, tr_y, _ = questions_of(data, train, train_repeats, rng, sizes)
     model = new_model(c).fit(question_x(x, tr_q), tr_y)
     return level_probs(model, question_x(x, questions))
 
@@ -146,7 +146,7 @@ def player_folds(data, folds, seed):
     return np.array([fold_of[k] for k in keys])
 
 
-def make_splits(data, games, repeats, folds=5, seed=42):
+def make_splits(data, sizes, repeats, folds=5, seed=42):
     """先切好各折的測試題，回傳 [(train 遮罩, questions, labels, players)]。
 
     測試題只由 seed 與折編號決定，所有組合都在同一批題目上比較。
@@ -154,7 +154,7 @@ def make_splits(data, games, repeats, folds=5, seed=42):
     fold = player_folds(data, folds, seed)
     splits = []
     for f in range(folds):
-        q, y, p = questions_of(data, fold == f, repeats, np.random.default_rng([seed, f]), *games)
+        q, y, p = questions_of(data, fold == f, repeats, np.random.default_rng([seed, f]), sizes)
         splits.append((fold != f, q, y, p))
     return splits
 
@@ -178,26 +178,26 @@ def bootstrap_mean(values, n=1000, seed=42):
     return float(v.mean()), float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
 
 
-def configs(data, games, train_repeats):
+def configs(data, sizes, train_repeats):
     """回傳 [(組合名稱, predict)]。"""
     out = []
     for (name, cols), c in itertools.product(feature_sets(data['n_profiles'], data['has_loss']).items(), CS):
         out.append(('avg %s C=%g' % (name, c), lambda tr, q, rng, cols=cols, c=c: predict_avg(
-            data, cols, c, tr, q, rng, games, train_repeats)))
+            data, cols, c, tr, q, rng, sizes, train_repeats)))
         for t in GAME_TEMPS:
             out.append(('game %s C=%g T=%g' % (name, c, t), lambda tr, q, rng, cols=cols, c=c, t=t: predict_game(
                 data, cols, c, t, tr, q)))
     return out
 
 
-def evaluate_grid(data, splits, games, train_repeats, seed, only=None):
+def evaluate_grid(data, splits, sizes, train_repeats, seed, only=None):
     """跑全部組合，回傳 [(名稱, 每題 pick 得分, 每題 argmax 得分)]，依玩家平均的 pick 分數排序。
 
     only 是組合名稱時只跑這一個，名稱不存在時拒絕。
     """
     labels = np.concatenate([s[2] for s in splits])
     players = np.concatenate([s[3] for s in splits])
-    grid = configs(data, games, train_repeats)
+    grid = configs(data, sizes, train_repeats)
     if only is not None:
         names = [name for name, _ in grid]
         if only not in names:
@@ -240,8 +240,7 @@ def cnn_question_points(path, keys, questions, labels, temp):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('jsonl', help='analyze_humansl 的輸出')
-    ap.add_argument('--min-games', type=int, default=5)
-    ap.add_argument('--max-games', type=int, default=20)
+    ap.add_argument('--sizes', type=parse_sizes, default=SIZES, help='每題局數，逗號分隔，預設 5,10,15,20')
     ap.add_argument('--train-repeats', type=int, default=10)
     ap.add_argument('--test-repeats', type=int, default=10)
     ap.add_argument('--seed', type=int, default=42)
@@ -252,9 +251,8 @@ def main():
     args = ap.parse_args()
 
     data = load_games(args.jsonl)
-    games = (args.min_games, args.max_games)
-    splits = make_splits(data, games, args.test_repeats, seed=args.seed)
-    results = evaluate_grid(data, splits, games, args.train_repeats, args.seed, args.config)
+    splits = make_splits(data, args.sizes, args.test_repeats, seed=args.seed)
+    results = evaluate_grid(data, splits, args.sizes, args.train_repeats, args.seed, args.config)
     questions = [q for s in splits for q in s[1]]
     labels = np.concatenate([s[2] for s in splits])
     players = np.concatenate([s[3] for s in splits])

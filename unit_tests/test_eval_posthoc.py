@@ -20,43 +20,67 @@ def _data(n_players=6, games_each=12, seed=0):
             'key': np.array(['g%d' % i for i in range(len(rank))]), 'player_id': np.array(pid)}
 
 
-def test_make_questions_sizes_and_labels():
+def test_make_questions_one_per_player_with_allowed_sizes():
     d = _data()
     rng = np.random.default_rng(0)
-    questions, labels = eval_posthoc.make_questions(d['player_id'], d['rank_idx'], 5, 7, rng)
-    assert all(5 <= len(q) <= 7 for q in questions)
+    questions, labels = eval_posthoc.make_questions(d['player_id'], d['rank_idx'], (5, 10), rng)
+    assert len(questions) == 6  # 6 位玩家各 1 題
+    assert all(len(q) in (5, 10) for q in questions)
     for q, lab in zip(questions, labels):
         assert len(set(d['player_id'][q])) == 1  # 一題只含同一位玩家
+        assert len(set(q.tolist())) == len(q)  # 同一題的局不重複
         assert (d['rank_idx'][q] == lab).all()
-    used = np.concatenate(questions)
-    assert len(used) == len(set(used.tolist()))  # 一局不會出現在兩題
+
+
+def test_make_questions_only_uses_sizes_that_fit():
+    pid = np.array(['a'] * 7 + ['b'] * 4)
+    rank = np.zeros(len(pid), np.int64)
+    for seed in range(20):
+        questions, _ = eval_posthoc.make_questions(pid, rank, eval_posthoc.SIZES, np.random.default_rng(seed))
+        assert [len(q) for q in questions] == [5]  # a 只放得下 5 局，b 不足 5 局不出題
+
+
+def test_make_questions_sizes_are_uniform():
+    pid = np.array(['p%d' % (i // 20) for i in range(20 * 200)])
+    rank = np.zeros(len(pid), np.int64)
+    questions, _ = eval_posthoc.make_questions(pid, rank, eval_posthoc.SIZES, np.random.default_rng(0))
+    counts = np.bincount([len(q) for q in questions], minlength=21)[list(eval_posthoc.SIZES)]
+    assert counts.sum() == 200 and (np.abs(counts - 50) < 20).all()
 
 
 def test_same_player_id_different_rank_is_different_player():
     pid = np.array(['p'] * 10)
     rank = np.array([0] * 5 + [3] * 5)
-    _, labels = eval_posthoc.make_questions(pid, rank, 5, 5, np.random.default_rng(0))
+    _, labels = eval_posthoc.make_questions(pid, rank, (5,), np.random.default_rng(0))
     assert sorted(labels.tolist()) == [0, 3]
 
 
 def test_evaluate_multi_game_beats_single():
-    res = eval_posthoc.evaluate(_data(n_players=20), 5, 10, 3, 0)
+    res = eval_posthoc.evaluate(_data(n_players=20), (5, 10), 3, 0)
     assert set(res['questions']) == {(a, s) for a in eval_posthoc.AGGS for s in eval_posthoc.SELECTS}
     assert res['questions'][('mean', 'argmax')][0] > res['single']['argmax']
 
 
 def test_evaluate_fails_when_too_few_games():
     with pytest.raises(ValueError):
-        eval_posthoc.evaluate(_data(games_each=3), 5, 10, 1, 0)
+        eval_posthoc.evaluate(_data(games_each=3), (5, 10), 1, 0)
 
 
 def test_make_questions_rejects_bad_sizes():
     pid, rank = np.array(['p'] * 4), np.zeros(4, np.int64)
     rng = np.random.default_rng(0)
     with pytest.raises(ValueError):
-        eval_posthoc.make_questions(pid, rank, 0, 3, rng)
+        eval_posthoc.make_questions(pid, rank, (0, 3), rng)
     with pytest.raises(ValueError):
-        eval_posthoc.make_questions(pid, rank, 4, 3, rng)
+        eval_posthoc.make_questions(pid, rank, (), rng)
+
+
+def test_parse_sizes():
+    assert eval_posthoc.parse_sizes('20,5, 10,15,5') == (5, 10, 15, 20)
+    with pytest.raises(ValueError):
+        eval_posthoc.parse_sizes('5,x')
+    with pytest.raises(ValueError):
+        eval_posthoc.parse_sizes('')
 
 
 def test_evaluate_hand_computed():
@@ -66,7 +90,7 @@ def test_evaluate_hand_computed():
     probs[2:, 4] = 1
     data = {'probs': probs, 'rank_idx': np.array([0, 0, 5, 5], np.int8),
             'key': np.array(['g%d' % i for i in range(4)]), 'player_id': np.array(['A', 'A', 'B', 'B'])}
-    res = eval_posthoc.evaluate(data, 2, 2, 3, 0)
+    res = eval_posthoc.evaluate(data, (2,), 3, 0)
     for mean, std in res['questions'].values():
         assert mean == pytest.approx((1 + NEAR_SCORE) / 2) and std == pytest.approx(0)
 
@@ -93,7 +117,7 @@ def test_split_players_keeps_player_together():
 
 
 def test_calibrate_log_argmax_unaffected():
-    cal = eval_posthoc.calibrate(_data(n_players=20), (0.5, 1.0, 3.0), 5, 10, 2, 0)
+    cal = eval_posthoc.calibrate(_data(n_players=20), (0.5, 1.0, 3.0), (5, 10), 2, 0)
     assert set(cal) == {(a, s) for a in eval_posthoc.AGGS for s in eval_posthoc.SELECTS}
     r = cal[('log', 'argmax')]  # log 相加整體除以溫度，argmax 不變
     assert r['after'] == pytest.approx(r['before'])
@@ -110,7 +134,7 @@ def test_calibrate_flattens_overconfident_pick():
     data = {'probs': np.clip(np.array(rows), 1e-6, None).astype(np.float32),
             'rank_idx': np.full(len(rows), 4, np.int8), 'key': np.array(['g%d' % i for i in range(len(rows))]),
             'player_id': np.repeat(['p%d' % i for i in range(40)], 5)}
-    cal = eval_posthoc.calibrate(data, eval_posthoc.TEMPS, 5, 5, 1, 0)
+    cal = eval_posthoc.calibrate(data, eval_posthoc.TEMPS, (5,), 1, 0)
     r = cal[('log', 'pick')]
     assert r['before'] < 0.5 and r['after'] == pytest.approx(1.0)
     assert all(t > 1 for t in r['temps'])

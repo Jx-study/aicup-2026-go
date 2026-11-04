@@ -100,7 +100,7 @@ def test_player_folds_separates_same_id_across_ranks():
 def test_questions_of_stay_inside_mask_and_report_true_player():
     d = make_data()
     mask = d['rank_idx'] == 4
-    qs, labels, players = fh.questions_of(d, mask, 2, np.random.default_rng(0), 5, 20)
+    qs, labels, players = fh.questions_of(d, mask, 2, np.random.default_rng(0), (5, 20))
     assert all(mask[q].all() for q in qs)
     assert set(labels) == {4} and len(players) == len(qs)
     assert all(len(set(d['player_id'][q])) == 1 for q in qs)

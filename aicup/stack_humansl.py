@@ -1,6 +1,6 @@
 """CNN 與 Human SL 的 stacking：每題的 CNN log 機率加 Human SL 特徵組 A，用 logistic regression 輸出 10 類機率。
 
-只用 CNN 沒訓練過的 val 玩家擬合。切題與依玩家的 5 折沿用 fit_humansl，
+只用 CNN 沒訓練過的 val 玩家擬合。出題方式與依玩家的 5 折沿用 fit_humansl，
 CNN 單獨、Human SL 單獨、stacking 在同一批題目上比較，差用以玩家重抽的配對 bootstrap。
 正則化強度用巢狀交叉驗證選：只在外層折的訓練玩家內再依玩家切內層折。
 
@@ -12,6 +12,7 @@ import argparse
 import numpy as np
 from sklearn.model_selection import GroupKFold
 
+from aicup.eval_posthoc import SIZES, parse_sizes
 from aicup.fit_humansl import (CS, bootstrap_mean, feature_sets, level_probs, load_games, make_splits,
                                new_model, player_means, predict_avg, question_points, question_x,
                                questions_of, read_val_probs)
@@ -75,15 +76,15 @@ def select_c(x, y, groups, cs=CS, inner_folds=5):
     return cs[int(np.argmax(scores))]
 
 
-def predict_stack(data, cnn_probs, train, questions, rng, games, train_repeats, temp, cs=CS, inner_folds=5,
+def predict_stack(data, cnn_probs, train, questions, rng, sizes, train_repeats, temp, cs=CS, inner_folds=5,
                   use_hsl=True):
     """用 train 遮罩的玩家切訓練題、選 C、擬合，回傳 (questions 的 10 類機率, 選到的 C)。
 
-    games 為 (最少局數, 最多局數)，temp 為 CNN 每局機率的溫度，cs 為候選 C，inner_folds 為內層折數。
+    sizes 為每題可用的局數，temp 為 CNN 每局機率的溫度，cs 為候選 C，inner_folds 為內層折數。
     use_hsl 為 False 時只用 CNN 特徵，用來分開「在 val 上重新擬合」與「加入 Human SL」的貢獻。
     """
     x = data['x'][:, hsl_columns(data)] if use_hsl else None
-    tr_q, tr_y, tr_players = questions_of(data, train, train_repeats, rng, *games)
+    tr_q, tr_y, tr_players = questions_of(data, train, train_repeats, rng, sizes)
     f_tr = question_features(x, cnn_probs, tr_q, temp)
     c_best = select_c(f_tr, tr_y, tr_players, cs, inner_folds)
     model = new_model(c_best).fit(f_tr, tr_y)
@@ -102,31 +103,29 @@ def main():
     ap.add_argument('jsonl', help='analyze_humansl 的輸出，玩家要是 CNN 沒訓練過的 val 玩家')
     ap.add_argument('--cnn-probs', required=True, help='CNN 的 val_probs.npz')
     ap.add_argument('--cnn-temp', type=float, default=3.0, help='CNN 每局機率的溫度，預設同 predict_rank')
-    ap.add_argument('--min-games', type=int, default=5)
-    ap.add_argument('--max-games', type=int, default=20)
+    ap.add_argument('--sizes', type=parse_sizes, default=SIZES, help='每題局數，逗號分隔，預設 5,10,15,20')
     ap.add_argument('--train-repeats', type=int, default=10)
     ap.add_argument('--test-repeats', type=int, default=10)
     ap.add_argument('--inner-folds', type=int, default=5)
-    ap.add_argument('--seed', type=int, default=42, help='切折、切題與 bootstrap 的 seed')
+    ap.add_argument('--seed', type=int, default=42, help='切折、出題與 bootstrap 的 seed')
     args = ap.parse_args()
 
     data = load_games(args.jsonl)
     cnn = load_cnn_probs(args.cnn_probs, data['key'], data['rank_idx'])
-    games = (args.min_games, args.max_games)
-    splits = make_splits(data, games, args.test_repeats, seed=args.seed)
+    splits = make_splits(data, args.sizes, args.test_repeats, seed=args.seed)
     hsl_cols = hsl_columns(data)
     stack, refit, hsl, chosen = [], [], [], []
     for f, (train, q, _, _) in enumerate(splits):
         # 每種方法各自從同一個 seed 起算，訓練題相同，不受執行順序影響
-        p_stack, c_stack = predict_stack(data, cnn, train, q, train_rng(args.seed, f), games,
+        p_stack, c_stack = predict_stack(data, cnn, train, q, train_rng(args.seed, f), args.sizes,
                                          args.train_repeats, args.cnn_temp, inner_folds=args.inner_folds)
-        p_refit, c_refit = predict_stack(data, cnn, train, q, train_rng(args.seed, f), games,
+        p_refit, c_refit = predict_stack(data, cnn, train, q, train_rng(args.seed, f), args.sizes,
                                          args.train_repeats, args.cnn_temp, inner_folds=args.inner_folds,
                                          use_hsl=False)
         stack.append(p_stack)
         refit.append(p_refit)
         chosen.append((c_stack, c_refit))
-        hsl.append(predict_avg(data, hsl_cols, HSL_C, train, q, train_rng(args.seed, f), games,
+        hsl.append(predict_avg(data, hsl_cols, HSL_C, train, q, train_rng(args.seed, f), args.sizes,
                                args.train_repeats))
     questions = [q for s in splits for q in s[1]]
     labels = np.concatenate([s[2] for s in splits])
