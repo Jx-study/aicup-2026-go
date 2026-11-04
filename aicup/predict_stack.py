@@ -14,7 +14,7 @@
         --test-jsonl humansl-analysis/test-p3.jsonl \\
         --test-probs rank-trained-models/<commit hash>/game_probs_test.npz \\
         --ckpt rank-trained-models/<commit hash>/best_model.pth \\
-        --out rank-trained-models/<commit hash>/submission_stack.csv
+        --out rank-trained-models/<stacking 的 commit hash>/submission_rank.csv
 """
 import argparse
 
@@ -96,7 +96,7 @@ def main():
     ap.add_argument('--test-probs', required=True, help='predict_rank 的每局機率快取，不開 TTA')
     ap.add_argument('--ckpt', help='產生 val_probs.npz 的 best_model.pth；給定時檢查 --test-probs 出自同一個 checkpoint')
     ap.add_argument('--test-dir', default='tests', help='含 rank_prediction_test_{public,private}.csv 的目錄')
-    ap.add_argument('--out', default='submission_stack.csv')
+    ap.add_argument('--out', default='submission_rank.csv')
     ap.add_argument('--cnn-temp', type=float, default=3.0, help='CNN 每局機率的溫度，預設同 predict_rank')
     ap.add_argument('--sizes', type=parse_sizes, default=SIZES, help='擬合用的每題局數，逗號分隔')
     ap.add_argument('--train-repeats', type=int, default=10)
