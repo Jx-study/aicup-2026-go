@@ -433,21 +433,23 @@ def test_make_ema_decay_zero_tracks_model():
         torch.testing.assert_close(ema.module.state_dict()[k], v)
 
 
+def _ema_module(last):
+    """從 last.pt 的 EMA 狀態取出 GoRankResNet 的 state_dict。"""
+    return {k[len('module.'):]: v for k, v in last['ema'].items() if k.startswith('module.')}
+
+
 def test_ema_selects_with_ema_weights(tmp_path, monkeypatch):
     feat, ckpt = _setup(tmp_path)
-    _main(monkeypatch, feat, ckpt, '--epochs', '2', '--no-amp', '--ema', '0.5', '--bn-batches', '0')
+    _main(monkeypatch, feat, ckpt, '--epochs', '1', '--no-amp', '--ema', '0.5', '--bn-batches', '0')
     last = torch.load(ckpt / 'last.pt', weights_only=False)
     best = torch.load(ckpt / 'best_model.pth', weights_only=True)
-    hist = pd.read_csv(ckpt / 'history.csv')
-    best_epoch = int(hist.loc[hist['val_score_pick'].idxmax(), 'epoch'])
-    ema_epoch = torch.load(ckpt / ('epoch_%d_ema.pth' % best_epoch), weights_only=True)
-    raw_epoch = torch.load(ckpt / ('epoch_%d.pth' % best_epoch), weights_only=True)
-    assert 'n_averaged' not in best and best.keys() == raw_epoch.keys()
+    ema, raw = _ema_module(last), last['model']
+    assert 'n_averaged' not in best and best.keys() == raw.keys() == ema.keys()
     for k in best:
-        torch.testing.assert_close(best[k], ema_epoch[k])
-    assert any(not torch.equal(best[k], raw_epoch[k]) for k in best if best[k].is_floating_point())
+        torch.testing.assert_close(best[k], ema[k])
+    assert any(not torch.equal(best[k], raw[k]) for k in best if best[k].is_floating_point())
+    hist = pd.read_csv(ckpt / 'history.csv')
     assert {'raw_val_loss', 'raw_val_score_pick'} <= set(hist.columns)
-    assert 'ema' in last
     np.testing.assert_allclose(_load_probs(ckpt)['probs'], _recompute(ckpt / 'best_model.pth', feat),
                                atol=1e-5)
 
@@ -488,7 +490,7 @@ def test_ema_recomputes_bn_on_last_epoch(tmp_path, monkeypatch):
     hist = pd.read_csv(ckpt / 'history.csv')
     assert hist['bn_val_score_pick'].isna().tolist() == [True, False]
     bn = torch.load(ckpt / 'final_ema_bn.pth', weights_only=True)
-    ema = torch.load(ckpt / 'epoch_2_ema.pth', weights_only=True)
+    ema = _ema_module(torch.load(ckpt / 'last.pt', weights_only=False))
     assert not torch.allclose(bn['bn_in.running_mean'], ema['bn_in.running_mean'])
     torch.testing.assert_close(bn['conv_in.weight'], ema['conv_in.weight'])
     np.testing.assert_allclose(  # 重算 BN 的版本不參與 best_model.pth 的挑選
@@ -506,3 +508,12 @@ def test_recompute_bn_matches_cumulative_train_stats():
         h = model.conv_in(packed.unpack_torch(x))
     torch.testing.assert_close(bn.bn_in.running_mean, h.mean((0, 2, 3)))
     assert model.bn_in.running_mean.abs().max() == 0  # 原模型不受影響
+
+
+@pytest.mark.parametrize('extra', [('--bn-batches', '-1'), ('--ema', '1'), ('--soft-label', '-1')],
+                         ids=['bn_batches', 'ema', 'soft_label'])
+def test_rejects_invalid_rv3_args(tmp_path, monkeypatch, extra):
+    feat, ckpt = _setup(tmp_path)
+    with pytest.raises(SystemExit):
+        _main(monkeypatch, feat, ckpt, '--epochs', '1', '--no-amp', *extra)
+    assert not ckpt.exists()  # 參數檢查在寫任何檔案之前

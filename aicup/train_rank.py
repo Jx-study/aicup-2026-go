@@ -74,8 +74,8 @@ def parse_args():
     ap.add_argument('--fresh', action='store_true', help='忽略既有 last.pt')
     ap.add_argument('--max-steps', type=int, default=0, help='每個 epoch 最多幾步，0 為不限，用於冒煙測試')
     args = ap.parse_args()
-    if args.soft_label < 0 or not 0 <= args.ema < 1:
-        ap.error('--soft-label 要 >= 0，--ema 要在 [0, 1)')
+    if args.soft_label < 0 or args.bn_batches < 0 or not 0 <= args.ema < 1:
+        ap.error('--soft-label、--bn-batches 要 >= 0，--ema 要在 [0, 1)')
     return args
 
 
@@ -410,8 +410,6 @@ def main():
 
         torch.save(model.state_dict(), os.path.join(args.ckpt_dir, 'epoch_%d.pth' % (epoch + 1)))
         selected = model if ema is None else ema.module  # module 去掉 AveragedModel 外層與 n_averaged
-        if ema is not None:
-            torch.save(selected.state_dict(), os.path.join(args.ckpt_dir, 'epoch_%d_ema.pth' % (epoch + 1)))
         if row['val_score_pick'] > best_score:
             best_score = row['val_score_pick']
             save_val_probs(probs_path, val_probs, val_meta, epoch + 1)
