@@ -8,6 +8,7 @@ import pytest
 
 from aicup import analyze_humansl as ah
 from aicup import fit_humansl
+from stack_helpers import write_rank_tests
 
 
 def test_to_gtp_skips_letter_i():
@@ -420,3 +421,19 @@ def test_no_eval_rows_load_in_fit_humansl(tmp_path):
     write_jsonl(p, rows)
     out = fit_humansl.load_games(str(p))
     assert out['n_profiles'] == 3 and out['has_loss'] is False
+
+
+def test_load_test_games_keys_colors_and_order(tmp_path):
+    sgf = '(;SZ[19]HD[0];B[pd];W[dp])'
+    write_rank_tests(tmp_path / 't', {'public': [([sgf, sgf], 'W'), ([sgf], 'B')], 'private': [([sgf], 'B')]})
+    games = ah.load_test_games(str(tmp_path / 't'))
+    assert [g['key'] for g in games] == ['pub_q_0001_g01', 'pub_q_0001_g02', 'pub_q_0002_g01', 'priv_q_0001_g01']
+    assert [g['color'] for g in games] == ['W', 'W', 'B', 'B']
+    assert [g['player_id'] for g in games] == ['pub_q_0001', 'pub_q_0001', 'pub_q_0002', 'priv_q_0001']
+    assert all(g['rank_idx'] == -1 and g['sgf'] == sgf for g in games)
+    assert len(ah.load_test_games(str(tmp_path / 't'), limit=3)) == 3
+
+
+def test_test_game_keys_count_within_question():
+    games = [(0, 's', 'B'), (1, 's', 'B'), (0, 's', 'B')]
+    assert ah.test_game_keys(['a', 'b'], games) == ['a_g01', 'b_g01', 'a_g02']

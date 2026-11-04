@@ -4,8 +4,11 @@
 記錄實際落子在 humanPolicy 中的機率。每局另送一個不帶 profile 的 query，評估目標玩家落子前後的局面，
 記錄每手的目數損失與勝率損失，--no-eval 時不送。結果追加寫入 jsonl，每局一行，重跑會跳過已完成的局。
 
+--test-dir 時改讀競賽二的測試題，每題拆成單局，player_id 記為 question_id，rank_idx 記為 -1。
+
 用法（Colab，KataGo 執行檔在 --katago-dir，模型在 --model-dir）：
     !python -m aicup.analyze_humansl --players-per-rank 1 --games-per-player 10 --out humansl-analysis/pilot.jsonl
+    !python -m aicup.analyze_humansl --test-dir /content/tests --profiles rank_11k rank_1d rank_6d --no-eval --out humansl-analysis/test-p3.jsonl
 """
 import argparse
 import glob
@@ -286,6 +289,30 @@ def load_games(csv_glob, per_rank, seed, limit, players_per_rank=0, games_per_pl
             for _, r in df.iterrows()]
 
 
+def test_game_keys(qids, games):
+    """測試題逐局的 key：question_id 加題內序號，順序同 predict_rank.read_questions 的 games。"""
+    seen = {}
+    keys = []
+    for q, _, _ in games:
+        seen[q] = seen.get(q, 0) + 1
+        keys.append('%s_g%02d' % (qids[q], seen[q]))
+    return keys
+
+
+def load_test_games(test_dir, limit=0):
+    """讀競賽二的 public 與 private 測試題，回傳每局一個 dict，欄位同 load_games。
+
+    color 是題目給的目標玩家顏色，沒有 color_ 欄位時拒絕。
+    """
+    from aicup.predict_rank import read_questions
+    qids, games = read_questions(test_dir)
+    if any(c is None for _, _, c in games):
+        raise SystemExit('%s 的測試題缺 color_ 欄位' % test_dir)
+    out = [{'key': k, 'rank_idx': -1, 'player_id': qids[q], 'color': c, 'sgf': s}
+           for k, (q, s, c) in zip(test_game_keys(qids, games), games)]
+    return out[:limit] if limit else out
+
+
 def done_keys(path, eval_visits, profiles=PROFILES):
     """已完成的 key。檔案裡的 eval_visits 或 profiles 和這次不同時拒絕接續，避免同一檔混用兩種設定。
 
@@ -315,6 +342,7 @@ def main():
     ap.add_argument('--players-per-rank', type=int, default=0, help='每個等級抽幾位玩家，非 0 時忽略 --per-rank')
     ap.add_argument('--games-per-player', type=int, default=20, help='每位玩家抽幾局，局數不足的玩家不抽')
     ap.add_argument('--players-file', help='含 player_id、rank 欄位的 CSV，只抽清單內的玩家，有人局數不足時拒絕')
+    ap.add_argument('--test-dir', help='競賽二測試題所在目錄；給定時不讀 --csv，不能和抽樣參數同時使用')
     ap.add_argument('--limit', type=int, default=0, help='最多分析幾局，用於冒煙測試')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--out', default='humansl-analysis/humansl.jsonl')
@@ -339,8 +367,14 @@ def main():
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
     done = done_keys(args.out, eval_visits, args.profiles)
     todo, bad = [], 0
-    for g in load_games(args.csv, args.per_rank, args.seed, args.limit,
-                        args.players_per_rank, args.games_per_player, args.players_file):
+    if args.test_dir:
+        if args.per_rank or args.players_per_rank or args.players_file:
+            raise SystemExit('--test-dir 不能和 --per-rank、--players-per-rank、--players-file 同時使用')
+        games = load_test_games(args.test_dir, args.limit)
+    else:
+        games = load_games(args.csv, args.per_rank, args.seed, args.limit,
+                           args.players_per_rank, args.games_per_player, args.players_file)
+    for g in games:
         if g['key'] in done:
             continue
         try:
