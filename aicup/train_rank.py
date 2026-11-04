@@ -2,6 +2,8 @@
 
 模型與預設超參數同 rank-prediction.ipynb。每個 epoch 存 last.pt，重跑自動接續。
 best_model.pth 依 val_score_pick 挑選，只存 state_dict；同時存 val_probs.npz 供事後分析。
+--soft-label 以有序 soft label 訓練，val_loss 仍是 hard label 的 NLL。
+--ema 追蹤權重的 EMA，best_model.pth 與 val_probs.npz 改用 EMA 權重挑選，原始權重的指標記成 raw_ 欄位，最後一個 epoch 另用 train 資料重算 EMA 的 BN 統計量，指標記成 bn_ 欄位，權重存成 final_ema_bn.pth。
 --patience 預設關閉；啟用時跑滿 --min-epochs 後，val_score_pick 連續 --patience 個 epoch 沒超過最佳就提前停止。
 每次啟動在 runs.jsonl 追加一筆指令與環境，接續訓練時也會記錄。
 
@@ -11,10 +13,12 @@ best_model.pth 依 val_score_pick 挑選，只存 state_dict；同時存 val_pro
     python -m aicup.train_rank --schedule cosine --epochs 15   # warmup 後 cosine 降到 0
     python -m aicup.train_rank --augment      # 每個 batch 隨機套 8 種盤面對稱之一
     python -m aicup.train_rank --color both   # 目標玩家的顏色資訊，需要 <feat-dir>/hd.npz
+    python -m aicup.train_rank --soft-label 1 --ema 0.999   # 有序 soft label 與 EMA
     python -m aicup.train_rank --patience 3   # 跑滿 --min-epochs 後，連續 3 個 epoch 沒超過最佳就停
     python -m aicup.train_rank --fresh       # 忽略既有 checkpoint 從頭訓練
 """
 import argparse
+import copy
 import datetime
 import json
 import math
@@ -26,6 +30,7 @@ import time
 import numpy as np
 import pandas as pd
 import torch
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from aicup import color, packed, symmetry
 from aicup.scoring import LEVELS, pick_level, score_strength
@@ -57,13 +62,21 @@ def parse_args():
                     help='swap 依目標玩家對調黑白平面，plane 加 color plane，both 兩者都做')
     ap.add_argument('--raw-color', action='store_true',
                     help='不修正讓子局，直接用 color 欄位，不需要 hd.npz')
+    ap.add_argument('--soft-label', type=float, default=0.0, metavar='TAU',
+                    help='目標正比於 exp(-|k - y| / TAU)，0 為 one-hot')
+    ap.add_argument('--ema', type=float, default=0.0, help='EMA 的 decay，0 為不追蹤')
+    ap.add_argument('--bn-batches', type=int, default=200,
+                    help='最後一個 epoch 重算 EMA 的 BN 統計量用幾個 train batch，0 為不重算')
     ap.add_argument('--patience', type=int, default=0,
                     help='val_score_pick 連續幾個 epoch 沒超過最佳就停，0 為不停')
     ap.add_argument('--min-epochs', type=int, default=6,
                     help='跑滿幾個 epoch 才檢查 --patience，lr 高的前期 val 跳動大')
     ap.add_argument('--fresh', action='store_true', help='忽略既有 last.pt')
     ap.add_argument('--max-steps', type=int, default=0, help='每個 epoch 最多幾步，0 為不限，用於冒煙測試')
-    return ap.parse_args()
+    args = ap.parse_args()
+    if args.soft_label < 0 or not 0 <= args.ema < 1:
+        ap.error('--soft-label 要 >= 0，--ema 要在 [0, 1)')
+    return args
 
 
 def load_to(split_dir, data_device):
@@ -120,8 +133,8 @@ def split_bytes(split_dir):
 
 
 def batches(x, y, batch_size, device, order=None, c=None, mode='none'):
-    """依 order（預設為原順序）切 batch，在 device 上解包成 float，c 不為 None 時套用顏色資訊。"""
-    n = len(y)
+    """依 order（預設為原順序，可只取一部分）切 batch，在 device 上解包成 float，c 不為 None 時套用顏色資訊。"""
+    n = len(y) if order is None else len(order)
     for i in range(0, n, batch_size):
         idx = slice(i, i + batch_size) if order is None else order[i:i + batch_size]
         xb = packed.unpack_torch(x[idx].to(device, non_blocking=True))
@@ -138,6 +151,39 @@ def lr_at(step, total_steps, base_lr, schedule, warmup_steps):
         return base_lr * (step + 1) / warmup_steps
     progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
     return base_lr * 0.5 * (1 + math.cos(math.pi * progress))
+
+
+def soft_label_table(tau, n=NUM_CLASSES):
+    """回傳 (n, n) 目標分布，第 y 列正比於 exp(-|k - y| / tau)；tau 為 0 時是 one-hot。"""
+    if tau <= 0:
+        return torch.eye(n)
+    k = torch.arange(n, dtype=torch.float64)
+    q = torch.exp(-(k[None] - k[:, None]).abs() / tau)
+    return (q / q.sum(1, keepdim=True)).float()
+
+
+def make_ema(model, decay):
+    """回傳追蹤 model 的 EMA，BN 的 running mean/var 也一起平均。"""
+    return AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(decay), use_buffers=True)
+
+
+def recompute_bn(model, x, y, args, device, amp, c=None):
+    """回傳 model 的副本，BN 統計量以 train 中隨機 args.bn_batches 個 batch 的累積平均重算。"""
+    bn = copy.deepcopy(model)
+    norms = [m for m in bn.modules() if isinstance(m, torch.nn.BatchNorm2d)]
+    for m in norms:
+        m.reset_running_stats()
+        m.momentum = None  # None 為累積平均，每個 batch 權重相同
+    gen = torch.Generator(device=x.device).manual_seed(args.seed)
+    order = torch.randperm(len(y), generator=gen, device=x.device)[:args.bn_batches * args.batch_size]
+    bn.train()
+    with torch.no_grad():
+        for xb, _ in batches(x, y, args.batch_size, device, order, c, args.color):
+            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
+                bn(xb)
+    for m in norms:
+        m.momentum = 0.1  # 還原 BatchNorm2d 預設值
+    return bn
 
 
 def patience_exhausted(history, patience, min_epochs=0):
@@ -239,6 +285,8 @@ def main():
                          num_classes=NUM_CLASSES).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     criterion = torch.nn.CrossEntropyLoss()
+    soft = soft_label_table(args.soft_label).to(device) if args.soft_label > 0 else None
+    ema = make_ema(model, args.ema) if args.ema > 0 else None
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
     last_path = os.path.join(args.ckpt_dir, 'last.pt')
@@ -250,6 +298,10 @@ def main():
         config['augment'] = True
     if args.color != 'none':
         config.update(color=args.color, raw_color=args.raw_color)
+    if soft is not None:
+        config['soft_label'] = args.soft_label
+    if ema is not None:
+        config['ema'] = args.ema
     start_epoch, history, best_score = 0, [], -1.0
     if os.path.exists(last_path) and not args.fresh:
         ckpt = torch.load(last_path, map_location=device, weights_only=False)
@@ -258,6 +310,8 @@ def main():
                              '要用新設定請加 --fresh 或換 --ckpt-dir' % (ckpt['config'], config))
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
+        if ema is not None:
+            ema.load_state_dict(ckpt['ema'])
         start_epoch, history, best_score = ckpt['epoch'], ckpt['history'], ckpt['best_score']
         print('從 epoch %d 接續（目前最佳 val_score_pick %.4f）' % (start_epoch, best_score))
 
@@ -315,9 +369,11 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
                 out = model(xb)
-            loss = criterion(out.float(), yb)
+            loss = criterion(out.float(), yb if soft is None else soft[yb])
             loss.backward()
             optimizer.step()
+            if ema is not None:
+                ema.update_parameters(model)
 
             loss_sum += loss.item()
             correct += (out.argmax(1) == yb).sum().item()
@@ -332,26 +388,43 @@ def main():
 
         train_min = (time.time() - t0) / 60
         metrics, val_probs = validate(model, x_val, y_val, args, device, amp, criterion, c_val)
+        raw = {}
+        if ema is not None:  # val_ 欄位與 best_model.pth 都用 EMA 權重
+            raw = {'raw_' + k: v for k, v in metrics.items() if k != 'val_n'}
+            metrics, val_probs = validate(ema.module, x_val, y_val, args, device, amp, criterion, c_val)
         row = {'epoch': epoch + 1, 'train_loss': loss_sum / max(steps, 1),
-               'train_acc': 100 * correct / max(total, 1), 'lr': lr, **metrics,
+               'train_acc': 100 * correct / max(total, 1), 'lr': lr, **metrics, **raw,
                'train_minutes': train_min, 'total_minutes': (time.time() - t0) / 60}
         history.append(row)
+        stop = patience_exhausted(history, args.patience, args.min_epochs)
+        if ema is not None and args.bn_batches and (stop or epoch + 1 == args.epochs):
+            bn = recompute_bn(ema.module, x_train, y_train, args, device, amp, c_train)
+            bn_metrics, _ = validate(bn, x_val, y_val, args, device, amp, criterion, c_val)
+            row.update({'bn_' + k: v for k, v in bn_metrics.items() if k != 'val_n'})
+            save_atomic(bn.state_dict(), os.path.join(args.ckpt_dir, 'final_ema_bn.pth'))
+            print('  重算 BN 的 EMA：val pick %.4f' % row['bn_val_score_pick'])
+            del bn
         print('Epoch %d/%d  train acc %.2f%% | val acc %.2f%%  score argmax %.4f  pick %.4f | %.1f 分'
               % (epoch + 1, args.epochs, row['train_acc'], row['val_acc'],
                  row['val_score_argmax'], row['val_score_pick'], row['total_minutes']), flush=True)
 
         torch.save(model.state_dict(), os.path.join(args.ckpt_dir, 'epoch_%d.pth' % (epoch + 1)))
+        selected = model if ema is None else ema.module  # module 去掉 AveragedModel 外層與 n_averaged
+        if ema is not None:
+            torch.save(selected.state_dict(), os.path.join(args.ckpt_dir, 'epoch_%d_ema.pth' % (epoch + 1)))
         if row['val_score_pick'] > best_score:
             best_score = row['val_score_pick']
             save_val_probs(probs_path, val_probs, val_meta, epoch + 1)
-            save_atomic(model.state_dict(), best_path)
+            save_atomic(selected.state_dict(), best_path)
             print('  更新 best_model.pth')
         pd.DataFrame(history).to_csv(os.path.join(args.ckpt_dir, 'history.csv'), index=False)
         # last.pt 最後寫，確保它記錄的 epoch 之前的檔案都已存好
-        save_atomic({'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
-                     'epoch': epoch + 1, 'history': history, 'best_score': best_score,
-                     'config': config}, last_path)
-        if patience_exhausted(history, args.patience, args.min_epochs):
+        state = {'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
+                 'epoch': epoch + 1, 'history': history, 'best_score': best_score, 'config': config}
+        if ema is not None:
+            state['ema'] = ema.state_dict()
+        save_atomic(state, last_path)
+        if stop:
             print('val_score_pick 連續 %d 個 epoch 沒超過最佳，提前停止' % args.patience)
             break
 

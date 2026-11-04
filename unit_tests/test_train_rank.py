@@ -379,3 +379,130 @@ def test_validate_tta_loss_is_nll_of_averaged_probs(tmp_path):
     # validate 的 val_loss 是各 batch 平均的平均，batch 4、4、2
     expect = np.mean([nll[:4].mean(), nll[4:8].mean(), nll[8:].mean()])
     assert metrics['val_loss'] == pytest.approx(expect, rel=1e-5)
+
+
+def test_soft_label_table_rows():
+    q = train_rank.soft_label_table(1.0)
+    assert q.shape == (len(LEVELS), len(LEVELS))
+    torch.testing.assert_close(q.sum(1), torch.ones(len(LEVELS)))
+    inv_e = float(np.exp(-1))
+    for y in (0, 4, 9):  # 兩端的 D、6D 相鄰比例也是 1/e
+        for k in (y - 1, y + 1):
+            if 0 <= k < len(LEVELS):
+                assert float(q[y, k] / q[y, y]) == pytest.approx(inv_e)
+    assert int(q.argmax(1).ne(torch.arange(len(LEVELS))).sum()) == 0
+
+
+def test_soft_label_table_small_tau_is_one_hot():
+    torch.testing.assert_close(train_rank.soft_label_table(0), torch.eye(len(LEVELS)))
+    torch.testing.assert_close(train_rank.soft_label_table(1e-3), torch.eye(len(LEVELS)))
+
+
+def test_soft_label_trains_with_hard_val_loss(tmp_path, monkeypatch):
+    feat, _ = _setup(tmp_path)
+    runs = {}
+    for name, extra in (('hard', ()), ('soft', ('--soft-label', '1'))):
+        _main(monkeypatch, feat, tmp_path / name, '--epochs', '1', '--no-amp', *extra)
+        runs[name] = pd.read_csv(tmp_path / name / 'history.csv')
+    assert runs['hard']['train_loss'].iloc[0] != pytest.approx(runs['soft']['train_loss'].iloc[0])
+    # val_loss 仍是 hard label 的 NLL，batch 4、4、2
+    saved = _load_probs(tmp_path / 'soft')
+    nll = -np.log(saved['probs'][np.arange(10), saved['rank_idx']])
+    expect = np.mean([nll[:4].mean(), nll[4:8].mean(), nll[8:].mean()])
+    assert runs['soft']['val_loss'].iloc[0] == pytest.approx(expect, rel=1e-5)
+
+
+def test_soft_label_rejects_resume_with_other_tau(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    _main(monkeypatch, feat, ckpt, '--epochs', '1', '--no-amp', '--soft-label', '1')
+    with pytest.raises(SystemExit, match='設定'):
+        _main(monkeypatch, feat, ckpt, '--epochs', '2', '--no-amp', '--soft-label', '0.5')
+
+
+def test_make_ema_decay_zero_tracks_model():
+    torch.manual_seed(0)
+    model = GoRankResNet(num_channels=8, num_blocks=1, num_classes=len(LEVELS))
+    ema = train_rank.make_ema(model, 0.0)
+    opt = torch.optim.SGD(model.parameters(), lr=0.1)
+    for _ in range(2):
+        model(torch.rand(4, 500, 19, 19)).sum().backward()
+        opt.step()
+        opt.zero_grad()
+        ema.update_parameters(model)
+    for k, v in model.state_dict().items():
+        torch.testing.assert_close(ema.module.state_dict()[k], v)
+
+
+def test_ema_selects_with_ema_weights(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    _main(monkeypatch, feat, ckpt, '--epochs', '2', '--no-amp', '--ema', '0.5', '--bn-batches', '0')
+    last = torch.load(ckpt / 'last.pt', weights_only=False)
+    best = torch.load(ckpt / 'best_model.pth', weights_only=True)
+    hist = pd.read_csv(ckpt / 'history.csv')
+    best_epoch = int(hist.loc[hist['val_score_pick'].idxmax(), 'epoch'])
+    ema_epoch = torch.load(ckpt / ('epoch_%d_ema.pth' % best_epoch), weights_only=True)
+    raw_epoch = torch.load(ckpt / ('epoch_%d.pth' % best_epoch), weights_only=True)
+    assert 'n_averaged' not in best and best.keys() == raw_epoch.keys()
+    for k in best:
+        torch.testing.assert_close(best[k], ema_epoch[k])
+    assert any(not torch.equal(best[k], raw_epoch[k]) for k in best if best[k].is_floating_point())
+    assert {'raw_val_loss', 'raw_val_score_pick'} <= set(hist.columns)
+    assert 'ema' in last
+    np.testing.assert_allclose(_load_probs(ckpt)['probs'], _recompute(ckpt / 'best_model.pth', feat),
+                               atol=1e-5)
+
+
+def test_ema_resume_matches_single_run(tmp_path, monkeypatch):
+    feat, _ = _setup(tmp_path)
+    once, twice = tmp_path / 'once', tmp_path / 'twice'
+    args = ('--epochs', '2', '--no-amp', '--schedule', 'cosine', '--warmup-steps', '2',
+            '--ema', '0.5', '--bn-batches', '0')
+    _main(monkeypatch, feat, once, *args)
+
+    validate, calls = train_rank.validate, []
+
+    def fail_second_epoch(*a, **k):  # 每個 epoch 驗證原始與 EMA 兩次，第 3 次是第 2 個 epoch
+        calls.append(1)
+        if len(calls) == 3:
+            raise KeyboardInterrupt
+        return validate(*a, **k)
+
+    monkeypatch.setattr(train_rank, 'validate', fail_second_epoch)
+    with pytest.raises(KeyboardInterrupt):
+        _main(monkeypatch, feat, twice, *args)
+    monkeypatch.setattr(train_rank, 'validate', validate)
+    _main(monkeypatch, feat, twice, *args)
+
+    a, b = pd.read_csv(once / 'history.csv'), pd.read_csv(twice / 'history.csv')
+    cols = ['train_loss', 'val_loss', 'raw_val_loss']
+    pd.testing.assert_frame_equal(a[cols], b[cols])
+    ea = torch.load(once / 'last.pt', weights_only=False)['ema']
+    eb = torch.load(twice / 'last.pt', weights_only=False)['ema']
+    for k in ea:
+        torch.testing.assert_close(ea[k], eb[k])
+
+
+def test_ema_recomputes_bn_on_last_epoch(tmp_path, monkeypatch):
+    feat, ckpt = _setup(tmp_path)
+    _main(monkeypatch, feat, ckpt, '--epochs', '2', '--no-amp', '--ema', '0.5', '--bn-batches', '2')
+    hist = pd.read_csv(ckpt / 'history.csv')
+    assert hist['bn_val_score_pick'].isna().tolist() == [True, False]
+    bn = torch.load(ckpt / 'final_ema_bn.pth', weights_only=True)
+    ema = torch.load(ckpt / 'epoch_2_ema.pth', weights_only=True)
+    assert not torch.allclose(bn['bn_in.running_mean'], ema['bn_in.running_mean'])
+    torch.testing.assert_close(bn['conv_in.weight'], ema['conv_in.weight'])
+    np.testing.assert_allclose(  # 重算 BN 的版本不參與 best_model.pth 的挑選
+        _load_probs(ckpt)['probs'], _recompute(ckpt / 'best_model.pth', feat), atol=1e-5)
+
+
+def test_recompute_bn_matches_cumulative_train_stats():
+    torch.manual_seed(0)
+    model = GoRankResNet(num_channels=8, num_blocks=1, num_classes=len(LEVELS))
+    feats = np.random.default_rng(0).integers(0, 256, (8, packed.PACKED_LEN), dtype=np.uint8)
+    x, y = torch.from_numpy(feats), torch.zeros(8, dtype=torch.long)
+    args = SimpleNamespace(batch_size=4, color='none', bn_batches=2, seed=0)
+    bn = train_rank.recompute_bn(model, x, y, args, torch.device('cpu'), False)
+    with torch.no_grad():  # 8 局全部用到，兩個 batch 等大，累積平均等於整份的平均
+        h = model.conv_in(packed.unpack_torch(x))
+    torch.testing.assert_close(bn.bn_in.running_mean, h.mean((0, 2, 3)))
+    assert model.bn_in.running_mean.abs().max() == 0  # 原模型不受影響
