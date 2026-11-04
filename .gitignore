@@ -11,6 +11,7 @@ player-features/
 rank-trained-models/
 player-trained-models/
 humansl-analysis/
+se-models/
 *.pth
 
 # 執行產出
