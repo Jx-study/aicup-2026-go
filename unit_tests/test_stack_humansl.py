@@ -8,24 +8,7 @@ from sklearn.model_selection import GroupKFold
 from aicup import stack_humansl as sh
 from aicup.fit_humansl import make_splits, question_points
 from aicup.scoring import aggregate_games, apply_temperature, pick_level
-
-
-def toy_data(n_players=50, games=20, seed=0):
-    """預設每級 5 位玩家，Human SL 特徵與 CNN 機率都帶有等級訊號。"""
-    rng = np.random.default_rng(seed)
-    rank = np.repeat(np.arange(n_players) % 10, games)
-    player = np.repeat(['p%d' % i for i in range(n_players)], games)
-    x = rank[:, None] + rng.normal(0, 2, (len(rank), 4))
-    logits = -0.5 * (np.arange(10)[None, :] - rank[:, None] - rng.normal(0, 2, (len(rank), 1))) ** 2
-    probs = np.exp(logits) / np.exp(logits).sum(1, keepdims=True)
-    keys = np.array(['k%d' % i for i in range(len(rank))])
-    data = {'x': x, 'rank_idx': rank.astype(np.int64), 'player_id': player, 'key': keys,
-            'n_profiles': 3, 'has_loss': False}
-    return data, probs
-
-
-def write_npz(path, keys, probs, rank_idx):
-    np.savez(path, key=keys, probs=probs, rank_idx=rank_idx)
+from stack_helpers import toy_data, write_npz
 
 
 def test_load_cnn_probs_aligns_by_key(tmp_path):

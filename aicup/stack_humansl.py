@@ -32,6 +32,9 @@ def load_cnn_probs(path, keys, rank_idx):
     if missing:
         raise ValueError('%s 缺少 %d 局，例如 %s' % (path, len(missing), ', '.join(missing[:3])))
     rows = np.array([index[k] for k in keys])
+    bad = np.flatnonzero(np.isnan(probs[rows]).any(axis=1))
+    if len(bad):
+        raise ValueError('%s 有 %d 局機率是 NaN，例如 %s' % (path, len(bad), keys[bad[0]]))
     if val_rank is not None:
         bad = np.flatnonzero(val_rank[rows] != rank_idx)
         if len(bad):
@@ -76,6 +79,13 @@ def select_c(x, y, groups, cs=CS, inner_folds=5):
     return cs[int(np.argmax(scores))]
 
 
+def fit_model(x, cnn_probs, questions, labels, players, temp, cs=CS, inner_folds=5):
+    """在 questions 上依 players 選 C 後擬合，回傳 (model, 選到的 C)；x 為 None 時只用 CNN 特徵。"""
+    f = question_features(x, cnn_probs, questions, temp)
+    c_best = select_c(f, labels, players, cs, inner_folds)
+    return new_model(c_best).fit(f, labels), c_best
+
+
 def predict_stack(data, cnn_probs, train, questions, rng, sizes, train_repeats, temp, cs=CS, inner_folds=5,
                   use_hsl=True):
     """用 train 遮罩的玩家切訓練題、選 C、擬合，回傳 (questions 的 10 類機率, 選到的 C)。
@@ -85,9 +95,7 @@ def predict_stack(data, cnn_probs, train, questions, rng, sizes, train_repeats, 
     """
     x = data['x'][:, hsl_columns(data)] if use_hsl else None
     tr_q, tr_y, tr_players = questions_of(data, train, train_repeats, rng, sizes)
-    f_tr = question_features(x, cnn_probs, tr_q, temp)
-    c_best = select_c(f_tr, tr_y, tr_players, cs, inner_folds)
-    model = new_model(c_best).fit(f_tr, tr_y)
+    model, c_best = fit_model(x, cnn_probs, tr_q, tr_y, tr_players, temp, cs, inner_folds)
     return level_probs(model, question_features(x, cnn_probs, questions, temp)), c_best
 
 

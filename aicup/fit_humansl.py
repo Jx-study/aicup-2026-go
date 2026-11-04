@@ -44,9 +44,10 @@ def game_features(row, cuts=CUTS):
 
 
 def load_games(path, cuts=CUTS):
-    """讀 jsonl，回傳 dict：x (N, D)、rank_idx、player_id、key、n_profiles、has_loss。
+    """讀 jsonl，回傳 dict：x (N, D)、rank_idx、player_id、key、n_profiles、profiles、has_loss。
 
-    各局的 profile 數與是否有損失欄位必須一致，否則拒絕。
+    各局的 profile 數、profile 名稱與是否有損失欄位必須一致，否則拒絕。
+    profiles 是 profile 名稱的 tuple，jsonl 沒有 profiles 欄位時為 None。
     """
     with open(path, encoding='utf-8') as f:
         rows = [json.loads(line) for line in f if line.strip()]
@@ -55,6 +56,9 @@ def load_games(path, cuts=CUTS):
     n_profiles = {len(r['probs']) for r in rows}
     if len(n_profiles) > 1:
         raise ValueError('%s 各局的 profile 數不同：%s' % (path, sorted(n_profiles)))
+    names = {tuple(r['profiles']) if 'profiles' in r else None for r in rows}
+    if len(names) > 1:
+        raise ValueError('%s 各局的 profile 名稱不同' % path)
     has_loss = {'score_loss' in r for r in rows}
     if len(has_loss) > 1:
         raise ValueError('%s 有些局有損失欄位、有些沒有' % path)
@@ -62,7 +66,7 @@ def load_games(path, cuts=CUTS):
             'rank_idx': np.array([r['rank_idx'] for r in rows], np.int64),
             'player_id': np.array([r['player_id'] for r in rows]),
             'key': np.array([r['key'] for r in rows]),
-            'n_profiles': n_profiles.pop(), 'has_loss': has_loss.pop()}
+            'n_profiles': n_profiles.pop(), 'profiles': names.pop(), 'has_loss': has_loss.pop()}
 
 
 def feature_sets(n_profiles=10, has_loss=True, cuts=CUTS):

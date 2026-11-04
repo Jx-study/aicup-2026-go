@@ -217,6 +217,20 @@ def test_load_games_rejects_mixed_rows(tmp_path):
         fh.load_games(str(p))
 
 
+def test_load_games_reads_profile_names(tmp_path):
+    p = tmp_path / 'a.jsonl'
+    names = ['rank_11k', 'rank_1d', 'rank_6d']
+    rows = [dict(row('D_%d' % i, 'p1', 0, loss=None, n_profiles=3), profiles=names) for i in range(2)]
+    write_rows(p, rows)
+    assert fh.load_games(str(p))['profiles'] == tuple(names)
+    rows[1]['profiles'] = ['rank_11k', 'rank_6d', 'rank_1d']
+    write_rows(p, rows)
+    with pytest.raises(ValueError, match='名稱'):
+        fh.load_games(str(p))
+    write_rows(p, [row('D_1', 'p1', 0)])
+    assert fh.load_games(str(p))['profiles'] is None
+
+
 def test_feature_sets_three_profiles_with_loss():
     sets = fh.feature_sets(3, True)
     assert sets['A'] == [0, 1, 2, 3]
