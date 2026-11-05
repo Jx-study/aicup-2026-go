@@ -329,32 +329,6 @@ def test_sample_listed_players_rejects_short_player():
         ah.sample_listed_players(listed_df(), players, 4, seed=42)
 
 
-def test_sample_listed_players_min_games_keeps_full_players_sample():
-    # a(D) 5 局、c(D) 6 局足夠抽 5 局，b(C) 4 局、a(C) 2 局不足
-    players = pd.DataFrame({'player_id': ['b', 'a', 'c', 'a'], 'rank': ['C', 'D', 'D', 'C']})
-    out = ah.sample_listed_players(listed_df(), players, 5, seed=7, min_games=2)
-    enough = ah.sample_listed_players(listed_df(), players.iloc[[1, 2]], 5, seed=7)
-    assert out['game_id'].tolist()[:10] == enough['game_id'].tolist()  # 局數足夠的玩家抽到的局不變
-    rest = out.iloc[10:]
-    assert rest.groupby(['player_id', 'rank']).size().to_dict() == {('a', 'C'): 2, ('b', 'C'): 4}
-    again = ah.sample_listed_players(listed_df(), players.iloc[::-1], 5, seed=7, min_games=2)
-    assert out['game_id'].tolist() == again['game_id'].tolist()
-
-
-def test_sample_listed_players_min_games_rejects_below_floor():
-    players = pd.DataFrame({'player_id': ['a', 'b'], 'rank': ['C', 'C']})
-    with pytest.raises(SystemExit, match="不足 3.*'a', 'C'"):
-        ah.sample_listed_players(listed_df(), players, 5, seed=7, min_games=3)
-
-
-@pytest.mark.parametrize('players_file, min_games', [(False, 2), (True, 0), (True, 5)])
-def test_load_games_rejects_bad_min_games(tmp_path, players_file, min_games):
-    csv_glob, players = write_train_csv(tmp_path)
-    with pytest.raises(SystemExit, match='--min-games'):
-        ah.load_games(csv_glob, 0, 42, 0, games_per_player=4, players_file=players if players_file else None,
-                      min_games=min_games)
-
-
 def write_train_csv(tmp_path):
     df = listed_df()
     df['color'], df['sgf_content'] = 'B', '(;SZ[19])'

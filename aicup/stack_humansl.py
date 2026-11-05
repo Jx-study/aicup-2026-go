@@ -15,25 +15,22 @@ CNN 單獨、Human SL 單獨、stacking 在同一批題目上比較，差用以�
 --prior 決定是否去掉訓練題的等級先驗：keep 不處理，balanced 用 class_weight，divide 把機率除以訓練題的等級比例。
 --combos 時分數同時印出不加權與每級等權兩種，每級等權是先算各等級玩家的平均，再對等級平均。
 --se、--se-opp、--hsl-opp、--prior 只用於 --combos。
---eval-players 給定時，只有清單內的玩家切折、出測試題，jsonl 中其他玩家每一折都只當訓練玩家。
 
 用法（在 repo 根目錄）：
     python -m aicup.stack_humansl humansl-analysis/val648-p3.jsonl --cnn-probs rank-trained-models/<commit hash>/val_probs.npz
     python -m aicup.stack_humansl humansl-analysis/val648-p3.jsonl --cnn-probs ... --se se-models/val648-se.jsonl --combos cnn+hsl,cnn+hsl+se8
     python -m aicup.stack_humansl humansl-analysis/val648-p3.jsonl --cnn-probs ... --se se-models/val648-se.jsonl --hsl-opp humansl-analysis/val648-p3-opp.jsonl --combos cnn+hsl+hd,cnn+hsl+hd+hslo
-    python -m aicup.stack_humansl humansl-analysis/val798-p3.jsonl --cnn-probs ... --eval-players humansl-analysis/val-players.csv --combos cnn+hsl
 """
 import argparse
-import csv
 import json
 
 import numpy as np
 from sklearn.model_selection import GroupKFold
 
 from aicup.eval_posthoc import SIZES, parse_sizes
-from aicup.fit_humansl import (CS, bootstrap_mean, feature_sets, level_probs, load_games, new_model,
-                               player_folds, player_keys, player_means, predict_avg, question_points,
-                               question_x, questions_of, read_val_probs)
+from aicup.fit_humansl import (CS, bootstrap_mean, feature_sets, level_probs, load_games, make_splits,
+                               new_model, player_means, predict_avg, question_points, question_x,
+                               questions_of, read_val_probs)
 from aicup.scoring import LEVELS, aggregate_games, apply_temperature, pick_level
 
 EPS = 1e-12  # log 前的下限，與 scoring.aggregate_games 一致
@@ -121,37 +118,6 @@ def load_hsl_opp(path, data):
     if wrong.any():
         raise ValueError('%s 的等級和目標玩家的 jsonl 不一致，例如 %s' % (path, data['key'][wrong][0]))
     return opp['x'][rows][:, hsl_columns(opp)]
-
-
-def load_eval_players(path):
-    """含 player_id、rank 欄位的 CSV，回傳 fit_humansl.player_keys 格式的 set。"""
-    with open(path, encoding='utf-8', newline='') as f:
-        return {'%d|%s' % (LEVELS.index(r['rank']), r['player_id']) for r in csv.DictReader(f)}
-
-
-def make_eval_splits(data, sizes, repeats, eval_players=None, folds=5, seed=42):
-    """同 fit_humansl.make_splits，但只有 eval_players 的玩家切折、出測試題，其他玩家每一折都只當訓練。
-
-    eval_players 是 player_keys 格式的 set，None 時所有玩家都參與，結果和 make_splits 相同。
-    eval_players 的局在 data 中的相對順序和另一份只含這些玩家的 data 相同時，兩者的測試題選到相同的局。
-    有清單內的玩家不在 data 時丟 ValueError。回傳 [(train 遮罩, questions, labels, players)]。
-    """
-    keys = player_keys(data)
-    if eval_players is None:
-        member = np.ones(len(keys), bool)
-    else:
-        missing = sorted(eval_players - set(keys))
-        if missing:
-            raise ValueError('有 %d 位評估玩家不在資料內，例如 %s' % (len(missing), missing[0]))
-        member = np.isin(keys, sorted(eval_players))
-    fold = np.full(len(keys), -1)
-    fold[member] = player_folds({'player_id': data['player_id'][member], 'rank_idx': data['rank_idx'][member]},
-                                folds, seed)
-    splits = []
-    for f in range(folds):
-        q, y, p = questions_of(data, fold == f, repeats, np.random.default_rng([seed, f]), sizes)
-        splits.append((fold != f, q, y, p))
-    return splits
 
 
 def hd_direction(hd, color):
@@ -331,21 +297,17 @@ def main():
     ap.add_argument('--hsl-opp', help='analyze_humansl --side opponent 的 jsonl，提供 hslo 特徵塊')
     ap.add_argument('--combos', help='逗號分隔的組合，例如 cnn+hsl,cnn+hsl+se8；第一個是配對差的基準')
     ap.add_argument('--prior', default='keep', choices=PRIORS, help='只用於 --combos')
-    ap.add_argument('--eval-players', help='含 player_id、rank 欄位的 CSV，只有這些玩家出測試題，其他玩家只當訓練')
     args = ap.parse_args()
     if not args.combos and (args.se or args.se_opp or args.hsl_opp or args.prior != 'keep'):
         ap.error('--se、--se-opp、--hsl-opp、--prior 只用於 --combos')
 
     data = load_games(args.jsonl)
     cnn = load_cnn_probs(args.cnn_probs, data['key'], data['rank_idx'])
-    eval_players = load_eval_players(args.eval_players) if args.eval_players else None
-    splits = make_eval_splits(data, args.sizes, args.test_repeats, eval_players, seed=args.seed)
+    splits = make_splits(data, args.sizes, args.test_repeats, seed=args.seed)
     questions = [q for s in splits for q in s[1]]
     labels = np.concatenate([s[2] for s in splits])
     players = np.concatenate([s[3] for s in splits])
-    n_train_only = 0 if eval_players is None else len(set(player_keys(data)) - eval_players)
-    print('%d 局，%d 位玩家出測試題，%d 位只當訓練，%d 題，seed %d'
-          % (len(data['x']), len(set(players)), n_train_only, len(questions), args.seed))
+    print('%d 局，%d 位玩家，%d 題，seed %d' % (len(data['x']), len(set(players)), len(questions), args.seed))
     if args.combos:
         run_combos(args, data, cnn, splits, labels, players)
         return

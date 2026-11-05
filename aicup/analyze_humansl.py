@@ -254,13 +254,10 @@ def sample_players(df, players_per_rank, games_per_player, seed):
             .sample(n=games_per_player, random_state=seed))
 
 
-def sample_listed_players(df, players, games_per_player, seed, min_games=None):
+def sample_listed_players(df, players, games_per_player, seed):
     """只留 players 內 (player_id, rank) 的局，每人抽 games_per_player 局，seed 用法同 sample_players()。
 
-    同一個 player_id 可能出現在不同等級，所以連同 rank 比對。
-    min_games 為 None 時，局數不足 games_per_player 的玩家以 SystemExit 拒絕。
-    min_games 給定時，局數介於 min_games 與 games_per_player 之間的玩家用全部的局，排在後面，
-    局數足夠的玩家照常抽樣，抽到的局和只列這些玩家時相同；局數不足 min_games 的玩家拒絕。
+    同一個 player_id 可能出現在不同等級，所以連同 rank 比對。局數不足的玩家以 SystemExit 拒絕。
     回傳順序只由清單內容與 seed 決定，和清單的列順序無關。
     """
     listed = pd.MultiIndex.from_frame(players[['player_id', 'rank']].astype(str))
@@ -268,39 +265,28 @@ def sample_listed_players(df, players, games_per_player, seed, min_games=None):
     df = df[pd.MultiIndex.from_arrays(key).isin(listed)]
     groups = df.groupby([df['player_id'].astype(str), df['rank'].astype(str)], group_keys=False)
     counts = groups.size().reindex(listed, fill_value=0)
-    floor = games_per_player if min_games is None else min_games
-    short = counts[counts < floor]
+    short = counts[counts < games_per_player]
     if len(short):
-        raise SystemExit('局數不足 %d 的玩家：%s' % (floor, short.to_dict()))
-    few = counts.index[counts < games_per_player]
-    if not len(few):
-        return groups.sample(n=games_per_player, random_state=seed)
-    # groupby().sample 共用亂數流，局數足夠的玩家另外抽
-    enough = counts.index[counts >= games_per_player].to_frame(index=False, name=['player_id', 'rank'])
-    sampled = sample_listed_players(df, enough, games_per_player, seed) if len(enough) else df.iloc[:0]
-    rest = df[pd.MultiIndex.from_arrays([df['player_id'].astype(str), df['rank'].astype(str)]).isin(few)]
-    return pd.concat([sampled, rest.sort_values(['rank', 'player_id', 'game_id'])])
+        raise SystemExit('局數不足 %d 的玩家：%s' % (games_per_player, short.to_dict()))
+    return groups.sample(n=games_per_player, random_state=seed)
 
 
 def load_games(csv_glob, per_rank, seed, limit, players_per_rank=0, games_per_player=20,
-               players_file=None, min_games=None):
+               players_file=None):
     """讀 CSV 並抽樣，回傳每局一個 dict。
 
     players_file 是含 player_id、rank 欄位的 CSV，給定時只抽清單內的玩家，不能和 per_rank、players_per_rank 同時使用。
-    min_games 只用於 players_file，見 sample_listed_players()。
     players_per_rank 非 0 時依玩家抽樣，忽略 per_rank。
     """
     if players_file and (per_rank or players_per_rank):
         raise SystemExit('--players-file 不能和 --per-rank、--players-per-rank 同時使用')
-    if min_games is not None and (not players_file or not 0 < min_games <= games_per_player):
-        raise SystemExit('--min-games 只用於 --players-file，且要介於 1 與 --games-per-player 之間')
     paths = sorted(glob.glob(csv_glob))
     if not paths:
         raise SystemExit('找不到 %s' % csv_glob)
     df = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
     if players_file:
         # player_id 全是數字時預設會被讀成整數
-        df = sample_listed_players(df, pd.read_csv(players_file, dtype=str), games_per_player, seed, min_games)
+        df = sample_listed_players(df, pd.read_csv(players_file, dtype=str), games_per_player, seed)
     elif players_per_rank:
         df = sample_players(df, players_per_rank, games_per_player, seed)
     elif per_rank:
@@ -367,10 +353,7 @@ def main():
     ap.add_argument('--per-rank', type=int, default=0, help='每個等級抽幾局，0 為全部')
     ap.add_argument('--players-per-rank', type=int, default=0, help='每個等級抽幾位玩家，非 0 時忽略 --per-rank')
     ap.add_argument('--games-per-player', type=int, default=20, help='每位玩家抽幾局，局數不足的玩家不抽')
-    ap.add_argument('--players-file', help='含 player_id、rank 欄位的 CSV，只抽清單內的玩家，局數不足的玩家見 --min-games')
-    ap.add_argument('--min-games', type=int,
-                    help='只用於 --players-file，局數不足 --games-per-player 但至少有這麼多局的玩家用全部的局；'
-                         '不給時局數不足 --games-per-player 的玩家拒絕')
+    ap.add_argument('--players-file', help='含 player_id、rank 欄位的 CSV，只抽清單內的玩家，有人局數不足時拒絕')
     ap.add_argument('--test-dir', help='競賽二測試題所在目錄；給定時不讀 --csv，不能和抽樣參數同時使用')
     ap.add_argument('--limit', type=int, default=0, help='最多分析幾局，用於冒煙測試')
     ap.add_argument('--seed', type=int, default=42)
@@ -398,12 +381,12 @@ def main():
     done = done_keys(args.out, eval_visits, args.profiles, args.side)
     todo, bad = [], 0
     if args.test_dir:
-        if args.per_rank or args.players_per_rank or args.players_file or args.min_games is not None:
-            raise SystemExit('--test-dir 不能和 --per-rank、--players-per-rank、--players-file、--min-games 同時使用')
+        if args.per_rank or args.players_per_rank or args.players_file:
+            raise SystemExit('--test-dir 不能和 --per-rank、--players-per-rank、--players-file 同時使用')
         games = load_test_games(args.test_dir, args.limit)
     else:
         games = load_games(args.csv, args.per_rank, args.seed, args.limit,
-                           args.players_per_rank, args.games_per_player, args.players_file, args.min_games)
+                           args.players_per_rank, args.games_per_player, args.players_file)
     for g in games:
         if g['key'] in done:
             continue
