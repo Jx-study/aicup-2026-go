@@ -1,3 +1,4 @@
+import json
 import re
 import sys
 
@@ -145,3 +146,146 @@ def test_main_runs_end_to_end_on_toy_data(tmp_path, monkeypatch, capsys):
     lo = float(re.search(r'stacking - CNN：\S+，95% 區間 (\S+)～', out).group(1))
     verdict = out.split('暫定門檻')[1].split('：')[1].strip()
     assert verdict == ('通過' if lo > 0 else '未通過')
+
+
+def write_se(path, keys, rank_idx, n_sym=8, seed=0, side='target'):
+    """每局 SE∞ score 隨等級上升，對稱之間加雜訊。"""
+    rng = np.random.default_rng(seed)
+    with open(path, 'w', encoding='utf-8') as f:
+        for k, y in zip(keys, rank_idx):
+            mean = (y + rng.normal(0, 1, n_sym)).tolist()
+            sl = np.full(11, 0.01)
+            sl[min(y + 1, 10)] = 0.9
+            f.write(json.dumps({'key': str(k), 'rank_idx': int(y), 'n': 50, 'score_mean': mean,
+                                'score_std': [1.0] * n_sym, 'sl_rank': (sl / sl.sum()).tolist(),
+                                'hd': int(y % 3 == 0), 'color': 'BW'[int(y) % 2], 'side': side}) + '\n')
+
+
+def test_load_se_blocks_aligns_by_key_and_averages_symmetries(tmp_path):
+    keys, rank = np.array(['a', 'b', 'c']), np.array([3, 1, 2])
+    with open(tmp_path / 's.jsonl', 'w', encoding='utf-8') as f:
+        for k, y, m, hd, color in (('b', 1, list(range(8)), None, 'B'), ('a', 3, [8.0] * 8, 2, 'W'),
+                                   ('c', 2, [0.0] * 8, 1, 'B')):
+            f.write(json.dumps({'key': k, 'rank_idx': y, 'n': 5, 'score_mean': m, 'score_std': [2.0] * 8,
+                                'sl_rank': [1 / 11] * 11, 'hd': hd, 'color': color}) + '\n')
+    b = sh.load_se_blocks(str(tmp_path / 's.jsonl'), keys, rank)
+    assert b['se1'][1].tolist() == [0.0, 2.0] and b['se4'][1, 0] == 1.5 and b['se8'][1, 0] == 3.5
+    assert b['se8'][0, 0] == 8.0
+    assert b['sl'].shape == (3, 11) and np.allclose(b['sl'], np.log(1 / 11))
+    assert b['hd'].ravel().tolist() == [-1.0, 0.0, 1.0]  # 執白讓人、分先、執黑被讓
+
+
+def test_hd_direction():
+    assert sh.hd_direction(None, 'B') == 0.0 and sh.hd_direction(0, 'W') == 0.0
+    assert sh.hd_direction(1, 'B') == 1.0 and sh.hd_direction(5, 'W') == -1.0
+
+
+def test_load_se_blocks_opponent_side_and_fewer_symmetries(tmp_path):
+    data, _ = toy_data(n_players=10, games=5)
+    write_se(tmp_path / 'o.jsonl', data['key'], data['rank_idx'], n_sym=4, side='opponent')
+    b = sh.load_se_blocks(str(tmp_path / 'o.jsonl'), data['key'], data['rank_idx'], side='opponent')
+    assert sorted(b) == ['se1o', 'se4o', 'slo']  # 4 種對稱的檔案沒有 se8o，對手側不重複產生 hd
+    with pytest.raises(ValueError, match='side'):
+        sh.load_se_blocks(str(tmp_path / 'o.jsonl'), data['key'], data['rank_idx'])
+
+
+def test_load_se_blocks_rejects_mixed_symmetry_counts(tmp_path):
+    with open(tmp_path / 's.jsonl', 'w', encoding='utf-8') as f:
+        for k, n_sym in (('a', 8), ('b', 4)):
+            f.write(json.dumps({'key': k, 'rank_idx': 1, 'n': 5, 'score_mean': [0.0] * n_sym,
+                                'score_std': [0.0] * n_sym, 'sl_rank': [0.1] * 11, 'hd': 0,
+                                'color': 'B'}) + '\n')
+    with pytest.raises(ValueError, match='對稱數'):
+        sh.load_se_blocks(str(tmp_path / 's.jsonl'), np.array(['a', 'b']), np.array([1, 1]))
+
+
+@pytest.mark.parametrize('row, match', [
+    ({'key': 'x', 'rank_idx': 3, 'n': 5, 'score_mean': [0] * 8, 'score_std': [0] * 8, 'sl_rank': [0.1] * 11}, '缺少'),
+    ({'key': 'a', 'rank_idx': 2, 'n': 5, 'score_mean': [0] * 8, 'score_std': [0] * 8, 'sl_rank': [0.1] * 11}, '等級'),
+    ({'key': 'a', 'rank_idx': 3, 'n': 0, 'score_mean': None, 'score_std': None, 'sl_rank': None}, '可評的手'),
+])
+def test_load_se_blocks_rejects_bad_rows(tmp_path, row, match):
+    (tmp_path / 's.jsonl').write_text(json.dumps(row) + '\n', encoding='utf-8')
+    with pytest.raises(ValueError, match=match):
+        sh.load_se_blocks(str(tmp_path / 's.jsonl'), np.array(['a']), np.array([3]))
+
+
+def test_parse_combo_and_inputs():
+    blocks = {'hsl': np.ones((3, 2)), 'se8': np.zeros((3, 2))}
+    assert sh.parse_combo('cnn+hsl+se8', set(blocks) | {'cnn'}) == ['cnn', 'hsl', 'se8']
+    for bad in ('cnn+foo', 'hsl+hsl'):
+        with pytest.raises(ValueError):
+            sh.parse_combo(bad, set(blocks) | {'cnn'})
+    probs = np.full((3, 10), 0.1)
+    x, c = sh.combo_inputs(['cnn'], blocks, probs)
+    assert x is None and c is probs
+    x, c = sh.combo_inputs(['se8', 'hsl'], blocks, probs)
+    assert c is None and x.shape == (3, 4) and x[:, :2].sum() == 0
+
+
+def test_question_features_without_cnn_is_feature_mean():
+    x = np.arange(12, dtype=float).reshape(6, 2)
+    f = sh.question_features(x, None, [np.array([0, 1]), np.array([4, 5])], temp=3.0)
+    assert f.tolist() == [[1.0, 2.0], [9.0, 10.0]]
+
+
+def test_divide_prior_removes_label_frequency():
+    labels = np.array([0, 0, 0, 1])
+    out = sh.divide_prior(np.array([[0.75, 0.25] + [0.0] * 8]), labels)
+    assert np.allclose(out[0, :2], [0.5, 0.5]) and np.isclose(out.sum(), 1.0)
+
+
+def test_level_weighted_averages_levels_not_players():
+    means = np.array([1.0, 1.0, 1.0, 0.0])
+    assert sh.level_weighted(means, np.array([0, 0, 0, 1])) == 0.5
+
+
+@pytest.mark.parametrize('prior', sh.PRIORS)
+def test_predict_inputs_se_only_beats_chance(tmp_path, prior):
+    data, _ = toy_data()
+    write_se(tmp_path / 's.jsonl', data['key'], data['rank_idx'])
+    blocks = sh.load_se_blocks(str(tmp_path / 's.jsonl'), data['key'], data['rank_idx'])
+    splits = make_splits(data, (5, 20), 2, seed=42)
+    points = []
+    for train, questions, labels, _ in splits:
+        p, _ = sh.predict_inputs(blocks['se8'], None, data, train, questions, np.random.default_rng(1), (5, 20), 2,
+                                 temp=3.0, cs=(0.1, 1.0), inner_folds=3, prior=prior)
+        assert np.allclose(p.sum(axis=1), 1.0)
+        points.append(question_points(labels, pick_level(p)))
+    assert np.concatenate(points).mean() > 0.5
+
+
+def test_predict_stack_matches_predict_inputs_keep():
+    data, probs = toy_data()
+    train, questions, _, _ = make_splits(data, (5, 20), 2, seed=42)[0]
+    a, c_a = sh.predict_stack(data, probs, train, questions, np.random.default_rng(1), (5, 20), 2,
+                              temp=3.0, cs=(0.1, 1.0), inner_folds=3)
+    b, c_b = sh.predict_inputs(data['x'][:, sh.hsl_columns(data)], probs, data, train, questions,
+                               np.random.default_rng(1), (5, 20), 2, temp=3.0, cs=(0.1, 1.0), inner_folds=3)
+    assert c_a == c_b and np.array_equal(a, b)
+
+
+def test_main_combos_end_to_end(tmp_path, monkeypatch, capsys):
+    data, probs = toy_data()
+    write_npz(tmp_path / 'v.npz', data['key'], probs, data['rank_idx'])
+    write_se(tmp_path / 's.jsonl', data['key'], data['rank_idx'])
+    write_se(tmp_path / 'o.jsonl', data['key'], data['rank_idx'], n_sym=4, side='opponent')
+    monkeypatch.setattr(sh, 'load_games', lambda path: data)
+    monkeypatch.setattr(sys, 'argv', ['stack_humansl', 'unused.jsonl', '--cnn-probs', str(tmp_path / 'v.npz'),
+                                      '--se', str(tmp_path / 's.jsonl'), '--se-opp', str(tmp_path / 'o.jsonl'),
+                                      '--combos', 'cnn+hsl,cnn+hsl+se8,se8+sl,cnn+hsl+se4o+hd',
+                                      '--prior', 'balanced', '--train-repeats', '2', '--test-repeats', '2',
+                                      '--inner-folds', '3'])
+    sh.main()
+    out = capsys.readouterr().out
+    assert 'prior balanced，基準 cnn+hsl' in out
+    rows = [line for line in out.splitlines() if line.startswith('| cnn') or line.startswith('| se8')]
+    assert len(rows) == 4
+    assert '+0.0000' in rows[0]  # 基準減自己
+
+
+@pytest.mark.parametrize('extra', [['--se', 's.jsonl'], ['--se-opp', 'o.jsonl'], ['--prior', 'balanced']])
+def test_main_rejects_combo_only_options_without_combos(monkeypatch, extra):
+    monkeypatch.setattr(sys, 'argv', ['stack_humansl', 'unused.jsonl', '--cnn-probs', 'v.npz'] + extra)
+    with pytest.raises(SystemExit):
+        sh.main()

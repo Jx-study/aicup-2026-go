@@ -31,6 +31,18 @@ def test_fit_stack_matches_stack_humansl_with_all_players():
     assert c == c_theirs and np.allclose(ours, theirs)
 
 
+def test_fit_stack_balanced_matches_stack_humansl_prior_balanced():
+    data, probs = toy_data()
+    questions, _ = player_questions(data)
+    model, c = ps.fit_stack(data, probs, (5, 10), 2, 3.0, 7, inner_folds=3, prior='balanced')
+    x = data['x'][:, sh.hsl_columns(data)]
+    ours = level_probs(model, sh.question_features(x, probs, questions, 3.0))
+    theirs, c_theirs = sh.predict_inputs(x, probs, data, np.ones(len(x), bool), questions, np.random.default_rng(7),
+                                         (5, 10), 2, 3.0, inner_folds=3, prior='balanced')
+    assert c == c_theirs and np.allclose(ours, theirs)
+    assert model[-1].class_weight == 'balanced'
+
+
 def test_fit_stack_learns_toy_levels():
     data, probs = toy_data()
     questions, labels = player_questions(data)

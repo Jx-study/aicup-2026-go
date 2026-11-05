@@ -88,8 +88,9 @@ def question_points(labels, preds):
     return (d == 0) + NEAR_SCORE * (d == 1)
 
 
-def new_model(c):
-    return make_pipeline(StandardScaler(), LogisticRegression(C=c, max_iter=3000))
+def new_model(c, class_weight=None):
+    """class_weight 為 'balanced' 時各等級的總權重相同，不帶訓練題的等級先驗。"""
+    return make_pipeline(StandardScaler(), LogisticRegression(C=c, max_iter=3000, class_weight=class_weight))
 
 
 def level_probs(model, x):

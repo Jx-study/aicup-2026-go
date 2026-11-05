@@ -26,14 +26,18 @@ from aicup.eval_posthoc import SIZES, parse_sizes
 from aicup.fit_humansl import level_probs, load_games, questions_of
 from aicup.predict_rank import file_sha256, read_questions
 from aicup.scoring import LEVELS, pick_level
-from aicup.stack_humansl import fit_model, hsl_columns, load_cnn_probs, question_features
+from aicup.stack_humansl import fit_model, hsl_columns, load_cnn_probs, prior_class_weight, question_features
 
 
-def fit_stack(data, cnn_probs, sizes, train_repeats, temp, seed, inner_folds=5):
-    """用 data 的全部玩家出題並擬合，回傳 (model, 選到的 C)。"""
+def fit_stack(data, cnn_probs, sizes, train_repeats, temp, seed, inner_folds=5, prior='keep'):
+    """用 data 的全部玩家出題並擬合，回傳 (model, 選到的 C)。
+
+    prior 為 balanced 時用 class_weight 去掉 val 玩家的等級先驗，同 stack_humansl 的 --prior balanced。
+    """
     rng = np.random.default_rng(seed)
     q, y, players = questions_of(data, np.ones(len(data['x']), bool), train_repeats, rng, sizes)
-    return fit_model(data['x'][:, hsl_columns(data)], cnn_probs, q, y, players, temp, inner_folds=inner_folds)
+    return fit_model(data['x'][:, hsl_columns(data)], cnn_probs, q, y, players, temp, inner_folds=inner_folds,
+                     class_weight=prior_class_weight(prior))
 
 
 def check_profiles(fit_data, test_data):
@@ -102,6 +106,8 @@ def main():
     ap.add_argument('--train-repeats', type=int, default=10)
     ap.add_argument('--inner-folds', type=int, default=5)
     ap.add_argument('--seed', type=int, default=42)
+    ap.add_argument('--prior', default='keep', choices=('keep', 'balanced'),
+                    help='balanced 時不帶 val 玩家的等級先驗')
     args = ap.parse_args()
 
     qids, games = read_questions(args.test_dir)
@@ -115,8 +121,9 @@ def main():
     print('測試：%d 題，%d 局，可用 %d 局' % (len(qids), len(games), valid.sum()))
 
     cnn = load_cnn_probs(args.val_probs, data['key'], data['rank_idx'])
-    model, c = fit_stack(data, cnn, args.sizes, args.train_repeats, args.cnn_temp, args.seed, args.inner_folds)
-    print('擬合：%d 局，%d 位玩家，選到 C=%g' % (len(data['x']), len(set(data['player_id'])), c))
+    model, c = fit_stack(data, cnn, args.sizes, args.train_repeats, args.cnn_temp, args.seed, args.inner_folds,
+                         args.prior)
+    print('擬合：%d 局，%d 位玩家，選到 C=%g，prior %s' % (len(data['x']), len(set(data['player_id'])), c, args.prior))
 
     preds, empty = predict(model, x_test, test_probs, game_q, valid, len(qids), args.cnn_temp)
     if empty:
