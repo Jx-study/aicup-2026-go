@@ -5,8 +5,9 @@
     val_probs.npz 要和 val jsonl 出自同一個 CNN 沒訓練過的 val 玩家。
 預測：
     每題的特徵是 CNN 各局機率以溫度縮放、log 合併後的 log 機率，接各局 Human SL 特徵組 A 的平均。
+    給定 --val-hsl-opp 與 --test-hsl-opp 時再接對手側的特徵組 A 平均，同 stack_humansl 的 cnn+hsl+hslo。
     CNN 各局機率讀 predict_rank 的快取，Human SL 讀 analyze_humansl --test-dir 的輸出。
-    缺 Human SL 結果或 CNN 機率為 NaN 的局不參與合併；整題都無效時回傳最弱等級，同 predict_rank。
+    缺 Human SL 結果（含對手側）或 CNN 機率為 NaN 的局不參與合併；整題都無效時回傳最弱等級，同 predict_rank。
 
 用法（在 repo 根目錄）：
     python -m aicup.predict_stack --val-jsonl humansl-analysis/val648-p3.jsonl \\
@@ -14,6 +15,7 @@
         --test-jsonl humansl-analysis/test-p3.jsonl \\
         --test-probs rank-trained-models/<commit hash>/game_probs_test.npz \\
         --ckpt rank-trained-models/<commit hash>/best_model.pth \\
+        --val-hsl-opp humansl-analysis/val648-p3-opp.jsonl --test-hsl-opp humansl-analysis/test-p3-opp.jsonl \\
         --out rank-trained-models/<stacking 的 commit hash>/submission_rank.csv
 """
 import argparse
@@ -26,17 +28,20 @@ from aicup.eval_posthoc import SIZES, parse_sizes
 from aicup.fit_humansl import level_probs, load_games, questions_of
 from aicup.predict_rank import file_sha256, read_questions
 from aicup.scoring import LEVELS, pick_level
-from aicup.stack_humansl import fit_model, hsl_columns, load_cnn_probs, prior_class_weight, question_features
+from aicup.stack_humansl import (fit_model, hsl_columns, load_cnn_probs, load_hsl_opp, prior_class_weight,
+                                 question_features)
 
 
-def fit_stack(data, cnn_probs, sizes, train_repeats, temp, seed, inner_folds=5, prior='keep'):
+def fit_stack(data, cnn_probs, sizes, train_repeats, temp, seed, inner_folds=5, prior='keep', x=None):
     """用 data 的全部玩家出題並擬合，回傳 (model, 選到的 C)。
 
+    x 是各局特徵，預設為 data 的 Human SL 特徵組 A。
     prior 為 balanced 時用 class_weight 去掉 val 玩家的等級先驗，同 stack_humansl 的 --prior balanced。
     """
     rng = np.random.default_rng(seed)
     q, y, players = questions_of(data, np.ones(len(data['x']), bool), train_repeats, rng, sizes)
-    return fit_model(data['x'][:, hsl_columns(data)], cnn_probs, q, y, players, temp, inner_folds=inner_folds,
+    x = data['x'][:, hsl_columns(data)] if x is None else x
+    return fit_model(x, cnn_probs, q, y, players, temp, inner_folds=inner_folds,
                      class_weight=prior_class_weight(prior))
 
 
@@ -51,17 +56,18 @@ def check_profiles(fit_data, test_data):
                          % (test_data['n_profiles'], fit_data['n_profiles']))
 
 
-def align_test(test_data, keys, game_probs):
-    """回傳 (Human SL 特徵組 A, 每局是否可用)，特徵依 keys 排列。
+def align_test(test_data, keys, game_probs, x=None):
+    """回傳 (各局特徵, 每局是否可用)，特徵依 keys 排列。
 
-    缺 Human SL 結果或 CNN 機率有 NaN 的局不可用，特徵列填 NaN。
+    x 是依 test_data['key'] 排列的各局特徵，預設為 Human SL 特徵組 A。
+    缺 Human SL 結果、特徵有 NaN 或 CNN 機率有 NaN 的局不可用，特徵列填 NaN。
     """
     index = {k: i for i, k in enumerate(test_data['key'])}
-    cols = hsl_columns(test_data)
-    x = np.full((len(keys), len(cols)), np.nan)
-    has_hsl = np.array([k in index for k in keys])
-    x[has_hsl] = test_data['x'][[index[k] for k in np.asarray(keys)[has_hsl]]][:, cols]
-    return x, has_hsl & ~np.isnan(game_probs).any(axis=1)
+    x = test_data['x'][:, hsl_columns(test_data)] if x is None else x
+    out = np.full((len(keys), x.shape[1]), np.nan)
+    in_test = np.array([k in index for k in keys])
+    out[in_test] = x[[index[k] for k in np.asarray(keys)[in_test]]]
+    return out, ~np.isnan(out).any(axis=1) & ~np.isnan(game_probs).any(axis=1)
 
 
 def read_test_probs(path, game_q, ckpt=None):
@@ -108,7 +114,11 @@ def main():
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--prior', default='keep', choices=('keep', 'balanced'),
                     help='balanced 時不帶 val 玩家的等級先驗')
+    ap.add_argument('--val-hsl-opp', help='analyze_humansl --side opponent 對 --val-jsonl 同一批局的輸出')
+    ap.add_argument('--test-hsl-opp', help='analyze_humansl --test-dir --side opponent 的輸出')
     args = ap.parse_args()
+    if bool(args.val_hsl_opp) != bool(args.test_hsl_opp):
+        ap.error('--val-hsl-opp 與 --test-hsl-opp 要一起給')
 
     qids, games = read_questions(args.test_dir)
     game_q = np.array([q for q, _, _ in games], np.int64)
@@ -117,12 +127,17 @@ def main():
     data = load_games(args.val_jsonl)
     test_data = load_games(args.test_jsonl)
     check_profiles(data, test_data)
-    x_test, valid = align_test(test_data, test_game_keys(qids, games), test_probs)
+    x_val, x_test_games = data['x'][:, hsl_columns(data)], test_data['x'][:, hsl_columns(test_data)]
+    if args.val_hsl_opp:
+        x_val = np.hstack([x_val, load_hsl_opp(args.val_hsl_opp, data)])
+        x_test_games = np.hstack([x_test_games, load_hsl_opp(args.test_hsl_opp, test_data, allow_missing=True)])
+    print('特徵：%s' % ('cnn+hsl+hslo' if args.val_hsl_opp else 'cnn+hsl'))
+    x_test, valid = align_test(test_data, test_game_keys(qids, games), test_probs, x_test_games)
     print('測試：%d 題，%d 局，可用 %d 局' % (len(qids), len(games), valid.sum()))
 
     cnn = load_cnn_probs(args.val_probs, data['key'], data['rank_idx'])
     model, c = fit_stack(data, cnn, args.sizes, args.train_repeats, args.cnn_temp, args.seed, args.inner_folds,
-                         args.prior)
+                         args.prior, x_val)
     print('擬合：%d 局，%d 位玩家，選到 C=%g，prior %s' % (len(data['x']), len(set(data['player_id'])), c, args.prior))
 
     preds, empty = predict(model, x_test, test_probs, game_q, valid, len(qids), args.cnn_temp)

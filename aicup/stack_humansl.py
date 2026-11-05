@@ -96,10 +96,11 @@ def load_se_blocks(path, keys, rank_idx, side='target'):
     return blocks
 
 
-def load_hsl_opp(path, data):
+def load_hsl_opp(path, data, allow_missing=False):
     """analyze_humansl --side opponent 的 jsonl 依 data['key'] 對齊，回傳特徵組 A 的欄位 (len(keys), D)。
 
-    profiles 與是否有損失欄位要和 data 相同。有 key 不在檔案內、等級不一致或 side 不是 opponent 時丟 ValueError。
+    profiles 與是否有損失欄位要和 data 相同。等級不一致或 side 不是 opponent 時丟 ValueError。
+    有 key 不在檔案內時，allow_missing 為 False 丟 ValueError，為 True 則該列填 NaN。
     """
     opp = load_games(path)
     if (opp['profiles'], opp['has_loss']) != (data['profiles'], data['has_loss']):
@@ -110,14 +111,18 @@ def load_hsl_opp(path, data):
     if bad:
         raise ValueError('%s 的 side 不是 opponent，例如 %s' % (path, bad[0]))
     row_of = {k: i for i, k in enumerate(opp['key'])}
-    missing = [k for k in data['key'] if k not in row_of]
-    if missing:
+    has = np.array([k in row_of for k in data['key']], bool)
+    if not allow_missing and not has.all():
+        missing = data['key'][~has]
         raise ValueError('%s 缺少 %d 局，例如 %s' % (path, len(missing), ', '.join(missing[:3])))
-    rows = np.array([row_of[k] for k in data['key']])
-    wrong = opp['rank_idx'][rows] != data['rank_idx']
+    rows = np.array([row_of[k] for k in data['key'][has]], np.int64)
+    wrong = opp['rank_idx'][rows] != data['rank_idx'][has]
     if wrong.any():
-        raise ValueError('%s 的等級和目標玩家的 jsonl 不一致，例如 %s' % (path, data['key'][wrong][0]))
-    return opp['x'][rows][:, hsl_columns(opp)]
+        raise ValueError('%s 的等級和目標玩家的 jsonl 不一致，例如 %s' % (path, data['key'][has][wrong][0]))
+    cols = hsl_columns(opp)
+    x = np.full((len(has), len(cols)), np.nan)
+    x[has] = opp['x'][rows][:, cols]
+    return x
 
 
 def hd_direction(hd, color):

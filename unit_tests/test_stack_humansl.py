@@ -334,6 +334,17 @@ def test_load_hsl_opp_rejects_bad_file(tmp_path, side, keys, rank, match):
         sh.load_hsl_opp(str(tmp_path / 'o.jsonl'), sh.load_games(str(tmp_path / 't.jsonl')))
 
 
+def test_load_hsl_opp_allow_missing_fills_nan(tmp_path):
+    write_hsl(tmp_path / 't.jsonl', ['a', 'b', 'c'], [-1, -1, -1])
+    write_hsl(tmp_path / 'o.jsonl', ['c', 'a'], [-1, -1], side='opponent')
+    data = sh.load_games(str(tmp_path / 't.jsonl'))
+    opp = sh.load_games(str(tmp_path / 'o.jsonl'))
+    x = sh.load_hsl_opp(str(tmp_path / 'o.jsonl'), data, allow_missing=True)
+    cols = sh.hsl_columns(opp)
+    assert np.allclose(x[0], opp['x'][1, cols]) and np.allclose(x[2], opp['x'][0, cols])
+    assert np.isnan(x[1]).all()
+
+
 def test_load_hsl_opp_rejects_different_profiles(tmp_path):
     write_hsl(tmp_path / 't.jsonl', ['a'], [0])
     write_hsl(tmp_path / 'o.jsonl', ['a'], [0], side='opponent')
