@@ -6,6 +6,7 @@
 
 SE∞ score 會隨盤面方向偏移，所以對前 --symmetries 種對稱（aicup.symmetry 的 k = 0 起）各算一次，
 score_mean、score_std 是依 k 排列的清單，取前 m 個就等於用 m 種對稱跑的結果。SL 只用原方向。
+--side opponent 時改評目標玩家的對手那一方的手，color 欄位仍是目標玩家的顏色。
 
 輸入二選一：
     --keys-from 讀另一份 jsonl 的 key（例如 analyze_humansl 的輸出），從 --csv 找出同樣的局
@@ -14,6 +15,7 @@ score_mean、score_std 是依 k 排列的清單，取前 m 個就等於用 m 種
 用法（在 repo 根目錄）：
     python -m aicup.strength_se --keys-from humansl-analysis/val648-p3.jsonl --out humansl-analysis/val648-se.jsonl
     python -m aicup.strength_se --test-dir /content/tests --out humansl-analysis/test-se.jsonl
+    python -m aicup.strength_se --keys-from humansl-analysis/val648-p3.jsonl --side opponent --symmetries 4 --out humansl-analysis/val648-se-opp.jsonl
 """
 import argparse
 import glob
@@ -44,6 +46,7 @@ HISTORY = 8  # 最近 8 個盤面
 PLANES = 2 * HISTORY + 2
 PASS_INDEX = BOARD * BOARD
 SL_RANKS = 11  # 3-5k、1-2k、1d～9d
+SIDES = ('target', 'opponent')
 
 
 def ensure_models(model_dir, url=MODEL_URL):
@@ -196,9 +199,19 @@ def load_keyed_games(keys_path, csv_glob, limit=0):
     return games
 
 
-def run_config(symmetries, dtype):
+def run_config(symmetries, dtype, side='target'):
     """每列都記錄的推論設定，接續時必須相同。"""
-    return {'models': MODELS, 'symmetries': symmetries, 'dtype': dtype}
+    return {'models': MODELS, 'symmetries': symmetries, 'dtype': dtype, 'side': side}
+
+
+def side_color(color, side):
+    """要評的那一方的顏色：target 是目標玩家，opponent 是對手。"""
+    return color if side == 'target' else {'B': 'W', 'W': 'B'}[color]
+
+
+def encode_job(game, side):
+    """game_features 的輸入：解析後的手順，加上要評的那一方的顏色。"""
+    return {'moves': game['parsed']['moves'], 'color': side_color(game['color'], side)}
 
 
 def done_keys(path, config):
@@ -218,7 +231,8 @@ def done_keys(path, config):
         data = data[:end]
     rows = [json.loads(line) for line in data.decode('utf-8').splitlines() if line.strip()]
     for k, v in config.items():
-        if any(r.get(k) != v for r in rows):
+        # 加入 side 之前的檔案沒有這個欄位，都是 target
+        if any(r.get(k, 'target' if k == 'side' else None) != v for r in rows):
             raise SystemExit('%s 的 %s 不是 %s，請換一個 --out' % (path, k, v))
     return {r['key'] for r in rows}
 
@@ -271,6 +285,7 @@ def main():
     ap.add_argument('--nproc', type=int, default=max(1, (os.cpu_count() or 2) - 2), help='編碼用的 process 數')
     ap.add_argument('--device', default=None, help='預設有 CUDA 時用 cuda，否則 cpu')
     ap.add_argument('--dtype', default='float32', choices=['float32', 'float16', 'bfloat16'])
+    ap.add_argument('--side', default='target', choices=SIDES, help='評目標玩家或對手的手')
     ap.add_argument('--symmetries', type=int, default=symmetry.N_SYMMETRIES, choices=range(1, 9),
                     help='SE∞ 用前幾種對稱，SL 只用原方向')
     args = ap.parse_args()
@@ -280,7 +295,7 @@ def main():
     else:
         games = load_keyed_games(args.keys_from, args.csv, args.limit)
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
-    config = run_config(args.symmetries, args.dtype)
+    config = run_config(args.symmetries, args.dtype, args.side)
     done = done_keys(args.out, config)
     todo, bad = [], []
     for g in games:
@@ -309,8 +324,7 @@ def main():
     chunks = [todo[i:i + args.chunk] for i in range(0, len(todo), args.chunk)]
     with open(args.out, 'a', encoding='utf-8') as f, ProcessPoolExecutor(args.nproc) as pool:
         def submit(chunk):
-            return [pool.submit(game_features, {'moves': g['parsed']['moves'], 'color': g['color']})
-                    for g in chunk]
+            return [pool.submit(game_features, encode_job(g, args.side)) for g in chunk]
         # 推論目前這組時先編碼下一組，記憶體只放兩組
         pending = submit(chunks[0])
         for j, chunk in enumerate(chunks):

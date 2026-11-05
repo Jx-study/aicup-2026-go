@@ -228,6 +228,64 @@ def test_done_keys_requires_same_config(tmp_path):
             se.done_keys(str(out), {**CONFIG, k: v})
 
 
+def test_side_color():
+    assert se.side_color('B', 'target') == 'B' and se.side_color('B', 'opponent') == 'W'
+    assert se.side_color('W', 'opponent') == 'B'
+
+
+def test_encode_job_uses_opponent_color():
+    g = {'color': 'B', 'parsed': parse_game('(;GM[1]SZ[19];B[dd];W[pp];B[dp])')}
+    assert se.encode_job(g, 'target')['color'] == 'B'
+    job = se.encode_job(g, 'opponent')
+    assert job['color'] == 'W' and len(se.game_features(job)) == 1
+
+
+class SyncPool:
+    """同步執行的 ProcessPoolExecutor 替身，讓 main 的編碼在測試 process 內跑。"""
+
+    def __init__(self, *args):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def submit(self, fn, arg):
+        result = fn(arg)
+        return type('Done', (), {'result': lambda self: result})()
+
+
+@pytest.mark.parametrize('side, want', [('target', ['B']), ('opponent', ['W'])])
+def test_main_passes_side_color_to_encoder(tmp_path, monkeypatch, side, want):
+    pd.DataFrame({'game_id': ['g_1'], 'rank': ['D'], 'player_id': ['p'], 'color': ['B'],
+                  'sgf_content': ['(;GM[1]SZ[19]HD[0];B[dd];W[pp];B[dp])']}).to_csv(tmp_path / 'train_D.csv', index=False)
+    keys = write_keys(tmp_path / 'k.jsonl', [{'key': 'D_g_1', 'hd': 0}])
+    seen = []
+    real = se.game_features
+    monkeypatch.setattr(se, 'game_features', lambda job: seen.append(job['color']) or real(job))
+    monkeypatch.setattr(se, 'ProcessPoolExecutor', SyncPool)
+    monkeypatch.setattr(se, 'ensure_models', lambda d: {})
+    monkeypatch.setattr(se, 'Estimator', lambda *a: FakeEstimator())
+    out = tmp_path / 'o.jsonl'
+    monkeypatch.setattr('sys.argv', ['strength_se', '--keys-from', keys, '--csv', str(tmp_path / 'train_*.csv'),
+                                     '--out', str(out), '--side', side, '--symmetries', '2', '--device', 'cpu'])
+    se.main()
+    row = json.loads(out.read_text(encoding='utf-8'))
+    assert seen == want and row['side'] == side and row['color'] == 'B'
+    assert row['n'] == (2 if side == 'target' else 1)
+
+
+def test_done_keys_treats_rows_without_side_as_target(tmp_path):
+    out = tmp_path / 'o.jsonl'
+    old = {k: v for k, v in CONFIG.items() if k != 'side'}
+    write_keys(out, [{'key': 'a', **old}])
+    assert se.done_keys(str(out), CONFIG) == {'a'}
+    with pytest.raises(SystemExit, match='side'):
+        se.done_keys(str(out), se.run_config(8, 'float32', 'opponent'))
+
+
 def test_done_keys_drops_partial_last_line(tmp_path):
     out = tmp_path / 'o.jsonl'
     write_keys(out, [{'key': 'a', **CONFIG}])
