@@ -284,8 +284,74 @@ def test_main_combos_end_to_end(tmp_path, monkeypatch, capsys):
     assert '+0.0000' in rows[0]  # 基準減自己
 
 
-@pytest.mark.parametrize('extra', [['--se', 's.jsonl'], ['--se-opp', 'o.jsonl'], ['--prior', 'balanced']])
+@pytest.mark.parametrize('extra', [['--se', 's.jsonl'], ['--se-opp', 'o.jsonl'], ['--hsl-opp', 'h.jsonl'],
+                                   ['--prior', 'balanced']])
 def test_main_rejects_combo_only_options_without_combos(monkeypatch, extra):
     monkeypatch.setattr(sys, 'argv', ['stack_humansl', 'unused.jsonl', '--cnn-probs', 'v.npz'] + extra)
     with pytest.raises(SystemExit):
         sh.main()
+
+
+P3 = ['rank_11k', 'rank_1d', 'rank_6d']
+
+
+def write_hsl(path, keys, rank_idx, side=None, seed=0, players=None):
+    """analyze_humansl --no-eval 格式的 jsonl，每局 3 個 profile、4 手；side 為 None 時不寫 side 欄位。"""
+    rng = np.random.default_rng(seed)
+    players = ['p'] * len(keys) if players is None else players
+    rows = []
+    for k, y, p in zip(keys, rank_idx, players):
+        r = {'key': str(k), 'rank_idx': int(y), 'player_id': str(p), 'hd': 0, 'color': 'B',
+             'turns': [0, 2, 4, 6], 'eval_visits': 0, 'profiles': P3,
+             'probs': rng.uniform(0.01, 0.9, (3, 4)).round(4).tolist()}
+        if side:
+            r['side'] = side
+        rows.append(r)
+    path.write_text(''.join(json.dumps(r) + '\n' for r in rows), encoding='utf-8')
+
+
+def test_load_hsl_opp_aligns_by_key(tmp_path):
+    keys, rank = np.array(['a', 'b', 'c']), np.array([0, 5, 9])
+    write_hsl(tmp_path / 't.jsonl', keys, rank)
+    write_hsl(tmp_path / 'o.jsonl', keys[::-1], rank[::-1], side='opponent')
+    data = sh.load_games(str(tmp_path / 't.jsonl'))
+    opp = sh.load_games(str(tmp_path / 'o.jsonl'))
+    x = sh.load_hsl_opp(str(tmp_path / 'o.jsonl'), data)
+    assert x.shape == (3, len(sh.hsl_columns(data)))
+    assert np.allclose(x, opp['x'][::-1][:, sh.hsl_columns(opp)])
+
+
+@pytest.mark.parametrize('side, keys, rank, match', [
+    (None, ['a', 'b'], [0, 5], 'side'),
+    ('target', ['a', 'b'], [0, 5], 'side'),
+    ('opponent', ['a'], [0], '缺少'),
+    ('opponent', ['a', 'b'], [0, 6], '等級'),
+])
+def test_load_hsl_opp_rejects_bad_file(tmp_path, side, keys, rank, match):
+    write_hsl(tmp_path / 't.jsonl', ['a', 'b'], [0, 5])
+    write_hsl(tmp_path / 'o.jsonl', keys, rank, side=side)
+    with pytest.raises(ValueError, match=match):
+        sh.load_hsl_opp(str(tmp_path / 'o.jsonl'), sh.load_games(str(tmp_path / 't.jsonl')))
+
+
+def test_load_hsl_opp_rejects_different_profiles(tmp_path):
+    write_hsl(tmp_path / 't.jsonl', ['a'], [0])
+    write_hsl(tmp_path / 'o.jsonl', ['a'], [0], side='opponent')
+    rows = [json.loads(line) for line in (tmp_path / 'o.jsonl').read_text(encoding='utf-8').splitlines()]
+    rows[0]['profiles'] = ['rank_11k', 'rank_1d', 'rank_9d']
+    (tmp_path / 'o.jsonl').write_text(json.dumps(rows[0]) + '\n', encoding='utf-8')
+    with pytest.raises(ValueError, match='profiles'):
+        sh.load_hsl_opp(str(tmp_path / 'o.jsonl'), sh.load_games(str(tmp_path / 't.jsonl')))
+
+
+def test_main_combos_with_hsl_opp(tmp_path, monkeypatch, capsys):
+    data, probs = toy_data()
+    write_hsl(tmp_path / 't.jsonl', data['key'], data['rank_idx'], players=data['player_id'])
+    write_hsl(tmp_path / 'o.jsonl', data['key'], data['rank_idx'], side='opponent', seed=1, players=data['player_id'])
+    write_npz(tmp_path / 'v.npz', data['key'], probs, data['rank_idx'])
+    monkeypatch.setattr(sys, 'argv', ['stack_humansl', str(tmp_path / 't.jsonl'),
+                                      '--cnn-probs', str(tmp_path / 'v.npz'), '--hsl-opp', str(tmp_path / 'o.jsonl'), '--combos', 'cnn+hsl,cnn+hsl+hslo',
+                                      '--train-repeats', '2', '--test-repeats', '2', '--inner-folds', '3'])
+    sh.main()
+    rows = [line for line in capsys.readouterr().out.splitlines() if line.startswith('| cnn')]
+    assert len(rows) == 2 and rows[1].startswith('| cnn+hsl+hslo |')

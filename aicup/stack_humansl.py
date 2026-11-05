@@ -11,13 +11,15 @@ CNN 單獨、Human SL 單獨、stacking 在同一批題目上比較，差用以�
     sl      SL 11 級平均機率的 log（--se 給定時才有）
     hd      讓子或讓先局的方向：目標玩家執黑（被讓、對手較強）為 +1，執白為 -1，HD 0 為 0（--se 給定時才有）
     se1o、se4o、se8o、slo  同上，評的是對手的手（--se-opp 給定時才有）
+    hslo    Human SL 特徵組 A，評的是對手的手（--hsl-opp 給定時才有）
 --prior 決定是否去掉訓練題的等級先驗：keep 不處理，balanced 用 class_weight，divide 把機率除以訓練題的等級比例。
 --combos 時分數同時印出不加權與每級等權兩種，每級等權是先算各等級玩家的平均，再對等級平均。
---se、--se-opp、--prior 只用於 --combos。
+--se、--se-opp、--hsl-opp、--prior 只用於 --combos。
 
 用法（在 repo 根目錄）：
     python -m aicup.stack_humansl humansl-analysis/val648-p3.jsonl --cnn-probs rank-trained-models/<commit hash>/val_probs.npz
     python -m aicup.stack_humansl humansl-analysis/val648-p3.jsonl --cnn-probs ... --se se-models/val648-se.jsonl --combos cnn+hsl,cnn+hsl+se8
+    python -m aicup.stack_humansl humansl-analysis/val648-p3.jsonl --cnn-probs ... --se se-models/val648-se.jsonl --hsl-opp humansl-analysis/val648-p3-opp.jsonl --combos cnn+hsl+hd,cnn+hsl+hd+hslo
 """
 import argparse
 import json
@@ -92,6 +94,30 @@ def load_se_blocks(path, keys, rank_idx, side='target'):
     if side == 'target':
         blocks['hd'] = np.array([[hd_direction(r['hd'], r['color'])] for r in picked])
     return blocks
+
+
+def load_hsl_opp(path, data):
+    """analyze_humansl --side opponent 的 jsonl 依 data['key'] 對齊，回傳特徵組 A 的欄位 (len(keys), D)。
+
+    profiles 與是否有損失欄位要和 data 相同。有 key 不在檔案內、等級不一致或 side 不是 opponent 時丟 ValueError。
+    """
+    opp = load_games(path)
+    if (opp['profiles'], opp['has_loss']) != (data['profiles'], data['has_loss']):
+        raise ValueError('%s 的 profiles 或損失欄位和目標玩家的 jsonl 不同' % path)
+    with open(path, encoding='utf-8') as f:
+        sides = [json.loads(line).get('side', 'target') for line in f if line.strip()]
+    bad = [k for k, s in zip(opp['key'], sides) if s != 'opponent']
+    if bad:
+        raise ValueError('%s 的 side 不是 opponent，例如 %s' % (path, bad[0]))
+    row_of = {k: i for i, k in enumerate(opp['key'])}
+    missing = [k for k in data['key'] if k not in row_of]
+    if missing:
+        raise ValueError('%s 缺少 %d 局，例如 %s' % (path, len(missing), ', '.join(missing[:3])))
+    rows = np.array([row_of[k] for k in data['key']])
+    wrong = opp['rank_idx'][rows] != data['rank_idx']
+    if wrong.any():
+        raise ValueError('%s 的等級和目標玩家的 jsonl 不一致，例如 %s' % (path, data['key'][wrong][0]))
+    return opp['x'][rows][:, hsl_columns(opp)]
 
 
 def hd_direction(hd, color):
@@ -224,6 +250,8 @@ def run_combos(args, data, cnn, splits, labels, players):
         blocks.update(load_se_blocks(args.se, data['key'], data['rank_idx']))
     if args.se_opp:
         blocks.update(load_se_blocks(args.se_opp, data['key'], data['rank_idx'], side='opponent'))
+    if args.hsl_opp:
+        blocks['hslo'] = load_hsl_opp(args.hsl_opp, data)
     combos = [c.strip() for c in args.combos.split(',') if c.strip()]
     parsed = {c: parse_combo(c, set(blocks) | {'cnn'}) for c in combos}
     keys = sorted(set(players))
@@ -266,11 +294,12 @@ def main():
     ap.add_argument('--seed', type=int, default=42, help='切折、出題與 bootstrap 的 seed')
     ap.add_argument('--se', help='strength_se 的 jsonl，提供 se1、se4、se8、sl、hd 特徵塊')
     ap.add_argument('--se-opp', help='strength_se --side opponent 的 jsonl，提供 se1o、se4o、se8o、slo 特徵塊')
+    ap.add_argument('--hsl-opp', help='analyze_humansl --side opponent 的 jsonl，提供 hslo 特徵塊')
     ap.add_argument('--combos', help='逗號分隔的組合，例如 cnn+hsl,cnn+hsl+se8；第一個是配對差的基準')
     ap.add_argument('--prior', default='keep', choices=PRIORS, help='只用於 --combos')
     args = ap.parse_args()
-    if not args.combos and (args.se or args.se_opp or args.prior != 'keep'):
-        ap.error('--se、--se-opp、--prior 只用於 --combos')
+    if not args.combos and (args.se or args.se_opp or args.hsl_opp or args.prior != 'keep'):
+        ap.error('--se、--se-opp、--hsl-opp、--prior 只用於 --combos')
 
     data = load_games(args.jsonl)
     cnn = load_cnn_probs(args.cnn_probs, data['key'], data['rank_idx'])
