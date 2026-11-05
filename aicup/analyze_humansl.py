@@ -4,11 +4,14 @@
 記錄實際落子在 humanPolicy 中的機率。每局另送一個不帶 profile 的 query，評估目標玩家落子前後的局面，
 記錄每手的目數損失與勝率損失，--no-eval 時不送。結果追加寫入 jsonl，每局一行，重跑會跳過已完成的局。
 
+--side opponent 時改評目標玩家的對手那一方的手，turns、probs 與損失都屬於對手，color 欄位仍是目標玩家的顏色。
+
 --test-dir 時改讀競賽二的測試題，每題拆成單局，player_id 記為 question_id，rank_idx 記為 -1。
 
 用法（Colab，KataGo 執行檔在 --katago-dir，模型在 --model-dir）：
     !python -m aicup.analyze_humansl --players-per-rank 1 --games-per-player 10 --out humansl-analysis/pilot.jsonl
     !python -m aicup.analyze_humansl --test-dir /content/tests --profiles rank_11k rank_1d rank_6d --no-eval --out humansl-analysis/test-p3.jsonl
+    !python -m aicup.analyze_humansl --players-file /content/val-players.csv --profiles rank_11k rank_1d rank_6d --no-eval --side opponent --out humansl-analysis/val648-p3-opp.jsonl
 """
 import argparse
 import glob
@@ -30,6 +33,7 @@ PROFILES = ['rank_11k', 'rank_8k', 'rank_5k', 'rank_2k',
 BOARD = 19
 GTP_COLS = 'ABCDEFGHJKLMNOPQRST'  # GTP 座標沒有 I
 PASS_INDEX = BOARD * BOARD
+SIDES = ('target', 'opponent')
 # 讓子數對應的標準星位，SGF 座標
 HANDICAP_STONES = {2: 'pd dp', 3: 'pd dp dd', 4: 'pd dp dd pp', 5: 'pd dp dd pp jj',
                    6: 'pd dp dd pp dj pj', 7: 'pd dp dd pp dj pj jj',
@@ -90,8 +94,13 @@ def parse_game(sgf_content, default_komi=6.5):
     return {'moves': moves, 'initial_stones': stones, 'komi': komi, 'hd': hd}
 
 
+def side_color(color, side):
+    """要評的那一方的顏色：target 是目標玩家，opponent 是對手。"""
+    return color if side == 'target' else {'B': 'W', 'W': 'B'}[color]
+
+
 def target_turns(moves, color, max_turns=0):
-    """目標玩家落子前的回合：turn t 是 moves[:t] 下完後的局面。"""
+    """color 方落子前的回合：turn t 是 moves[:t] 下完後的局面。"""
     turns = [t for t, (c, _) in enumerate(moves) if c == color]
     return turns[:max_turns] if max_turns else turns
 
@@ -191,14 +200,15 @@ class Engine:
         self.proc.terminate()
 
 
-def analyze_group(engine, games, rules, max_turns, eval_visits=1, profiles=PROFILES):
+def analyze_group(engine, games, rules, max_turns, eval_visits=1, profiles=PROFILES, side='target'):
     """同時送出一組局的所有 query，回傳可寫入 jsonl 的 dict 清單，失敗的局略過。
 
     probs 的列順序和 profiles 相同。eval_visits 為 0 時不送損失 query，輸出沒有損失欄位。
+    side 決定評哪一方的手，見 side_color；輸出的 color 一律是目標玩家的顏色。
     """
     queries, meta = [], {}
     for g in games:
-        turns = target_turns(g['parsed']['moves'], g['color'], max_turns)
+        turns = target_turns(g['parsed']['moves'], side_color(g['color'], side), max_turns)
         if not turns:
             continue
         meta[g['key']] = (g, turns)
@@ -218,12 +228,12 @@ def analyze_group(engine, games, rules, max_turns, eval_visits=1, profiles=PROFI
         probs[probs < 0] = np.nan  # -1 代表該點在這組規則下不合法
         row = {'key': key, 'rank_idx': g['rank_idx'], 'player_id': g['player_id'],
                'hd': g['parsed']['hd'],
-               'color': g['color'],
+               'color': g['color'], 'side': side,
                'turns': turns, 'eval_visits': eval_visits, 'profiles': list(profiles),
                'probs': np.round(probs, 6).tolist()}
         if eval_visits:
             score_loss, winrate_loss = move_losses({t: r['rootInfo'] for t, r in evals.items()},
-                                                   turns, g['color'])
+                                                   turns, side_color(g['color'], side))
             row['score_loss'] = np.round(score_loss, 3).tolist()
             row['winrate_loss'] = np.round(winrate_loss, 5).tolist()
         rows.append(row)
@@ -313,10 +323,10 @@ def load_test_games(test_dir, limit=0):
     return out[:limit] if limit else out
 
 
-def done_keys(path, eval_visits, profiles=PROFILES):
-    """已完成的 key。檔案裡的 eval_visits 或 profiles 和這次不同時拒絕接續，避免同一檔混用兩種設定。
+def done_keys(path, eval_visits, profiles=PROFILES, side='target'):
+    """已完成的 key。檔案裡的 eval_visits、profiles 或 side 和這次不同時拒絕接續，避免同一檔混用兩種設定。
 
-    沒有 eval_visits 欄位的列視為不同，沒有 profiles 欄位的列視為全部 PROFILES。
+    沒有 eval_visits 欄位的列視為不同，沒有 profiles 欄位的列視為全部 PROFILES，沒有 side 欄位的列視為 target。
     """
     if not os.path.exists(path):
         return set()
@@ -326,6 +336,8 @@ def done_keys(path, eval_visits, profiles=PROFILES):
         raise SystemExit('%s 的 eval_visits 不是 %d，請換一個 --out' % (path, eval_visits))
     if any(r.get('profiles', PROFILES) != list(profiles) for r in rows):
         raise SystemExit('%s 的 profiles 不是 %s，請換一個 --out' % (path, ' '.join(profiles)))
+    if any(r.get('side', 'target') != side for r in rows):
+        raise SystemExit('%s 的 side 不是 %s，請換一個 --out' % (path, side))
     return {r['key'] for r in rows}
 
 
@@ -356,6 +368,7 @@ def main():
     ap.add_argument('--eval-visits', type=int, default=1, help='算每手損失的 query 用的 maxVisits')
     ap.add_argument('--no-eval', action='store_true', help='不送算損失的 query，eval_visits 記為 0')
     ap.add_argument('--profiles', nargs='+', default=PROFILES, help='要送 query 的 profile，預設全部')
+    ap.add_argument('--side', default='target', choices=SIDES, help='評目標玩家或對手的手')
     ap.add_argument('--group', type=int, default=8, help='同時送出幾局')
     # 1 visit 用不到搜尋執行緒，改用多個 query 並行填滿 GPU 批次
     ap.add_argument('--override-config', default='numAnalysisThreads=32,numSearchThreadsPerAnalysisThread=1',
@@ -365,7 +378,7 @@ def main():
     eval_visits = 0 if args.no_eval else args.eval_visits
 
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
-    done = done_keys(args.out, eval_visits, args.profiles)
+    done = done_keys(args.out, eval_visits, args.profiles, args.side)
     todo, bad = [], 0
     if args.test_dir:
         if args.per_rank or args.players_per_rank or args.players_file:
@@ -394,7 +407,7 @@ def main():
         with open(args.out, 'a', encoding='utf-8') as f:
             for i in range(0, len(todo), args.group):
                 rows = analyze_group(engine, todo[i:i + args.group], args.rules, args.max_turns,
-                                     eval_visits, args.profiles)
+                                     eval_visits, args.profiles, args.side)
                 for r in rows:
                     f.write(json.dumps(r) + '\n')
                 f.flush()

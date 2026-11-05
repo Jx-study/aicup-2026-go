@@ -437,3 +437,39 @@ def test_load_test_games_keys_colors_and_order(tmp_path):
 def test_test_game_keys_count_within_question():
     games = [(0, 's', 'B'), (1, 's', 'B'), (0, 's', 'B')]
     assert ah.test_game_keys(['a', 'b'], games) == ['a_g01', 'b_g01', 'a_g02']
+
+
+def test_side_color():
+    assert ah.side_color('B', 'target') == 'B' and ah.side_color('B', 'opponent') == 'W'
+    assert ah.side_color('W', 'opponent') == 'B'
+
+
+def test_analyze_group_opponent_side_scores_other_color():
+    # 目標執黑，對手是白方的第 1 手，損失同 test_analyze_group_white_loss_sign
+    g = {'key': 'D_1', 'rank_idx': 0, 'player_id': 'p1', 'color': 'B', 'parsed': THREE_MOVES}
+    engine = FakeEngine(0.25)
+    r = ah.analyze_group(engine, [g], 'chinese', 0, side='opponent')[0]
+    assert r['turns'] == [1] and r['score_loss'] == pytest.approx([3.0])
+    assert r['color'] == 'B' and r['side'] == 'opponent'
+    assert all(q['analyzeTurns'] == [1] for q in engine.queries if 'overrideSettings' in q)
+
+
+def test_analyze_group_records_target_side_by_default():
+    g = {'key': 'D_1', 'rank_idx': 0, 'player_id': 'p1', 'color': 'B', 'parsed': THREE_MOVES}
+    assert ah.analyze_group(FakeEngine(0.25), [g], 'chinese', 0)[0]['side'] == 'target'
+
+
+def test_done_keys_rejects_different_side(tmp_path):
+    p = tmp_path / 'a.jsonl'
+    write_jsonl(p, [{'key': 'D_1', 'eval_visits': 0, 'profiles': P3, 'side': 'opponent'}])
+    assert ah.done_keys(str(p), 0, P3, 'opponent') == {'D_1'}
+    with pytest.raises(SystemExit, match='side'):
+        ah.done_keys(str(p), 0, P3)
+
+
+def test_done_keys_treats_missing_side_as_target(tmp_path):
+    p = tmp_path / 'a.jsonl'
+    write_jsonl(p, [{'key': 'D_1', 'eval_visits': 0, 'profiles': P3}])
+    assert ah.done_keys(str(p), 0, P3) == {'D_1'}
+    with pytest.raises(SystemExit, match='side'):
+        ah.done_keys(str(p), 0, P3, 'opponent')

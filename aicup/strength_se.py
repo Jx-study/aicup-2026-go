@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 
 from aicup import symmetry
-from aicup.analyze_humansl import load_test_games, parse_game
+from aicup.analyze_humansl import SIDES, load_test_games, parse_game, side_color
 from aicup.color import parse_hd
 from aicup.scoring import LEVELS
 
@@ -46,7 +46,6 @@ HISTORY = 8  # 最近 8 個盤面
 PLANES = 2 * HISTORY + 2
 PASS_INDEX = BOARD * BOARD
 SL_RANKS = 11  # 3-5k、1-2k、1d～9d
-SIDES = ('target', 'opponent')
 
 
 def ensure_models(model_dir, url=MODEL_URL):
@@ -202,11 +201,6 @@ def load_keyed_games(keys_path, csv_glob, limit=0):
 def run_config(symmetries, dtype, side='target'):
     """每列都記錄的推論設定，接續時必須相同。"""
     return {'models': MODELS, 'symmetries': symmetries, 'dtype': dtype, 'side': side}
-
-
-def side_color(color, side):
-    """要評的那一方的顏色：target 是目標玩家，opponent 是對手。"""
-    return color if side == 'target' else {'B': 'W', 'W': 'B'}[color]
 
 
 def encode_job(game, side):

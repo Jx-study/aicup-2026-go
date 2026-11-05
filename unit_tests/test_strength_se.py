@@ -228,11 +228,6 @@ def test_done_keys_requires_same_config(tmp_path):
             se.done_keys(str(out), {**CONFIG, k: v})
 
 
-def test_side_color():
-    assert se.side_color('B', 'target') == 'B' and se.side_color('B', 'opponent') == 'W'
-    assert se.side_color('W', 'opponent') == 'B'
-
-
 def test_encode_job_uses_opponent_color():
     g = {'color': 'B', 'parsed': parse_game('(;GM[1]SZ[19];B[dd];W[pp];B[dp])')}
     assert se.encode_job(g, 'target')['color'] == 'B'
