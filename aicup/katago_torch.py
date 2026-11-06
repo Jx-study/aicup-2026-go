@@ -114,6 +114,35 @@ def profile_row(profile, pla='B'):
     return m.get_metadata_row(nextPlayer=pla, boardArea=BOARD * BOARD)
 
 
+def features(kg=None):
+    """KataGo Features，iterLadders 對同一個盤面物件只搜尋一次。
+
+    不給 history 時前一、前二盤面就是當下盤面，fill_row_features 會對同一盤面搜三次征子，
+    第二、三次改成重播第一次的結果，輸出不變。快取只在同一次 fill_row_features 內有效，
+    每次呼叫開頭自動清空，因為盤面物件會原地落子。
+    """
+    kg = kg or katago()
+
+    class CachedLadderFeatures(kg['features'].Features):
+        _ladder_cache = None
+
+        def fill_row_features(self, *args, **kwargs):
+            self._ladder_cache = None
+            return super().fill_row_features(*args, **kwargs)
+
+        def iterLadders(self, board, f):
+            cache = self._ladder_cache
+            # history 為真時前一、前二盤面是不同物件，要各搜一次
+            if cache is None or cache[0] is not board:
+                calls = []
+                super().iterLadders(board, lambda loc, pos, moves: calls.append((loc, pos, list(moves))))
+                cache = self._ladder_cache = (board, calls)
+            for loc, pos, moves in cache[1]:
+                f(loc, pos, moves)
+
+    return CachedLadderFeatures({'version': INPUT_VERSION}, BOARD)
+
+
 def to_loc(board, point):
     """sgfmill 的 (row, col)（row 從下往上）轉成 KataGo Board 的 loc，None 是 pass。"""
     if point is None:
@@ -139,7 +168,7 @@ def encode_game(parsed, turns, history=False):
     """
     kg = katago()
     Board = kg['board'].Board
-    feats = kg['features'].Features({'version': INPUT_VERSION}, BOARD)
+    feats = features(kg)
     color = {'B': Board.BLACK, 'W': Board.WHITE}
     moves = parsed['moves']
     if any(t < 0 or t >= len(moves) for t in turns) or list(turns) != sorted(set(turns)):

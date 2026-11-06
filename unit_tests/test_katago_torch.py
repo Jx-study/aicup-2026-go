@@ -118,6 +118,38 @@ def test_ko_point_illegal():
     assert plane(enc, 0, 6) == {pos('cc')}
 
 
+def random_game(seed, n_moves=150):
+    """隨機合法著手的棋局（parse_game 的格式），盤面夠亂才會出現征子。"""
+    kg = kt.katago()
+    Board = kg['board'].Board
+    board = Board(size=19)
+    rng = np.random.default_rng(seed)
+    moves = []
+    for i in range(n_moves):
+        c = 'B' if i % 2 == 0 else 'W'
+        pla = Board.BLACK if c == 'B' else Board.WHITE
+        legal = np.flatnonzero(kt.legal_mask(board, pla)[:361])
+        pos_ = int(rng.choice(legal))
+        point = (18 - pos_ // 19, pos_ % 19)
+        board.play(pla, kt.to_loc(board, point))
+        moves.append((c, point))
+    return {'moves': moves, 'initial_stones': [], 'komi': 6.5, 'hd': 0}
+
+
+@pytest.mark.parametrize('history', [False, True])
+def test_ladder_cache_matches_plain_features(monkeypatch, history):
+    games = [random_game(s) for s in range(3)]
+    turns = list(range(0, 150, 3))
+    cached = [kt.encode_game(g, turns, history=history) for g in games]
+    kg = kt.katago()
+    monkeypatch.setattr(kt, 'features', lambda kg_=None: kg['features'].Features({'version': kt.INPUT_VERSION}, 19))
+    plain = [kt.encode_game(g, turns, history=history) for g in games]
+    assert sum(int(e['spatial'][:, 14].sum()) for e in plain) > 0  # 確實有征子
+    for a, b in zip(cached, plain):
+        for k in a:
+            np.testing.assert_array_equal(a[k], b[k])
+
+
 def test_move_index_matches_katago():
     kg = kt.katago()
     board = kg['board'].Board(size=19)
