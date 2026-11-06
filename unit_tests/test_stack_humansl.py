@@ -366,3 +366,68 @@ def test_main_combos_with_hsl_opp(tmp_path, monkeypatch, capsys):
     sh.main()
     rows = [line for line in capsys.readouterr().out.splitlines() if line.startswith('| cnn')]
     assert len(rows) == 2 and rows[1].startswith('| cnn+hsl+hslo |')
+
+
+def with_extra_players(data, probs, n_players=10, games=7):
+    """data 後面接上 n_players 位局數較少的玩家，回傳 (合併的 data, 合併的 probs, 原本玩家的 player_keys set)。"""
+    extra, extra_probs = toy_data(n_players=n_players, games=games, seed=5)
+    merged = dict(data)
+    for k, prefix in (('player_id', 'x'), ('key', 'xk')):
+        merged[k] = np.concatenate([data[k], np.array([prefix + v for v in extra[k]])])
+    for k in ('x', 'rank_idx'):
+        merged[k] = np.concatenate([data[k], extra[k]])
+    return merged, np.vstack([probs, extra_probs]), set(sh.player_keys(data))
+
+
+def test_make_eval_splits_without_list_matches_make_splits():
+    data, _ = toy_data()
+    for a, b in zip(make_splits(data, (5, 20), 2, seed=7), sh.make_eval_splits(data, (5, 20), 2, seed=7)):
+        assert np.array_equal(a[0], b[0]) and np.array_equal(a[2], b[2]) and np.array_equal(a[3], b[3])
+        assert all(np.array_equal(p, q) for p, q in zip(a[1], b[1]))
+
+
+def test_make_eval_splits_extra_players_only_train():
+    data, probs = toy_data()
+    merged, _, eval_players = with_extra_players(data, probs)
+    base = make_splits(data, (5, 20), 2, seed=7)
+    out = sh.make_eval_splits(merged, (5, 20), 2, eval_players, seed=7)
+    n = len(data['key'])
+    for (tr_a, q_a, y_a, p_a), (tr_b, q_b, y_b, p_b) in zip(base, out):
+        assert all(np.array_equal(merged['key'][q], data['key'][r]) for q, r in zip(q_b, q_a))  # 測試題相同
+        assert np.array_equal(y_a, y_b) and np.array_equal(p_a, p_b)
+        assert np.array_equal(tr_b[:n], tr_a) and tr_b[n:].all()  # 額外玩家每一折都只當訓練
+
+
+def test_make_eval_splits_with_all_players_matches_make_splits():
+    data, _ = toy_data()
+    full = sh.make_eval_splits(data, (5, 20), 2, set(sh.player_keys(data)), seed=7)
+    for a, b in zip(make_splits(data, (5, 20), 2, seed=7), full):
+        assert np.array_equal(a[0], b[0]) and np.array_equal(a[2], b[2]) and np.array_equal(a[3], b[3])
+        assert all(np.array_equal(p, q) for p, q in zip(a[1], b[1]))
+
+
+def test_make_eval_splits_rejects_unknown_player():
+    data, _ = toy_data()
+    with pytest.raises(ValueError, match='不在資料內'):
+        sh.make_eval_splits(data, (5, 20), 2, {'3|nobody'}, seed=7)
+
+
+def test_load_eval_players(tmp_path):
+    (tmp_path / 'p.csv').write_text('player_id,rank\nabc,1D\n007,D\n', encoding='utf-8')
+    assert sh.load_eval_players(str(tmp_path / 'p.csv')) == {'4|abc', '0|007'}
+
+
+def test_main_eval_players_end_to_end(tmp_path, monkeypatch, capsys):
+    data, probs = toy_data()
+    merged, merged_probs, eval_players = with_extra_players(data, probs)
+    write_hsl(tmp_path / 't.jsonl', merged['key'], merged['rank_idx'], players=merged['player_id'])
+    write_npz(tmp_path / 'v.npz', merged['key'], merged_probs, merged['rank_idx'])
+    with open(tmp_path / 'p.csv', 'w', encoding='utf-8') as f:
+        f.write('player_id,rank\n' + ''.join('%s,%s\n' % (k.split('|')[1], sh.LEVELS[int(k.split('|')[0])])
+                                             for k in sorted(eval_players)))
+    monkeypatch.setattr(sys, 'argv', ['stack_humansl', str(tmp_path / 't.jsonl'), '--cnn-probs', str(tmp_path / 'v.npz'),
+                                      '--eval-players', str(tmp_path / 'p.csv'), '--combos', 'cnn+hsl',
+                                      '--train-repeats', '2', '--test-repeats', '2', '--inner-folds', '3'])
+    sh.main()
+    out = capsys.readouterr().out
+    assert '50 位玩家出測試題，10 位只當訓練' in out
