@@ -12,9 +12,12 @@ CNN 單獨、Human SL 單獨、stacking 在同一批題目上比較，差用以�
     hd      讓子或讓先局的方向：目標玩家執黑（被讓、對手較強）為 +1，執白為 -1，HD 0 為 0（--se 給定時才有）
     se1o、se4o、se8o、slo  同上，評的是對手的手（--se-opp 給定時才有）
     hslo    Human SL 特徵組 A，評的是對手的手（--hsl-opp 給定時才有）
+    pm      逐手模型 10 個等級的平均 log 機率，評的是目標玩家的手（--pm 給定時才有）
+    pmo     同上，評的是對手的手（--pm 的每局都有對手側時才有）
 --prior 決定是否去掉訓練題的等級先驗：keep 不處理，balanced 用 class_weight，divide 把機率除以訓練題的等級比例。
+--cs 是巢狀交叉驗證的候選 C，不給時用 fit_humansl.CS。
 --combos 時分數同時印出不加權與每級等權兩種，每級等權是先算各等級玩家的平均，再對等級平均。
---se、--se-opp、--hsl-opp、--prior 只用於 --combos。
+--se、--se-opp、--hsl-opp、--pm、--prior、--cs 只用於 --combos。
 
 用法（在 repo 根目錄）：
     python -m aicup.stack_humansl humansl-analysis/val648-p3.jsonl --cnn-probs rank-trained-models/<commit hash>/val_probs.npz
@@ -123,6 +126,40 @@ def load_hsl_opp(path, data, allow_missing=False):
     x = np.full((len(has), len(cols)), np.nan)
     x[has] = opp['x'][rows][:, cols]
     return x
+
+
+def load_pm_blocks(path, keys, rank_idx):
+    """infer_permove 的 jsonl 依 keys 對齊，回傳 {'pm': (len(keys), 10)}，每局都有 pmo 時另有 'pmo'。
+
+    有 key 不在檔案內、等級不一致、有局沒有目標側的手，或只有部分局有對手側的手時丟 ValueError。
+    """
+    with open(path, encoding='utf-8') as f:
+        rows = {r['key']: r for r in map(json.loads, (line for line in f if line.strip()))}
+    missing = [k for k in keys if k not in rows]
+    if missing:
+        raise ValueError('%s 缺少 %d 局，例如 %s' % (path, len(missing), ', '.join(missing[:3])))
+    picked = [rows[k] for k in keys]
+    bad = [r['key'] for r, y in zip(picked, rank_idx) if r['rank_idx'] != y]
+    if bad:
+        raise ValueError('%s 的等級和 jsonl 不一致，例如 %s' % (path, bad[0]))
+    bad = [r['key'] for r in picked if r['pm'] is None]
+    if bad:
+        raise ValueError('%s 有 %d 局沒有目標側的手，例如 %s' % (path, len(bad), bad[0]))
+    blocks = {'pm': np.array([r['pm'] for r in picked], np.float64)}
+    bad = [r['key'] for r in picked if r.get('pmo') is None]
+    if bad and len(bad) < len(picked):
+        raise ValueError('%s 有 %d 局沒有對手側的手，例如 %s' % (path, len(bad), bad[0]))
+    if not bad:
+        blocks['pmo'] = np.array([r['pmo'] for r in picked], np.float64)
+    return blocks
+
+
+def parse_cs(text):
+    """'0.001,0.01' 轉成正則化強度的 tuple，順序照輸入（同分時 select_c 取較前者）。"""
+    cs = tuple(float(v) for v in text.split(',') if v.strip())
+    if not cs or any(c <= 0 for c in cs):
+        raise argparse.ArgumentTypeError('--cs 要是逗號分隔的正數')
+    return cs
 
 
 def hd_direction(hd, color):
@@ -257,6 +294,8 @@ def run_combos(args, data, cnn, splits, labels, players):
         blocks.update(load_se_blocks(args.se_opp, data['key'], data['rank_idx'], side='opponent'))
     if args.hsl_opp:
         blocks['hslo'] = load_hsl_opp(args.hsl_opp, data)
+    if args.pm:
+        blocks.update(load_pm_blocks(args.pm, data['key'], data['rank_idx']))
     combos = [c.strip() for c in args.combos.split(',') if c.strip()]
     parsed = {c: parse_combo(c, set(blocks) | {'cnn'}) for c in combos}
     keys = sorted(set(players))
@@ -268,7 +307,7 @@ def run_combos(args, data, cnn, splits, labels, players):
         probs, fold_c = [], []
         for f, (train, q, _, _) in enumerate(splits):
             p, c_best = predict_inputs(x, cnn_c, data, train, q, train_rng(args.seed, f), args.sizes,
-                                       args.train_repeats, args.cnn_temp, inner_folds=args.inner_folds,
+                                       args.train_repeats, args.cnn_temp, cs=args.cs, inner_folds=args.inner_folds,
                                        prior=args.prior)
             probs.append(p)
             fold_c.append(c_best)
@@ -300,11 +339,15 @@ def main():
     ap.add_argument('--se', help='strength_se 的 jsonl，提供 se1、se4、se8、sl、hd 特徵塊')
     ap.add_argument('--se-opp', help='strength_se --side opponent 的 jsonl，提供 se1o、se4o、se8o、slo 特徵塊')
     ap.add_argument('--hsl-opp', help='analyze_humansl --side opponent 的 jsonl，提供 hslo 特徵塊')
+    ap.add_argument('--pm', help='infer_permove 的 jsonl，提供 pm 特徵塊，每局都有對手側時另有 pmo')
     ap.add_argument('--combos', help='逗號分隔的組合，例如 cnn+hsl,cnn+hsl+se8；第一個是配對差的基準')
     ap.add_argument('--prior', default='keep', choices=PRIORS, help='只用於 --combos')
+    ap.add_argument('--cs', type=parse_cs, default=CS,
+                    help='逗號分隔的候選 C，只用於 --combos，預設 %s' % ','.join('%g' % c for c in CS))
     args = ap.parse_args()
-    if not args.combos and (args.se or args.se_opp or args.hsl_opp or args.prior != 'keep'):
-        ap.error('--se、--se-opp、--hsl-opp、--prior 只用於 --combos')
+    if not args.combos and (args.se or args.se_opp or args.hsl_opp or args.pm or args.prior != 'keep'
+                            or args.cs != CS):
+        ap.error('--se、--se-opp、--hsl-opp、--pm、--prior、--cs 只用於 --combos')
 
     data = load_games(args.jsonl)
     cnn = load_cnn_probs(args.cnn_probs, data['key'], data['rank_idx'])
