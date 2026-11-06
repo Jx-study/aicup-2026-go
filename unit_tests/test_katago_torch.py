@@ -195,3 +195,15 @@ def test_move_log_probs_model():
     # 對稱下結果接近原方向
     logp_sym = kt.move_log_probs(model, enc, 'rank_1d', sym=5)
     assert np.abs(logp_sym - logp).max() < 0.5
+
+
+def test_ensure_humanv0_rejects_wrong_file(tmp_path):
+    p = tmp_path / 'bad.ckpt'
+    p.write_bytes(b'x' * 10)
+    with pytest.raises(ValueError):
+        kt.ensure_humanv0(str(p))
+
+
+@pytest.mark.skipif(not os.path.exists(kt.CHECKPOINT), reason='沒有 humanv0 checkpoint')
+def test_ensure_humanv0_accepts_local_checkpoint():
+    assert kt.ensure_humanv0() == kt.CHECKPOINT

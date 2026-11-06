@@ -60,6 +60,9 @@ from aicup.analyze_humansl import BOARD, PASS_INDEX, parse_game, policy_index, t
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_KATAGO_PYTHON = os.path.join(_ROOT, 'Note', 'katago', 'src', 'python')
 CHECKPOINT = os.path.join(_ROOT, 'Note', 'katago', 'models', 'b18c384nbt-humanv0.ckpt')
+CHECKPOINT_URL = 'https://media.katagotraining.org/uploaded/networks/models_extra/b18c384nbt-humanv0.ckpt'
+CHECKPOINT_BYTES = 323_752_318
+CHECKPOINT_SHA256 = '84b23476b56a73a775a0f09bad7d1c5c435690adb343aa851e80bf198c0c8b27'
 INPUT_VERSION = 14  # humanv0 的 config version，決定 Features 的編碼版本
 N_SPATIAL = 22
 N_GLOBAL = 19
@@ -241,6 +244,28 @@ def policy_symmetry(policy, k, inverse=False):
     if isinstance(policy, torch.Tensor):
         return torch.cat([flat, policy[..., PASS_INDEX:]], dim=-1)
     return np.concatenate([flat, policy[..., PASS_INDEX:]], axis=-1)
+
+
+def ensure_humanv0(path=CHECKPOINT, url=CHECKPOINT_URL):
+    """path 不存在時從 url 下載，確認大小與 SHA-256 後回傳 path；已存在但不符時丟 ValueError。"""
+    import hashlib
+    import urllib.request
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        tmp = path + '.part'
+        print('下載 %s' % url, flush=True)
+        urllib.request.urlretrieve(url, tmp)
+        os.replace(tmp, path)
+    size = os.path.getsize(path)
+    if size != CHECKPOINT_BYTES:
+        raise ValueError('%s 的大小是 %d，預期 %d' % (path, size, CHECKPOINT_BYTES))
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    if h.hexdigest() != CHECKPOINT_SHA256:
+        raise ValueError('%s 的 SHA-256 不符' % path)
+    return path
 
 
 def load_humanv0(path=CHECKPOINT, device='cpu', use_swa=True):
