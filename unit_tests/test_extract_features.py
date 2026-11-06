@@ -39,6 +39,19 @@ def test_split_by_player_size_with_uneven_players():
     assert 2000 <= len(val) < 2000 + 181  # 最多多出一位玩家的局數
 
 
+def test_split_by_player_larger_val_is_superset():
+    # 玩家順序與 val_size 無關，較大的 val 只會在後面多加玩家
+    rows = [{'player_id': 'p%d' % p, 'game_id': 'g_%d_%d' % (p, g),
+             'rank': ('D', '3D')[p % 2], 'color': 'B', 'sgf_content': ''}
+            for p in range(300) for g in range(1 + p % 11 * 4)]
+    df = pd.DataFrame(rows).sample(frac=1.0, random_state=0).reset_index(drop=True)
+    key = lambda d: set(d['rank'] + '/' + d['player_id'])
+    sizes = (500, 1500, 3000, 5000)
+    vals = [key(split_by_player(df, n)[0]) for n in sizes]
+    for small, large in zip(vals, vals[1:]):
+        assert small < large
+
+
 def test_split_by_player_whole_players():
     df = _fake_df()
     val, _ = split_by_player(df, 300)

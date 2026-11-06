@@ -7,6 +7,7 @@
     python -m aicup.extract_features                 # 全量，以玩家切分
     python -m aicup.extract_features --frac 0.1      # 先抽 10% 測速度
     python -m aicup.extract_features --val-by game   # 逐局切分，與教學 baseline 一致
+    python -m aicup.extract_features --val-size 180000 --out rank-features-v180000   # 擴大依玩家切分的 val
 
 中斷後重跑同一個指令會跳過已完成的分片。換參數前要先刪除輸出目錄。
 """
@@ -139,15 +140,19 @@ def main():
     ap.add_argument('--per-shard', type=int, default=5000)
     ap.add_argument('--frac', type=float, default=1.0, help='只取打亂後的前一部分，用來測速度')
     ap.add_argument('--val-by', choices=('game', 'player'), default='player')
+    ap.add_argument('--val-size', type=int, default=VAL_SIZE,
+                    help='val 的局數，預設 %d；以玩家切分時較大的 val 包含較小 val 的全部玩家' % VAL_SIZE)
     args = ap.parse_args()
+    if args.val_size <= 0:
+        ap.error('--val-size 要是正整數')
 
     config = {'format': FORMAT, 'frac': args.frac, 'val_by': args.val_by, 'nproc': args.nproc,
-              'per_shard': args.per_shard, 'seed': SEED, 'val_size': VAL_SIZE}
+              'per_shard': args.per_shard, 'seed': SEED, 'val_size': args.val_size}
     check_config(args.out, config)
 
     df = load_dataframe(args.train_dir)
     df = df.iloc[:int(len(df) * args.frac)]
-    val_size = int(VAL_SIZE * args.frac)
+    val_size = int(args.val_size * args.frac)
     split = split_by_player if args.val_by == 'player' else split_by_game
     df_val, df_train = split(df, val_size)
     print('共 %d 局：train %d / val %d，%d 個進程'
