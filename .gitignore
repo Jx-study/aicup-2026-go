@@ -7,6 +7,7 @@ dataset/
 # 特徵與權重：體積龐大，由上述資料重新產生
 rank-features/
 rank-features-*/
+permove-features/
 player-features/
 rank-trained-models/
 player-trained-models/
