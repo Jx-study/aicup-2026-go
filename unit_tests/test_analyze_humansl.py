@@ -473,3 +473,65 @@ def test_done_keys_treats_missing_side_as_target(tmp_path):
     assert ah.done_keys(str(p), 0, P3) == {'D_1'}
     with pytest.raises(SystemExit, match='side'):
         ah.done_keys(str(p), 0, P3, 'opponent')
+
+
+def test_build_query_pre_root_history_only_when_enabled():
+    g = ah.parse_game('(;GM[1]SZ[19]KM[7.5];B[dd];W[pp])')
+    base = ah.build_query('k|0', g, [0], 'rank_5k', 'chinese')
+    assert base['overrideSettings'] == {'humanSLProfile': 'rank_5k'}
+    assert base == ah.build_query('k|0', g, [0], 'rank_5k', 'chinese', pre_root_history=False)
+    q = ah.build_query('k|0', g, [0], 'rank_5k', 'chinese', pre_root_history=True)
+    assert q['overrideSettings'] == {'humanSLProfile': 'rank_5k', 'ignorePreRootHistory': False}
+
+
+def test_analyze_group_pre_root_history_marks_rows_and_profile_queries():
+    g = {'key': 'D_1', 'rank_idx': 0, 'player_id': 'p1', 'color': 'B', 'parsed': THREE_MOVES}
+    assert 'pre_root_history' not in ah.analyze_group(FakeEngine(0.25), [g], 'chinese', 0)[0]
+    engine = FakeEngine(0.25)
+    r = ah.analyze_group(engine, [g], 'chinese', 0, profiles=P3, pre_root_history=True)[0]
+    assert r['pre_root_history'] is True
+    prof = [q for q in engine.queries if 'overrideSettings' in q]
+    assert len(prof) == 3
+    assert all(q['overrideSettings']['ignorePreRootHistory'] is False for q in prof)
+    assert all('overrideSettings' not in q for q in engine.queries if q['id'].endswith('|eval'))
+
+
+def test_done_keys_rejects_different_pre_root_history(tmp_path):
+    p = tmp_path / 'a.jsonl'
+    write_jsonl(p, [{'key': 'D_1', 'eval_visits': 0, 'profiles': P3}])
+    with pytest.raises(SystemExit, match='pre_root_history'):
+        ah.done_keys(str(p), 0, P3, pre_root_history=True)
+    write_jsonl(p, [{'key': 'D_1', 'eval_visits': 0, 'profiles': P3, 'pre_root_history': True}])
+    assert ah.done_keys(str(p), 0, P3, pre_root_history=True) == {'D_1'}
+    with pytest.raises(SystemExit, match='pre_root_history'):
+        ah.done_keys(str(p), 0, P3)
+
+
+def test_policy_stats_rank_pmax_entropy():
+    hp = [0.0] * 362
+    hp[0], hp[1], hp[2], hp[3] = 0.5, 0.25, 0.25, -1.0  # 最後一點不合法
+    assert ah.policy_stats(hp, 0)[:2] == (0.0, 0.5)
+    rank, pmax, ent = ah.policy_stats(hp, 1)
+    assert rank == 1.0 and pmax == 0.5
+    assert ent == pytest.approx(-(0.5 * np.log(0.5) + 2 * 0.25 * np.log(0.25)))
+    assert ah.policy_stats(hp, 4)[0] == 3.0  # 機率 0 的合法點，前面有 3 個更大
+    assert all(np.isnan(ah.policy_stats(hp, 3)))
+
+
+def test_analyze_group_move_stats_columns_and_default_absent():
+    g = {'key': 'D_1', 'rank_idx': 0, 'player_id': 'p1', 'color': 'B', 'parsed': THREE_MOVES}
+    assert not {'move_rank', 'pmax', 'entropy'} & set(ah.analyze_group(FakeEngine(0.25), [g], 'chinese', 0)[0])
+    r = ah.analyze_group(FakeEngine(0.25), [g], 'chinese', 0, profiles=P3, move_stats=True)[0]
+    for name in ('move_rank', 'pmax', 'entropy'):
+        assert np.array(r[name]).shape == np.array(r['probs']).shape == (3, 2)
+    # FakeEngine 的 policy 只有 A19 為 0.25；第一手落在 A19，第二手落在機率 0 的合法點
+    assert np.allclose(r['move_rank'], [[0, 1]] * 3) and np.allclose(r['pmax'], 0.25)
+    assert np.allclose(r['entropy'], -0.25 * np.log(0.25))
+
+
+def test_analyze_group_move_stats_nan_when_illegal():
+    g = {'key': 'D_1', 'rank_idx': 0, 'player_id': 'p1', 'color': 'B', 'parsed': THREE_MOVES}
+    r = ah.analyze_group(FakeEngine(-1.0), [g], 'chinese', 0, move_stats=True)[0]
+    for name in ('move_rank', 'pmax', 'entropy'):
+        assert np.isnan(np.array(r[name], dtype=float)[:, 0]).all()  # 第一手的 A19 不合法
+        assert not np.isnan(np.array(r[name], dtype=float)[:, 1]).any()

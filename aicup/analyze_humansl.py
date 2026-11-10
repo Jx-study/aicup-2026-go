@@ -6,6 +6,10 @@
 
 --side opponent 時改評目標玩家的對手那一方的手，turns、probs 與損失都屬於對手，color 欄位仍是目標玩家的顏色。
 
+--pre-root-history 時 profile query 讓網路看到前幾手，輸出的每一列多一個 pre_root_history 欄位。
+
+--move-stats 時輸出的每一列多 move_rank、pmax、entropy 三個欄位，形狀同 probs，見 policy_stats。
+
 --test-dir 時改讀競賽二的測試題，每題拆成單局，player_id 記為 question_id，rank_idx 記為 -1。
 
 用法（Colab，KataGo 執行檔在 --katago-dir，模型在 --model-dir）：
@@ -132,9 +136,16 @@ def base_query(qid, game, turns, rules):
     }
 
 
-def build_query(qid, game, turns, profile, rules):
+def build_query(qid, game, turns, profile, rules, pre_root_history=False):
+    """單一 profile 的落子機率 query。
+
+    pre_root_history 為真時關掉 analysis engine 預設的 ignorePreRootHistory，網路看得到前幾手。
+    """
+    settings = {'humanSLProfile': profile}
+    if pre_root_history:
+        settings['ignorePreRootHistory'] = False
     return dict(base_query(qid, game, turns, rules), maxVisits=1, includePolicy=True,
-                overrideSettings={'humanSLProfile': profile})
+                overrideSettings=settings)
 
 
 def build_eval_query(qid, game, turns, rules, max_visits):
@@ -200,11 +211,28 @@ class Engine:
         self.proc.terminate()
 
 
-def analyze_group(engine, games, rules, max_turns, eval_visits=1, profiles=PROFILES, side='target'):
+def policy_stats(policy, index):
+    """humanPolicy 在實際落子 index 上的統計：(move_rank, pmax, entropy)。
+
+    合法點是值 >= 0 的點。move_rank 是機率大於實際落子的合法點個數，pmax 是最大值，
+    entropy 是合法點上的熵（自然對數）。實際落子不合法時三個值都是 NaN。
+    """
+    hp = np.asarray(policy, dtype=float)
+    if hp[index] < 0:
+        return np.nan, np.nan, np.nan
+    legal = hp[hp >= 0]
+    pos = legal[legal > 0]
+    return float((legal > hp[index]).sum()), float(legal.max()), float(-(pos * np.log(pos)).sum())
+
+
+def analyze_group(engine, games, rules, max_turns, eval_visits=1, profiles=PROFILES, side='target',
+                  pre_root_history=False, move_stats=False):
     """同時送出一組局的所有 query，回傳可寫入 jsonl 的 dict 清單，失敗的局略過。
 
     probs 的列順序和 profiles 相同。eval_visits 為 0 時不送損失 query，輸出沒有損失欄位。
     side 決定評哪一方的手，見 side_color；輸出的 color 一律是目標玩家的顏色。
+    pre_root_history 只影響 profile query，見 build_query；為真時輸出多一個 pre_root_history 欄位。
+    move_stats 為真時輸出多 move_rank、pmax、entropy 三個欄位，形狀同 probs。
     """
     queries, meta = [], {}
     for g in games:
@@ -212,7 +240,7 @@ def analyze_group(engine, games, rules, max_turns, eval_visits=1, profiles=PROFI
         if not turns:
             continue
         meta[g['key']] = (g, turns)
-        queries += [build_query('%s|%d' % (g['key'], i), g['parsed'], turns, prof, rules)
+        queries += [build_query('%s|%d' % (g['key'], i), g['parsed'], turns, prof, rules, pre_root_history)
                     for i, prof in enumerate(profiles)]
         if eval_visits:
             queries.append(build_eval_query('%s|eval' % g['key'], g['parsed'], turns, rules, eval_visits))
@@ -231,6 +259,13 @@ def analyze_group(engine, games, rules, max_turns, eval_visits=1, profiles=PROFI
                'color': g['color'], 'side': side,
                'turns': turns, 'eval_visits': eval_visits, 'profiles': list(profiles),
                'probs': np.round(probs, 6).tolist()}
+        if pre_root_history:
+            row['pre_root_history'] = True
+        if move_stats:
+            stats = np.array([[policy_stats(r[t]['humanPolicy'], policy_index(g['parsed']['moves'][t][1]))
+                               for t in turns] for r in per_profile])  # (profile, 手, 3)
+            for j, name in enumerate(('move_rank', 'pmax', 'entropy')):
+                row[name] = np.round(stats[:, :, j], 6).tolist()
         if eval_visits:
             score_loss, winrate_loss = move_losses({t: r['rootInfo'] for t, r in evals.items()},
                                                    turns, side_color(g['color'], side))
@@ -323,10 +358,11 @@ def load_test_games(test_dir, limit=0):
     return out[:limit] if limit else out
 
 
-def done_keys(path, eval_visits, profiles=PROFILES, side='target'):
-    """已完成的 key。檔案裡的 eval_visits、profiles 或 side 和這次不同時拒絕接續，避免同一檔混用兩種設定。
+def done_keys(path, eval_visits, profiles=PROFILES, side='target', pre_root_history=False):
+    """已完成的 key。檔案裡的 eval_visits、profiles、side 或 pre_root_history 和這次不同時拒絕接續，避免同一檔混用兩種設定。
 
-    沒有 eval_visits 欄位的列視為不同，沒有 profiles 欄位的列視為全部 PROFILES，沒有 side 欄位的列視為 target。
+    沒有 eval_visits 欄位的列視為不同，沒有 profiles 欄位的列視為全部 PROFILES，沒有 side 欄位的列視為 target，
+    沒有 pre_root_history 欄位的列視為 False。
     """
     if not os.path.exists(path):
         return set()
@@ -338,6 +374,8 @@ def done_keys(path, eval_visits, profiles=PROFILES, side='target'):
         raise SystemExit('%s 的 profiles 不是 %s，請換一個 --out' % (path, ' '.join(profiles)))
     if any(r.get('side', 'target') != side for r in rows):
         raise SystemExit('%s 的 side 不是 %s，請換一個 --out' % (path, side))
+    if any(r.get('pre_root_history', False) != pre_root_history for r in rows):
+        raise SystemExit('%s 的 pre_root_history 不是 %s，請換一個 --out' % (path, pre_root_history))
     return {r['key'] for r in rows}
 
 
@@ -369,6 +407,8 @@ def main():
     ap.add_argument('--no-eval', action='store_true', help='不送算損失的 query，eval_visits 記為 0')
     ap.add_argument('--profiles', nargs='+', default=PROFILES, help='要送 query 的 profile，預設全部')
     ap.add_argument('--side', default='target', choices=SIDES, help='評目標玩家或對手的手')
+    ap.add_argument('--pre-root-history', action='store_true', help='profile query 讓網路看到前幾手')
+    ap.add_argument('--move-stats', action='store_true', help='輸出每手的 move_rank、pmax、entropy')
     ap.add_argument('--group', type=int, default=8, help='同時送出幾局')
     # 1 visit 用不到搜尋執行緒，改用多個 query 並行填滿 GPU 批次
     ap.add_argument('--override-config', default='numAnalysisThreads=32,numSearchThreadsPerAnalysisThread=1',
@@ -378,7 +418,7 @@ def main():
     eval_visits = 0 if args.no_eval else args.eval_visits
 
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
-    done = done_keys(args.out, eval_visits, args.profiles, args.side)
+    done = done_keys(args.out, eval_visits, args.profiles, args.side, args.pre_root_history)
     todo, bad = [], 0
     if args.test_dir:
         if args.per_rank or args.players_per_rank or args.players_file:
@@ -407,7 +447,7 @@ def main():
         with open(args.out, 'a', encoding='utf-8') as f:
             for i in range(0, len(todo), args.group):
                 rows = analyze_group(engine, todo[i:i + args.group], args.rules, args.max_turns,
-                                     eval_visits, args.profiles, args.side)
+                                     eval_visits, args.profiles, args.side, args.pre_root_history, args.move_stats)
                 for r in rows:
                     f.write(json.dumps(r) + '\n')
                 f.flush()
