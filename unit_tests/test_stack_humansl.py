@@ -454,3 +454,108 @@ def test_main_eval_players_end_to_end(tmp_path, monkeypatch, capsys):
     sh.main()
     out = capsys.readouterr().out
     assert '50 位玩家出測試題，10 位只當訓練' in out
+
+
+def test_combo_inputs_skips_set_block():
+    data, probs = toy_data()
+    x, cnn = sh.combo_inputs(sh.parse_combo('cnn+hsl+set', {'hsl', 'cnn', 'set'}), {'hsl': data['x']}, probs)
+    assert np.array_equal(x, data['x']) and cnn is probs
+    x, cnn = sh.combo_inputs(sh.parse_combo('set', {'hsl', 'cnn', 'set'}), {'hsl': data['x']}, probs)
+    assert x is None and cnn is None
+
+
+def test_predict_inputs_q_fn_equals_putting_the_same_columns_in_x():
+    data, _ = toy_data()
+    v = np.random.default_rng(3).normal(size=(len(data['key']), 3)) + data['rank_idx'][:, None] * 0.3
+    x = data['x'][:, :2]
+    splits = make_splits(data, (5, 20), 2, seed=42)
+    train, questions, _, _ = splits[0]
+
+    def q_fn(qs):
+        return np.array([v[q].mean(axis=0) for q in qs])
+
+    a, c_a = sh.predict_inputs(x, None, data, train, questions, np.random.default_rng(1), (5, 20), 2, temp=3.0,
+                               cs=(0.1, 1.0), inner_folds=3, q_fn=q_fn)
+    b, c_b = sh.predict_inputs(np.hstack([x, v]), None, data, train, questions, np.random.default_rng(1), (5, 20), 2,
+                               temp=3.0, cs=(0.1, 1.0), inner_folds=3)
+    assert c_a == c_b and np.allclose(a, b)
+
+
+def run_main_with_set(tmp_path, monkeypatch, combos, with_set_args=True, seed='42'):
+    data, probs = toy_data()
+    v = np.random.default_rng(3).normal(size=(len(data['key']), 4)) + data['rank_idx'][:, None] * 0.3
+    write_npz(tmp_path / 'v.npz', data['key'], probs, data['rank_idx'])
+    seen = {}
+
+    def fake_loader(model_path, set_dir, keys):
+        seen['args'] = (model_path, set_dir, len(keys))
+        return lambda qs: np.array([v[q].mean(axis=0) for q in qs])
+
+    monkeypatch.setattr(sh, 'load_games', lambda path: data)
+    monkeypatch.setattr(sh, 'load_set_q_fn', fake_loader)
+    argv = ['stack_humansl', 'unused.jsonl', '--cnn-probs', str(tmp_path / 'v.npz'), '--combos', combos,
+            '--train-repeats', '2', '--test-repeats', '2', '--inner-folds', '3', '--seed', seed,
+            '--out', str(tmp_path / 'out' / ('s%s.npz' % seed))]
+    if with_set_args:
+        argv += ['--set-model', 'm.pt', '--set-dir', 'trunk']
+    monkeypatch.setattr(sys, 'argv', argv)
+    sh.main()
+    return seen
+
+
+def test_main_set_block_writes_scores_readable_by_stack_hgb(tmp_path, monkeypatch, capsys):
+    from aicup import stack_hgb
+    seen = run_main_with_set(tmp_path, monkeypatch, 'hsl,hsl+set')
+    assert seen['args'] == ('m.pt', 'trunk', 1000)
+    out = capsys.readouterr().out
+    assert [line.split(' | ')[0] for line in out.splitlines() if line.startswith('| hsl')] == ['| hsl', '| hsl+set']
+    scores, players, n_games = stack_hgb.load_seed_scores([str(tmp_path / 'out' / 's42.npz')])
+    assert set(scores) == {'hsl', 'hsl+set'} and len(players) == len(n_games) == len(scores['hsl'])
+
+
+def test_main_non_set_combo_scores_do_not_change_with_set_block(tmp_path, monkeypatch):
+    for name in ('a', 'b'):
+        (tmp_path / name).mkdir()
+    run_main_with_set(tmp_path / 'a', monkeypatch, 'hsl', with_set_args=False)
+    run_main_with_set(tmp_path / 'b', monkeypatch, 'hsl,hsl+set')
+    a = np.load(tmp_path / 'a' / 'out' / 's42.npz')
+    b = np.load(tmp_path / 'b' / 'out' / 's42.npz')
+    assert np.array_equal(a['score_hsl'], b['score_hsl']) and np.array_equal(a['keys'], b['keys'])
+
+
+def test_main_set_combo_without_set_model_raises(tmp_path, monkeypatch):
+    with pytest.raises(SystemExit):
+        run_main_with_set(tmp_path, monkeypatch, 'hsl,hsl+set', with_set_args=False)
+
+
+def test_main_does_not_load_set_model_when_combos_lack_set(tmp_path, monkeypatch):
+    seen = run_main_with_set(tmp_path, monkeypatch, 'hsl', with_set_args=True)
+    assert 'args' not in seen
+
+
+def test_load_set_q_fn_rejects_missing_key(tmp_path):
+    from aicup.setmodel_trunk import DIM
+    key = np.array(['k1'])
+    player_id = np.array(['p1'])
+    rank_idx = np.array([0])
+    count = np.array([0], np.int32)
+    vec = np.zeros((0, DIM), np.float16)
+    np.savez(tmp_path / 'part-00000.npz', key=key, player_id=player_id, rank_idx=rank_idx,
+             count=count, vec=vec)
+    with pytest.raises(ValueError, match='1 個 key 沒有抽取結果'):
+        sh.load_set_q_fn('unused.pt', str(tmp_path), np.array(['k1', 'missing_key']))
+
+
+@pytest.mark.parametrize('extra', [['--set-model', 'm.pt'], ['--set-dir', 'd'], ['--out', 'o.npz']])
+def test_main_rejects_set_options_without_combos(monkeypatch, extra):
+    monkeypatch.setattr(sys, 'argv', ['stack_humansl', 'unused.jsonl', '--cnn-probs', 'v.npz'] + extra)
+    with pytest.raises(SystemExit):
+        sh.main()
+
+
+@pytest.mark.parametrize('extra', [['--set-model', 'm.pt'], ['--set-dir', 'd']])
+def test_main_rejects_set_model_without_set_dir_and_vice_versa(monkeypatch, extra):
+    argv = ['stack_humansl', 'unused.jsonl', '--cnn-probs', 'v.npz', '--combos', 'hsl'] + extra
+    monkeypatch.setattr(sys, 'argv', argv)
+    with pytest.raises(SystemExit):
+        sh.main()

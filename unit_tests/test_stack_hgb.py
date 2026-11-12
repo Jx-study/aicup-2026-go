@@ -171,7 +171,7 @@ def run_combos_preds(monkeypatch, target, opp, cnn, splits, seed, sizes, train_r
     monkeypatch.setattr(stack_humansl, 'question_points', record)
     args = SimpleNamespace(se=None, se_opp=None, hsl_opp=opp, pm=None, combos='cnn+hsl+hslo', seed=seed,
                            sizes=sizes, train_repeats=train_repeats, cnn_temp=3.0, cs=cs, inner_folds=inner_folds,
-                           prior='keep')
+                           prior='keep', set_model=None, set_dir=None, out=None)
     labels = np.concatenate([s[2] for s in splits])
     players = np.concatenate([s[3] for s in splits])
     stack_humansl.run_combos(args, load_games(target), cnn, splits, labels, players)

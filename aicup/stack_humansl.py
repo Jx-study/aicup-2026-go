@@ -14,10 +14,13 @@ CNN 單獨、Human SL 單獨、stacking 在同一批題目上比較，差用以�
     hslo    Human SL 基本特徵組 base，評的是對手的手（--hsl-opp 給定時才有）
     pm      逐手模型 10 個等級的平均 log 機率，評的是目標玩家的手（--pm 給定時才有）
     pmo     同上，評的是對手的手（--pm 的每局都有對手側時才有）
+    set     set 模型對每題輸出的 10 級 log 機率（--set-model 與 --set-dir 給定時才有）
+            是題層級特徵，不是各局特徵
 --prior 決定是否去掉訓練題的等級先驗：keep 不處理，balanced 用 class_weight，divide 把機率除以訓練題的等級比例。
 --cs 是巢狀交叉驗證的候選 C，不給時用 fit_humansl.CS。
 --combos 時分數同時印出不加權與每級等權兩種，每級等權是先算各等級玩家的平均，再對等級平均。
---se、--se-opp、--hsl-opp、--pm、--prior、--cs 只用於 --combos。
+--se、--se-opp、--hsl-opp、--pm、--set-model、--set-dir、--out、--prior、--cs 只用於 --combos。
+--out 給定時，把每個組合的逐題分數存成 score_<組合> 的 npz，欄位同 stack_hgb run，可交給 stack_hgb compare 合併多個 seed。
 --eval-players 給定時，只有清單內的玩家切折、出測試題，jsonl 中其他玩家每一折都只當訓練玩家。
 
 用法（在 repo 根目錄）：
@@ -25,10 +28,12 @@ CNN 單獨、Human SL 單獨、stacking 在同一批題目上比較，差用以�
     python -m aicup.stack_humansl humansl-analysis/val648-p3.jsonl --cnn-probs ... --se se-models/val648-se.jsonl --combos cnn+hsl,cnn+hsl+se8
     python -m aicup.stack_humansl humansl-analysis/val648-p3.jsonl --cnn-probs ... --se se-models/val648-se.jsonl --hsl-opp humansl-analysis/val648-p3-opp.jsonl --combos cnn+hsl+hd,cnn+hsl+hd+hslo
     python -m aicup.stack_humansl humansl-analysis/val-v180000-p3.jsonl --cnn-probs ... --eval-players humansl-analysis/val-players.csv --combos cnn+hsl
+    python -m aicup.stack_humansl humansl-analysis/val-v180000-dev-p3-hist.jsonl --hsl-opp ... --cnn-probs ... --combos hsl+hslo,hsl+hslo+set --set-model humansl-analysis/setmodel/set-model.pt --set-dir humansl-analysis/setmodel/trunk-eval --out runs/s42.npz
 """
 import argparse
 import csv
 import json
+from pathlib import Path
 
 import numpy as np
 from sklearn.model_selection import GroupKFold
@@ -243,8 +248,8 @@ def parse_combo(combo, available):
 
 
 def combo_inputs(names, blocks, cnn_probs):
-    """組合的 (各局特徵 x 或 None, CNN 機率或 None)。blocks 是 {名稱: 各局特徵}，不含 cnn。"""
-    cols = [blocks[n] for n in names if n != 'cnn']
+    """組合的 (各局特徵 x 或 None, CNN 機率或 None)。blocks 是 {名稱: 各局特徵}，不含 cnn 與 set。"""
+    cols = [blocks[n] for n in names if n not in ('cnn', 'set')]
     return (np.hstack(cols) if cols else None), (cnn_probs if 'cnn' in names else None)
 
 
@@ -266,9 +271,9 @@ def select_c(x, y, groups, cs=CS, inner_folds=5, class_weight=None):
     return cs[int(np.argmax(scores))]
 
 
-def fit_model(x, cnn_probs, questions, labels, players, temp, cs=CS, inner_folds=5, class_weight=None):
-    """在 questions 上依 players 選 C 後擬合，回傳 (model, 選到的 C)；x 為 None 時只用 CNN 特徵。"""
-    f = question_features(x, cnn_probs, questions, temp)
+def fit_model(x, cnn_probs, questions, labels, players, temp, cs=CS, inner_folds=5, class_weight=None, q_fn=None):
+    """在 questions 上依 players 選 C 後擬合，回傳 (model, 選到的 C)；特徵由 question_features 組成，q_fn 見該函數。"""
+    f = question_features(x, cnn_probs, questions, temp, q_fn)
     c_best = select_c(f, labels, players, cs, inner_folds, class_weight)
     return new_model(c_best, class_weight).fit(f, labels), c_best
 
@@ -286,17 +291,18 @@ def prior_class_weight(prior):
 
 
 def predict_inputs(x, cnn_probs, data, train, questions, rng, sizes, train_repeats, temp, cs=CS, inner_folds=5,
-                   prior='keep'):
+                   prior='keep', q_fn=None):
     """用 train 遮罩的玩家切訓練題、選 C、擬合，回傳 (questions 的 10 類機率, 選到的 C)。
 
-    x 是各局特徵或 None，cnn_probs 是每局 CNN 機率或 None，兩者不能都是 None。
+    x 是各局特徵或 None，cnn_probs 是每局 CNN 機率或 None，q_fn 是題層級特徵函數或 None，三者不能都是 None。
     sizes 為每題可用的局數，temp 為 CNN 每局機率的溫度，cs 為候選 C，inner_folds 為內層折數。
     prior 為 keep 時不處理等級先驗；balanced 擬合時用 class_weight='balanced'；
     divide 照常擬合，預測機率再除以訓練題的等級比例後正規化。
     """
     tr_q, tr_y, tr_players = questions_of(data, train, train_repeats, rng, sizes)
-    model, c_best = fit_model(x, cnn_probs, tr_q, tr_y, tr_players, temp, cs, inner_folds, prior_class_weight(prior))
-    probs = level_probs(model, question_features(x, cnn_probs, questions, temp))
+    model, c_best = fit_model(x, cnn_probs, tr_q, tr_y, tr_players, temp, cs, inner_folds, prior_class_weight(prior),
+                              q_fn)
+    probs = level_probs(model, question_features(x, cnn_probs, questions, temp, q_fn))
     if prior == 'divide':
         probs = divide_prior(probs, tr_y)
     return probs, c_best
@@ -325,6 +331,17 @@ def print_interval(label, values, seed):
     return interval
 
 
+def load_set_q_fn(model_path, set_dir, keys):
+    """set 塊的 q_fn：載入 set 模型與 setmodel_trunk 的輸出，依 keys 對齊每局向量。
+
+    有 key 不在 set_dir 的輸出內時丟 ValueError。沒有向量的局不參與，題內全部局都沒有向量時用訓練玩家的等級先驗。
+    """
+    from aicup.setmodel_train import align, embed_games, load_games as load_trunk, load_model, make_q_fn
+    vec, mask = align(load_trunk(set_dir), keys)
+    model, prior_logp = load_model(model_path)
+    return make_q_fn(model, embed_games(model, vec, mask), mask.any(axis=1), prior_logp)
+
+
 def run_combos(args, data, cnn, splits, labels, players):
     """--combos：同一批題目、同一組折比較各組合，以第一個組合為基準算配對差。"""
     blocks = {'hsl': data['x'][:, hsl_columns(data)]}
@@ -337,23 +354,36 @@ def run_combos(args, data, cnn, splits, labels, players):
     if args.pm:
         blocks.update(load_pm_blocks(args.pm, data['key'], data['rank_idx']))
     combos = [c.strip() for c in args.combos.split(',') if c.strip()]
-    parsed = {c: parse_combo(c, set(blocks) | {'cnn'}) for c in combos}
+    parsed = {c: parse_combo(c, set(blocks) | {'cnn', 'set'}) for c in combos}
+    need_set = any('set' in names for names in parsed.values())
+    if need_set and not args.set_model:
+        raise ValueError('組合含 set 塊，要給 --set-model 與 --set-dir')
+    set_q_fn = load_set_q_fn(args.set_model, args.set_dir, data['key']) if need_set else None
     keys = sorted(set(players))
     player_label = dict(zip(players, labels))
     player_labels = np.array([player_label[k] for k in keys])
-    means, chosen = {}, {}
+    means, chosen, scores = {}, {}, {}
     for combo in combos:
         x, cnn_c = combo_inputs(parsed[combo], blocks, cnn)
         probs, fold_c = [], []
         for f, (train, q, _, _) in enumerate(splits):
             p, c_best = predict_inputs(x, cnn_c, data, train, q, train_rng(args.seed, f), args.sizes,
                                        args.train_repeats, args.cnn_temp, cs=args.cs, inner_folds=args.inner_folds,
-                                       prior=args.prior)
+                                       prior=args.prior, q_fn=set_q_fn if 'set' in parsed[combo] else None)
             probs.append(p)
             fold_c.append(c_best)
-        m = player_means(question_points(labels, pick_level(np.concatenate(probs))), players)
+        scores[combo] = question_points(labels, pick_level(np.concatenate(probs)))
+        m = player_means(scores[combo], players)
         means[combo] = np.array([m[k] for k in keys])
         chosen[combo] = fold_c
+    if args.out:
+        questions = [q for s in splits for q in s[1]]
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(out, player_id=players, keys=np.array([','.join(data['key'][q]) for q in questions]),
+                 rank_idx=labels, n_games=np.array([len(q) for q in questions]),
+                 **{'score_' + c: v for c, v in scores.items()})
+        print('逐題分數 ->', out)
     base = combos[0]
     print('prior %s，基準 %s' % (args.prior, base))
     print('| 組合 | 不加權 | 95% 區間 | 每級等權 | 減基準 | 95% 區間 | 各折 C |')
@@ -380,15 +410,24 @@ def main():
     ap.add_argument('--se-opp', help='strength_se --side opponent 的 jsonl，提供 se1o、se4o、se8o、slo 特徵塊')
     ap.add_argument('--hsl-opp', help='analyze_humansl --side opponent 的 jsonl，提供 hslo 特徵塊')
     ap.add_argument('--pm', help='infer_permove 的 jsonl，提供 pm 特徵塊，每局都有對手側時另有 pmo')
+    ap.add_argument('--set-model',
+                    help='setmodel_train 輸出的 checkpoint，提供 set 塊，只用於 --combos，要搭配 --set-dir')
+    ap.add_argument('--set-dir', help='setmodel_trunk extract --set eval 的輸出目錄，要搭配 --set-model')
+    ap.add_argument('--out', help='只用於 --combos：逐題分數的 npz 路徑')
     ap.add_argument('--combos', help='逗號分隔的組合，例如 cnn+hsl,cnn+hsl+se8；第一個是配對差的基準')
     ap.add_argument('--prior', default='keep', choices=PRIORS, help='只用於 --combos')
     ap.add_argument('--cs', type=parse_cs, default=CS,
                     help='逗號分隔的候選 C，只用於 --combos，預設 %s' % ','.join('%g' % c for c in CS))
     ap.add_argument('--eval-players', help='含 player_id、rank 欄位的 CSV，只有這些玩家出測試題，其他玩家只當訓練')
     args = ap.parse_args()
-    if not args.combos and (args.se or args.se_opp or args.hsl_opp or args.pm or args.prior != 'keep'
-                            or args.cs != CS):
-        ap.error('--se、--se-opp、--hsl-opp、--pm、--prior、--cs 只用於 --combos')
+    if not args.combos and (args.se or args.se_opp or args.hsl_opp or args.pm or args.set_model or args.set_dir
+                            or args.out or args.prior != 'keep' or args.cs != CS):
+        ap.error('--se、--se-opp、--hsl-opp、--pm、--set-model、--set-dir、--out、--prior、--cs'
+                 ' 只用於 --combos')
+    if bool(args.set_model) != bool(args.set_dir):
+        ap.error('--set-model 與 --set-dir 要一起給')
+    if args.combos and any('set' in c.split('+') for c in args.combos.split(',')) and not args.set_model:
+        ap.error('組合含 set 塊，要給 --set-model 與 --set-dir')
 
     data = load_games(args.jsonl)
     cnn = load_cnn_probs(args.cnn_probs, data['key'], data['rank_idx'])
