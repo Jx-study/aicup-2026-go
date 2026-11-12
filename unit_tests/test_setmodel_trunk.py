@@ -74,10 +74,15 @@ def test_split_val_size_covers_dev_and_holdout():
 
 def test_check_config_rejects_change(tmp_path):
     import argparse
-    args = argparse.Namespace(set='train', players_per_rank=200, chunk=200, keys_from=None, out=str(tmp_path))
+    args = argparse.Namespace(set='train', players_per_rank=200, chunk=200, dtype='fp16', keys_from=None,
+                              out=str(tmp_path))
     st.check_config(args)
     st.check_config(args)
     args.players_per_rank = 100
+    with pytest.raises(SystemExit):
+        st.check_config(args)
+    args.players_per_rank = 200
+    args.dtype = 'bf16'
     with pytest.raises(SystemExit):
         st.check_config(args)
 
@@ -85,3 +90,9 @@ def test_check_config_rejects_change(tmp_path):
 def test_load_vectors_ignores_tmp(tmp_path):
     (tmp_path / 'tmp-part-000001.npz').write_bytes(b'broken')
     assert st.load_vectors(str(tmp_path)) == {}
+
+
+def test_check_v11():
+    st.check_v11(pd.DataFrame({'sgf_content': ['(;GM[1]SZ[19]HD[0];B[aa])', '(;GM[1]SZ[19];B[aa])']}), 'x')
+    with pytest.raises(SystemExit):
+        st.check_v11(pd.DataFrame({'sgf_content': ['(;GM[1]SZ[19];B[aa])']}), 'x')

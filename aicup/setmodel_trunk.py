@@ -5,6 +5,7 @@
 每局取目標玩家在 SGF 手數 FIRST_MOVE～LAST_MOVE（含，從 1 起算）之間的手，從中等距取 PER_GAME 手，
 範圍內不足時全取，範圍內沒有任何手的局不產生向量。
 
+棋譜都來自 --train-dir，必須是官方訓練集 v1.1（含 HD[n]），舊版沒有讓子資訊時拒絕。
 兩種局集合：
     train  split_by_player(df, SPLIT_VAL_SIZE) 的 train 玩家中局數 >= 20 者，每級 --players-per-rank 位，每人抽 20 局
     eval   --keys-from 指定的 jsonl 的局（開發組 20 局）
@@ -82,9 +83,16 @@ def to_game(row):
             'player_id': str(row['player_id']), 'color': row['color'], 'sgf': row['sgf_content']}
 
 
+def check_v11(df, train_dir):
+    """棋譜沒有任何 HD[n] 時拒絕：舊版 CSV 沒有讓子資訊，parse_game 不會對調讓子局的黑白。"""
+    if not df['sgf_content'].str.contains('HD[', regex=False).any():
+        raise SystemExit('%s 的棋譜沒有 HD[n]，不是官方訓練集 v1.1' % train_dir)
+
+
 def train_games(train_dir, players_per_rank):
     """train 集合：每局一個 dict（key、rank_idx、player_id、color、sgf）。"""
     df = load_dataframe(train_dir)
+    check_v11(df, train_dir)
     df['player_id'] = df['player_id'].astype(str)
     _, df_train = split_by_player(df, SPLIT_VAL_SIZE)
     players = select_train_players(df_train, players_per_rank)
@@ -108,7 +116,7 @@ def encode_one(game):
             return game['key'], None, None
         enc = encode_game(parsed, turns, history=True)
         return game['key'], enc['spatial'], enc['global']
-    except Exception:  # 壞 SGF 或不支援的局，該局沒有向量
+    except ValueError:  # 壞 SGF 或非 19 路棋盤，該局沒有向量；其他例外代表程式或環境有問題，不吞
         return game['key'], None, None
 
 
@@ -183,7 +191,8 @@ def get_games(args):
 def check_config(args):
     """輸出目錄的 extract_config.json 和這次的參數不同時拒絕，沒有則寫入。part 編號只在同一組參數下對得到同一批局。"""
     config = {'set': args.set, 'players_per_rank': args.players_per_rank if args.set == 'train' else None,
-              'chunk': args.chunk, 'keys_from': os.path.basename(args.keys_from) if args.keys_from else None}
+              'chunk': args.chunk, 'dtype': args.dtype,
+              'keys_from': os.path.basename(args.keys_from) if args.keys_from else None}
     path = os.path.join(args.out, 'extract_config.json')
     if os.path.exists(path):
         with open(path, encoding='utf-8') as f:
@@ -211,8 +220,16 @@ def extract(args):
     if os.path.exists(timing):
         with open(timing, encoding='utf-8') as f:
             log = json.load(f)
-    log['runs'].append({'start': time.strftime('%Y-%m-%d %H:%M:%S'), 'players_per_rank': args.players_per_rank,
-                        'set': args.set, 'dtype': args.dtype})
+    run = {'start': time.strftime('%Y-%m-%d %H:%M:%S'),
+           'players_per_rank': args.players_per_rank if args.set == 'train' else None,
+           'set': args.set, 'dtype': args.dtype, 'positions': 0}
+    log['runs'].append(run)
+
+    def save_log():
+        with open(timing, 'w', encoding='utf-8') as f:
+            json.dump(log, f, indent=1)
+
+    save_log()  # 中斷時也留得下這次的開始時間
     positions = 0
     with ProcessPoolExecutor(args.workers) as pool:
         def submit(n):
@@ -231,12 +248,12 @@ def extract(args):
             write_part(part_path(args.out, n), chunks[n], results, vecs)
             positions += len(vecs)
             el = time.time() - t0
+            run.update(last=time.strftime('%Y-%m-%d %H:%M:%S'), seconds=round(el, 1), positions=positions)
+            save_log()
             print('part %d/%d 完成，%d 局無向量，累計 %d 個局面，%.0f 秒，%.1f 個/秒'
                   % (i + 1, len(todo), len(results) - len(ok), positions, el, positions / el), flush=True)
-    log['runs'][-1].update(end=time.strftime('%Y-%m-%d %H:%M:%S'), seconds=round(time.time() - t0, 1),
-                           positions=positions)
-    with open(timing, 'w', encoding='utf-8') as f:
-        json.dump(log, f, indent=1)
+    run.update(end=time.strftime('%Y-%m-%d %H:%M:%S'), seconds=round(time.time() - t0, 1))
+    save_log()
 
 
 def bench(args):
@@ -287,7 +304,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('mode', choices=['bench', 'extract'])
     ap.add_argument('--set', choices=['train', 'eval'], required=True)
-    ap.add_argument('--train-dir', default='training-v1.1/training', help='含 train_*.csv 的目錄')
+    ap.add_argument('--train-dir', default='training-v1.1/training', help='官方訓練集 v1.1 的 train_*.csv 所在目錄，要含 HD[n]')
     ap.add_argument('--keys-from', help='--set eval 用的 jsonl')
     ap.add_argument('--players-per-rank', type=int, default=PLAYERS_PER_RANK)
     ap.add_argument('--out', help='extract 的輸出目錄')
