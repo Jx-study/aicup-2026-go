@@ -229,6 +229,29 @@ def test_question_features_without_cnn_is_feature_mean():
     assert f.tolist() == [[1.0, 2.0], [9.0, 10.0]]
 
 
+def test_question_features_q_fn_appends_per_question_block():
+    x = np.arange(12, dtype=float).reshape(6, 2)
+    v = np.random.default_rng(0).normal(size=(6, 3))
+
+    def q_fn(questions):
+        return np.array([np.tanh(v[q]).mean(axis=0) for q in questions])
+
+    qs = [np.array([0, 1, 2]), np.array([4, 5])]
+    f = sh.question_features(x, None, qs, temp=3.0, q_fn=q_fn)
+    assert f.shape == (2, 5) and np.allclose(f[:, :2], sh.question_x(x, qs)) and np.allclose(f[:, 2:], q_fn(qs))
+    # 題內局的順序不影響，題外的局不影響
+    shuffled = sh.question_features(x, None, [np.array([2, 0, 1]), np.array([5, 4])], temp=3.0, q_fn=q_fn)
+    assert np.allclose(f, shuffled)
+    alone = sh.question_features(x, None, qs[1:], temp=3.0, q_fn=q_fn)
+    assert np.allclose(alone[0], f[1])
+
+
+def test_question_features_q_fn_rejects_wrong_rows():
+    x = np.zeros((4, 2))
+    with pytest.raises(ValueError):
+        sh.question_features(x, None, [np.array([0, 1]), np.array([2, 3])], temp=3.0, q_fn=lambda qs: np.zeros((1, 3)))
+
+
 def test_divide_prior_removes_label_frequency():
     labels = np.array([0, 0, 0, 1])
     out = sh.divide_prior(np.array([[0.75, 0.25] + [0.0] * 8]), labels)

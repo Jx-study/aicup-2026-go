@@ -209,16 +209,22 @@ def cnn_question_probs(probs, questions, temp):
     return np.array([aggregate_games(scaled[q], 'log') for q in questions])
 
 
-def question_features(x, cnn_probs, questions, temp):
-    """每題的特徵：CNN 合併後的 10 個 log 機率，接各局特徵 x 的平均。
+def question_features(x, cnn_probs, questions, temp, q_fn=None):
+    """每題的特徵：CNN 合併後的 10 個 log 機率，接各局特徵 x 的平均，最後接 q_fn 的輸出。
 
-    x 為 None 時只有 CNN；cnn_probs 為 None 時只有 x 的平均。
+    x、cnn_probs、q_fn 為 None 的部分不放，至少要有一個。
+    q_fn 接收 questions，回傳 (題數, k)；第 i 列只能由 questions[i] 的局決定，且不受局的順序影響。
     """
     parts = []
     if cnn_probs is not None:
         parts.append(np.log(np.maximum(cnn_question_probs(cnn_probs, questions, temp), EPS)))
     if x is not None:
         parts.append(question_x(x, questions))
+    if q_fn is not None:
+        out = np.asarray(q_fn(questions), dtype=float)
+        if out.ndim != 2 or len(out) != len(questions):
+            raise ValueError('q_fn 要回傳 (題數, k)，得到 %s' % (out.shape,))
+        parts.append(out)
     return np.hstack(parts)
 
 
