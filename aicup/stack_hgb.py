@@ -40,8 +40,14 @@ run 的 .npz 欄位：
 import argparse
 import csv
 import json
+import sys
 import warnings
 from pathlib import Path
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
 
 import numpy as np
 from sklearn.ensemble import HistGradientBoostingClassifier
@@ -75,13 +81,44 @@ K_GROUPS = GROUP_ORDER
 ARM_GROUPS = {'hgb_all': K_GROUPS, 'hgb_all_lr': K_GROUPS,
               'hgb_nodist': tuple(g for g in K_GROUPS if g not in DIST_GROUPS),
               'hgb_nowithin': tuple(g for g in K_GROUPS if g != 'within')}
-STAGE1_GROUPS = {'hgb': tuple(g for g in K_GROUPS if g != 'cnn'), 'lr': ('hsl', 'hslo')}
+STAGE1_GROUPS = {'hgb': tuple(g for g in K_GROUPS if g != 'cnn'), 'lr': ('hsl', 'hslo'),
+                 'hgb_hsl': ('hsl', 'hslo')}
 LR_ARMS = ('lr_base', 'lr_hist')
 HGB_ARMS = ('hgb_all', 'hgb_nodist', 'hgb_nowithin')
 POOL_ARMS = ('pool', 'pool_s1')
 EMPTY_POOL_ARMS = ('nopool', 'nopool_s1')
-ALL_ARMS = LR_ARMS + HGB_ARMS + ('hgb_all_lr',) + POOL_ARMS + EMPTY_POOL_ARMS
+HGB_HSL_POOL_ARMS = ('pool_hgbhsl', 'pool_hgbhsl_s1')
+HGB_HSL_EMPTY_POOL_ARMS = ('nopool_hgbhsl', 'nopool_hgbhsl_s1')
+ALL_STAGE1_POOL_ARMS = POOL_ARMS + HGB_HSL_POOL_ARMS
+ALL_STAGE1_EMPTY_ARMS = EMPTY_POOL_ARMS + HGB_HSL_EMPTY_POOL_ARMS
+ALL_ARMS = LR_ARMS + HGB_ARMS + ('hgb_all_lr',) + ALL_STAGE1_POOL_ARMS + ALL_STAGE1_EMPTY_ARMS
 DEFAULT_ARMS = ('lr_base', 'lr_hist', 'hgb_all', 'hgb_all_lr', 'hgb_nodist', 'hgb_nowithin')
+
+
+def stage1_arms(stage1):
+    """回傳 (pool 臂元組, nopool 臂元組)。
+
+    stage1 為 'lr' 或 'hgb' 時為 ('pool', 'pool_s1') 與 ('nopool', 'nopool_s1')；
+    'hgb_hsl' 時輸出帶第一段種類名稱 ('pool_hgbhsl', 'pool_hgbhsl_s1') 與 ('nopool_hgbhsl', 'nopool_hgbhsl_s1')。
+    """
+    if stage1 == 'hgb_hsl':
+        return HGB_HSL_POOL_ARMS, HGB_HSL_EMPTY_POOL_ARMS
+    return POOL_ARMS, EMPTY_POOL_ARMS
+
+
+def normalize_arms(arms, stage1):
+    """依 stage1 將通用的 pool / nopool 映射至該 stage1 對應的臂名稱。"""
+    pool_pair, empty_pair = stage1_arms(stage1)
+    mapping = {
+        'pool': pool_pair[0], 'pool_s1': pool_pair[1],
+        'nopool': empty_pair[0], 'nopool_s1': empty_pair[1],
+    }
+    out = []
+    for a in arms:
+        target = mapping.get(a, a)
+        if target not in out:
+            out.append(target)
+    return tuple(out)
 
 
 def _nanmean(x, axis=None):
@@ -254,10 +291,12 @@ def fill_nan(f_train, f_test):
 
 
 def fit_stage1(kind, params, f, y, seed):
-    """第一段模型：hgb 時 params 是 (max_depth, max_iter)，lr 時是 C。"""
-    if kind == 'hgb':
+    """第一段模型：hgb / hgb_hsl 時 params 是 (max_depth, max_iter)，lr 時是 C。"""
+    if kind in ('hgb', 'hgb_hsl'):
         return hgb_model(*params, seed).fit(f, y)
-    return new_model(params).fit(f, y)
+    elif kind == 'lr':
+        return new_model(params).fit(f, y)
+    raise ValueError('未知的 stage1 kind：%s' % kind)
 
 
 def stage1_log_probs(model, f):
@@ -286,10 +325,12 @@ def two_stage(kind, dev_tr, dev_te, pool, cnn_tr, cnn_te, seed, cs=CS, inner_fol
 
     every = np.arange(len(y_tr))
     f_all, y_all, g_all = with_pool(every)
-    if kind == 'hgb':
+    if kind in ('hgb', 'hgb_hsl'):
         params, _ = select_hgb(f_all, y_all, g_all, seed, inner_folds)
-    else:
+    elif kind == 'lr':
         params = select_c(f_all, y_all, g_all, cs, inner_folds)
+    else:
+        raise ValueError('未知的 stage1 kind：%s' % kind)
     fits = [('test', set(g_all))]
     s1_test = stage1_log_probs(fit_stage1(kind, params, f_all, y_all, seed), dev_te)
     oof = np.full((len(y_tr), len(LEVELS)), np.nan)
@@ -326,28 +367,43 @@ def same_games(a, b):
 
 
 def evaluate(old, hist, cnn, splits, arms, seed, sizes=SIZES, train_repeats=10, temp=3.0, cs=CS, inner_folds=5,
-             pool=None, stage1='hgb', log=print):
+             pool=None, stage1='lr', log=print):
     """在 splits 的測試題上跑各方案，回傳 ({方案: 依 splits 順序合併的預測等級}, {方案: 各折的超參數})。
 
     old、hist 是 (data, games)，局與順序要相同；cnn 是每局 CNN 機率；pool 是 train 池的 (data, games) 或 None。
     訓練題用 train_rng(seed, 折)，和 stack_humansl 相同；train 池的題用 rng [seed, POOL_RNG]，每折相同。
     """
+    arms = normalize_arms(arms, stage1)
     unknown = sorted(set(arms) - set(ALL_ARMS))
     if unknown:
         raise ValueError('未知的方案：%s' % ', '.join(unknown))
     if not same_games(old[0], hist[0]):
         raise ValueError('舊版與 history 版 jsonl 的局或順序不同')
-    if any(a in POOL_ARMS for a in arms) and pool is None:
-        raise ValueError('pool、pool_s1 需要 train 池')
     data_old, games_old = old
     data, games = hist
-    two_stage_kinds = [p for p in (POOL_ARMS, EMPTY_POOL_ARMS) if set(p) & set(arms)]
-    pool_q = None
-    if pool is not None and set(POOL_ARMS) & set(arms):
-        check_disjoint(set(pool[0]['player_id']), {'開發組': set(data['player_id'])})
-        q, y, g = questions_of(pool[0], np.ones(len(pool[0]['key']), bool), train_repeats,
-                               np.random.default_rng([seed, POOL_RNG]), sizes)
-        pool_q = (stack_groups(question_matrix(pool[1], None, q, temp), STAGE1_GROUPS[stage1]), y, g)
+
+    two_stage_requests = []
+    pool_pair, empty_pair = stage1_arms(stage1)
+    if set(pool_pair) & set(arms):
+        two_stage_requests.append((stage1, pool_pair, True))
+    if set(empty_pair) & set(arms):
+        two_stage_requests.append((stage1, empty_pair, False))
+    if stage1 != 'hgb_hsl':
+        if set(HGB_HSL_POOL_ARMS) & set(arms):
+            two_stage_requests.append(('hgb_hsl', HGB_HSL_POOL_ARMS, True))
+        if set(HGB_HSL_EMPTY_POOL_ARMS) & set(arms):
+            two_stage_requests.append(('hgb_hsl', HGB_HSL_EMPTY_POOL_ARMS, False))
+
+    pool_qs = {}
+    for s1, arm_pair, use_pool in two_stage_requests:
+        if use_pool and s1 not in pool_qs:
+            if pool is None:
+                raise ValueError('%s 需要 train 池' % ', '.join(arm_pair))
+            check_disjoint(set(pool[0]['player_id']), {'開發組': set(data['player_id'])})
+            q, y, g = questions_of(pool[0], np.ones(len(pool[0]['key']), bool), train_repeats,
+                                   np.random.default_rng([seed, POOL_RNG]), sizes)
+            pool_qs[s1] = (stack_groups(question_matrix(pool[1], None, q, temp), STAGE1_GROUPS[s1]), y, g)
+
     preds = {a: [] for a in arms}
     params = {a: [] for a in arms}
     x_old = np.hstack([games_old['hsl'], games_old['hslo']])
@@ -375,17 +431,17 @@ def evaluate(old, hist, cnn, splits, arms, seed, sizes=SIZES, train_repeats=10, 
             c = select_c(f_tr, tr_y, tr_g, cs, inner_folds)
             preds['hgb_all_lr'].append(pick_level(level_probs(new_model(c).fit(f_tr, tr_y), f_te)))
             params['hgb_all_lr'].append(c)
-        for arm_pair in two_stage_kinds:
-            p2, p1, info = two_stage(stage1, (stack_groups(m_tr, STAGE1_GROUPS[stage1]), tr_y, tr_g),
-                                     stack_groups(m_te, STAGE1_GROUPS[stage1]),
-                                     pool_q if arm_pair == POOL_ARMS else None, m_tr['cnn'], m_te['cnn'], seed, cs,
+        for s1, arm_pair, use_pool in two_stage_requests:
+            p2, p1, info = two_stage(s1, (stack_groups(m_tr, STAGE1_GROUPS[s1]), tr_y, tr_g),
+                                     stack_groups(m_te, STAGE1_GROUPS[s1]),
+                                     pool_qs.get(s1) if use_pool else None, m_tr['cnn'], m_te['cnn'], seed, cs,
                                      inner_folds)
             for used, fit_players in info['fits']:
                 assert not (fit_players & test_players), '第一段的擬合玩家含測試玩家（%s）' % used
             for arm, p in zip(arm_pair, (p2, p1)):
                 if arm in arms:
                     preds[arm].append(pick_level(p))
-                    stage1_params = list(info['stage1']) if stage1 == 'hgb' else info['stage1']
+                    stage1_params = list(info['stage1']) if s1 in ('hgb', 'hgb_hsl') else info['stage1']
                     params[arm].append({'stage1': stage1_params, 'stage2_c': info['stage2_c']})
         log('折 %d 完成：%s' % (f, ', '.join('%s %s' % (a, json.dumps(params[a][-1])) for a in arms)))
     return {a: np.concatenate(v) for a, v in preds.items()}, params
@@ -427,7 +483,7 @@ def load_pool(args):
 
 
 def cmd_run(args):
-    arms = tuple(a.strip() for a in args.arms.split(',') if a.strip())
+    arms = normalize_arms(tuple(a.strip() for a in args.arms.split(',') if a.strip()), args.stage1)
     old = load_game_features(args.jsonl, args.opp)
     hist = load_game_features(args.hist_jsonl, args.hist_opp)
     data = hist[0]
@@ -536,7 +592,8 @@ def main():
     run.add_argument('--pool-opp', help='train 池的對手側 history 版 jsonl')
     run.add_argument('--exclude-players', nargs='*', default=[],
                      help='含 player_id 欄位的 CSV，train 池的玩家不能出現在其中')
-    run.add_argument('--stage1', choices=('hgb', 'lr'), default='hgb', help='lr 時第一段只用 hsl+hslo')
+    run.add_argument('--stage1', choices=('lr', 'hgb', 'hgb_hsl'), default='lr',
+                     help='第一段種類：lr（只用 hsl+hslo 的 LR）、hgb（全 Human SL 特徵的 HGB）、hgb_hsl（只用 hsl+hslo 的 HGB）')
     run.add_argument('--seed', type=int, default=42, help='切折、出題、HGB 與 bootstrap 的 seed')
     run.add_argument('--out', required=True)
     run.add_argument('--cnn-temp', type=float, default=3.0)

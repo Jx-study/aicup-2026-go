@@ -228,7 +228,7 @@ def test_two_stage_never_fits_on_predicted_players(fast_hgb):
     pool = toy_stage_inputs(20, seed=1, prefix='q')
     f_te = toy_stage_inputs(10, seed=2, prefix='t')[0]
     cnn_tr, cnn_te = np.zeros((len(y), 10)), np.zeros((len(f_te), 10))
-    for kind in ('lr', 'hgb'):
+    for kind in ('lr', 'hgb', 'hgb_hsl'):
         probs, s1, info = sh.two_stage(kind, (f, y, g), f_te, pool, cnn_tr, cnn_te, 0, cs=(1.0,), inner_folds=3)
         assert probs.shape == s1.shape == (len(f_te), 10)
         assert np.allclose(s1.sum(1), 1)
@@ -344,3 +344,65 @@ def test_pool_requires_exclude_players(monkeypatch, capsys):
     with pytest.raises(SystemExit):
         sh.main()
     assert '--exclude-players' in capsys.readouterr().err
+
+
+def test_hgb_hsl_stage1_width_and_model(tmp_path, fast_hgb):
+    assert sh.STAGE1_GROUPS['hgb_hsl'] == ('hsl', 'hslo')
+    data, games = sh.load_game_features(*toy_files(tmp_path, n_players=50))
+    m = sh.question_matrix(games, None, [np.arange(5)], 3.0)
+    feat = sh.stack_groups(m, sh.STAGE1_GROUPS['hgb_hsl'])
+    assert feat.shape == (1, 8)
+
+    pool = sh.load_game_features(*toy_files(tmp_path, name='pool', n_players=20, prefix='q', seed=3))
+    cnn = toy_cnn(data)
+    splits = make_eval_splits(data, (5,), 1, None, seed=2)
+    preds, params = sh.evaluate(
+        (data, games), (data, games), cnn, splits,
+        arms=('pool',), seed=2, sizes=(5,), train_repeats=1,
+        cs=(1.0,), inner_folds=2, pool=pool, stage1='hgb_hsl', log=lambda *_: None
+    )
+    assert 'pool_hgbhsl' in preds
+    assert len(preds['pool_hgbhsl']) == sum(len(s[2]) for s in splits)
+    p = params['pool_hgbhsl'][0]['stage1']
+    assert isinstance(p, list) and len(p) == 2
+
+
+def test_merge_two_stage_outputs_no_conflict(tmp_path, fast_hgb, monkeypatch):
+    target, opp = toy_files(tmp_path)
+    data = sh.load_game_features(target, opp)[0]
+    p_target, p_opp = toy_files(tmp_path, name='pool', n_players=10, prefix='q', seed=8)
+    np.savez(tmp_path / 'cnn.npz', key=data['key'], probs=toy_cnn(data), rank_idx=data['rank_idx'])
+    holdout = tmp_path / 'holdout.csv'
+    holdout.write_text('player_id\nnone\n', encoding='utf-8')
+
+    # Run 1: --stage1 lr
+    monkeypatch.setattr('sys.argv', [
+        'stack_hgb', 'run', '--jsonl', target, '--opp', opp, '--hist-jsonl', target, '--hist-opp', opp,
+        '--cnn-probs', str(tmp_path / 'cnn.npz'),
+        '--pool-jsonl', p_target, '--pool-opp', p_opp, '--exclude-players', str(holdout),
+        '--stage1', 'lr', '--arms', 'lr_base,lr_hist,pool,pool_s1',
+        '--sizes', '5', '--train-repeats', '1', '--test-repeats', '1', '--inner-folds', '2', '--cs', '1',
+        '--seed', '42', '--out', str(tmp_path / 'r-lr-s42.npz')
+    ])
+    sh.main()
+
+    # Run 2: --stage1 hgb_hsl
+    monkeypatch.setattr('sys.argv', [
+        'stack_hgb', 'run', '--jsonl', target, '--opp', opp, '--hist-jsonl', target, '--hist-opp', opp,
+        '--cnn-probs', str(tmp_path / 'cnn.npz'),
+        '--pool-jsonl', p_target, '--pool-opp', p_opp, '--exclude-players', str(holdout),
+        '--stage1', 'hgb_hsl', '--arms', 'pool,pool_s1',
+        '--sizes', '5', '--train-repeats', '1', '--test-repeats', '1', '--inner-folds', '2', '--cs', '1',
+        '--seed', '42', '--out', str(tmp_path / 'r-hgbhsl-s42.npz')
+    ])
+    sh.main()
+
+    # 合併讀取兩個檔案，確認沒有衝突
+    scores, players, n_games = sh.load_seed_scores([
+        str(tmp_path / 'r-lr-s42.npz'),
+        str(tmp_path / 'r-hgbhsl-s42.npz')
+    ])
+    assert 'lr_base' in scores
+    assert 'pool' in scores
+    assert 'pool_hgbhsl' in scores
+
