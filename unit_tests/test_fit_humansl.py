@@ -54,9 +54,9 @@ def test_game_features_short_game_uses_available_moves():
 
 def test_feature_sets_columns():
     sets = fh.feature_sets()
-    assert sets['A'] == list(range(11))
-    assert sets['B50'] == list(range(17))
-    assert sets['B100'] == list(range(11)) + list(range(17, 23))
+    assert sets['base'] == list(range(11))
+    assert sets['loss50'] == list(range(17))
+    assert sets['loss100'] == list(range(11)) + list(range(17, 23))
 
 
 def test_load_games_shapes_and_empty(tmp_path):
@@ -135,7 +135,7 @@ def test_splits_are_independent_of_predict_rng():
 @pytest.mark.parametrize('mode', ['avg', 'game'])
 def test_learned_model_separates_ranks(mode):
     d = make_data()
-    cols = fh.feature_sets()['A']
+    cols = fh.feature_sets()['base']
     if mode == 'avg':
         predict = lambda tr, q, rng: fh.predict_avg(d, cols, 1.0, tr, q, rng, (5, 20), 3)
     else:
@@ -204,7 +204,7 @@ def test_load_games_reports_profiles_and_loss(tmp_path):
     write_rows(p, [row('D_1', 'p1', 0, loss=None, n_profiles=3), row('D_2', 'p1', 0, loss=None, n_profiles=3)])
     d = fh.load_games(str(p))
     assert d['x'].shape == (2, 4) and d['n_profiles'] == 3 and not d['has_loss']
-    assert fh.feature_sets(d['n_profiles'], d['has_loss']) == {'A': [0, 1, 2, 3]}
+    assert fh.feature_sets(d['n_profiles'], d['has_loss']) == {'base': [0, 1, 2, 3]}
 
 
 def test_load_games_rejects_mixed_rows(tmp_path):
@@ -233,16 +233,16 @@ def test_load_games_reads_profile_names(tmp_path):
 
 def test_feature_sets_three_profiles_with_loss():
     sets = fh.feature_sets(3, True)
-    assert sets['A'] == [0, 1, 2, 3]
-    assert sets['B50'] == list(range(10)) and sets['B100'] == [0, 1, 2, 3] + list(range(10, 16))
+    assert sets['base'] == [0, 1, 2, 3]
+    assert sets['loss50'] == list(range(10)) and sets['loss100'] == [0, 1, 2, 3] + list(range(10, 16))
 
 
 def test_evaluate_grid_only_one_config():
     d = make_data()
     splits = fh.make_splits(d, (5, 20), 1, folds=3)
-    results = fh.evaluate_grid(d, splits, (5, 20), 1, 42, only='avg A C=1')
-    assert [r[0] for r in results] == ['avg A C=1']
-    with pytest.raises(ValueError, match='avg A C=0.1'):
+    results = fh.evaluate_grid(d, splits, (5, 20), 1, 42, only='avg base C=1')
+    assert [r[0] for r in results] == ['avg base C=1']
+    with pytest.raises(ValueError, match='avg base C=0.1'):
         fh.evaluate_grid(d, splits, (5, 20), 1, 42, only='nope')
 
 

@@ -1,9 +1,9 @@
 """非線性第二層與題內分布特徵，以及加 train 池的兩段式第二層。
 
-出題、切折、訓練題沿用 aicup.stack_humansl，所有臂在同一批測試題上比較。
+出題、切折、訓練題沿用 aicup.stack_humansl，所有方案在同一批測試題上比較。
 每題特徵只用該題自己的局計算，不使用任何標籤。特徵群：
     cnn      CNN 合併後的 10 個 log 機率，同 stack_humansl
-    hsl      Human SL 特徵組 A 的題內平均，同 stack_humansl
+    hsl      Human SL 基本特徵組 base 的題內平均，同 stack_humansl
     dist     每個 profile 逐手 log 機率的 10、25、50、75、90 分位數與 log 機率 < log(0.01) 的比例，題內 nanmean
     stats    每個 profile 的 move_rank == 0 比例、log(1 + move_rank) 平均，加 rank_1d 的 pmax、entropy 平均，題內 nanmean
     hslo、disto、statso  同上，評的是對手的手
@@ -12,16 +12,16 @@
 每局指標：s 是目標側逐手 log P(rank_6d) - log P(rank_11k) 的平均，r 是目標側 rank_6d 的 log(1 + move_rank) 平均，
 d 是同一局目標側的 s 減對手側的 s。
 
-臂：
-    A           cnn+hsl+hslo 的 logistic regression，用 --jsonl、--opp
-    A_hist      同 A，改用 --hist-jsonl、--hist-opp
-    K           全部特徵群的 HistGradientBoostingClassifier，用 history 版
-    K_LR        同樣特徵，第二層用 A 的 LR 與 C 選法，NaN 用訓練題的欄平均填補
-    K_nodist    K 去掉 dist、stats、disto、statso
-    K_nowithin  K 去掉 within
-    L、L_s1     兩段式：第一段是 K 去掉 cnn（--stage1 lr 時只用 hsl+hslo 的 LR），擬合玩家是 train 池加外層訓練玩家；
-                第二段是 cnn 加第一段 out-of-fold 的 log 機率的 LR。L_s1 是第一段在測試題的輸出直接選等級
-    L0、L0_s1   train 池為空的 L、L_s1
+方案：
+    lr_base       cnn+hsl+hslo 的 logistic regression，用 --jsonl、--opp
+    lr_hist       同 lr_base，改用 --hist-jsonl、--hist-opp
+    hgb_all       全部特徵群的 HistGradientBoostingClassifier，用 history 版
+    hgb_all_lr    同樣特徵，第二層用 lr_base 的 LR 與 C 選法，NaN 用訓練題的欄平均填補
+    hgb_nodist    hgb_all 去掉 dist、stats、disto、statso
+    hgb_nowithin  hgb_all 去掉 within
+    pool、pool_s1  兩段式：第一段是 hgb_all 去掉 cnn（--stage1 lr 時只用 hsl+hslo 的 LR），擬合玩家是 train 池加外層訓練玩家；
+                  第二段是 cnn 加第一段 out-of-fold 的 log 機率的 LR。pool_s1 是第一段在測試題的輸出直接選等級
+    nopool、nopool_s1  train 池為空的 pool、pool_s1
 HGB 的 max_depth 與 max_iter 在外層訓練玩家內依玩家切折選，max_iter 的候選用同一個模型的前幾輪預測。
 
 run 的 .npz 欄位：
@@ -29,13 +29,13 @@ run 的 .npz 欄位：
     keys         每題的局 key，以逗號連接
     rank_idx     每題的等級
     n_games      每題局數
-    score_<臂>   各臂的逐題分數
-    params       各臂各折選到的超參數，JSON 字串
+    score_<方案>   各方案的逐題分數
+    params       各方案各折選到的超參數，JSON 字串
 
 用法（在 repo 根目錄）：
-    python -m aicup.stack_hgb run --jsonl humansl-analysis/val-v180000-dev-p3.jsonl --opp humansl-analysis/val-v180000-dev-p3-opp.jsonl --hist-jsonl humansl-analysis/val-v180000-dev-p3-hist.jsonl --hist-opp humansl-analysis/val-v180000-dev-p3-opp-hist.jsonl --cnn-probs rank-trained-models/59844b9/val_probs_dev.npz --eval-players humansl-analysis/val-players.csv --seed 42 --out Note/ref/r13/k-s42.npz
-    python -m aicup.stack_hgb run ... --arms A,L,L_s1,L0 --pool-jsonl <train 池目標側> --pool-opp <train 池對手側> --exclude-players humansl-analysis/holdout-v180000.csv --out Note/ref/r13/l-s42.npz
-    python -m aicup.stack_hgb compare --files "Note/ref/r13/k-s{seed}.npz" --main K --base A
+    python -m aicup.stack_hgb run --jsonl humansl-analysis/val-v180000-dev-p3.jsonl --opp humansl-analysis/val-v180000-dev-p3-opp.jsonl --hist-jsonl humansl-analysis/val-v180000-dev-p3-hist.jsonl --hist-opp humansl-analysis/val-v180000-dev-p3-opp-hist.jsonl --cnn-probs rank-trained-models/59844b9/val_probs_dev.npz --eval-players humansl-analysis/val-players.csv --seed 42 --out runs/hgb-s42.npz
+    python -m aicup.stack_hgb run ... --arms lr_base,pool,pool_s1,nopool --pool-jsonl <train 池目標側> --pool-opp <train 池對手側> --exclude-players humansl-analysis/holdout-v180000.csv --out runs/pool-s42.npz
+    python -m aicup.stack_hgb compare --files "runs/hgb-s{seed}.npz" --main hgb_all --base lr_base
 """
 import argparse
 import csv
@@ -72,16 +72,16 @@ for _g in ('hsl', 'dist', 'stats'):
     GROUP_WIDTH[_g + 'o'] = GROUP_WIDTH[_g]
 DIST_GROUPS = ('dist', 'stats', 'disto', 'statso')
 K_GROUPS = GROUP_ORDER
-ARM_GROUPS = {'K': K_GROUPS, 'K_LR': K_GROUPS,
-              'K_nodist': tuple(g for g in K_GROUPS if g not in DIST_GROUPS),
-              'K_nowithin': tuple(g for g in K_GROUPS if g != 'within')}
+ARM_GROUPS = {'hgb_all': K_GROUPS, 'hgb_all_lr': K_GROUPS,
+              'hgb_nodist': tuple(g for g in K_GROUPS if g not in DIST_GROUPS),
+              'hgb_nowithin': tuple(g for g in K_GROUPS if g != 'within')}
 STAGE1_GROUPS = {'hgb': tuple(g for g in K_GROUPS if g != 'cnn'), 'lr': ('hsl', 'hslo')}
-LR_ARMS = ('A', 'A_hist')
-HGB_ARMS = ('K', 'K_nodist', 'K_nowithin')
-POOL_ARMS = ('L', 'L_s1')
-EMPTY_POOL_ARMS = ('L0', 'L0_s1')
-ALL_ARMS = LR_ARMS + HGB_ARMS + ('K_LR',) + POOL_ARMS + EMPTY_POOL_ARMS
-DEFAULT_ARMS = ('A', 'A_hist', 'K', 'K_LR', 'K_nodist', 'K_nowithin')
+LR_ARMS = ('lr_base', 'lr_hist')
+HGB_ARMS = ('hgb_all', 'hgb_nodist', 'hgb_nowithin')
+POOL_ARMS = ('pool', 'pool_s1')
+EMPTY_POOL_ARMS = ('nopool', 'nopool_s1')
+ALL_ARMS = LR_ARMS + HGB_ARMS + ('hgb_all_lr',) + POOL_ARMS + EMPTY_POOL_ARMS
+DEFAULT_ARMS = ('lr_base', 'lr_hist', 'hgb_all', 'hgb_all_lr', 'hgb_nodist', 'hgb_nowithin')
 
 
 def _nanmean(x, axis=None):
@@ -327,18 +327,18 @@ def same_games(a, b):
 
 def evaluate(old, hist, cnn, splits, arms, seed, sizes=SIZES, train_repeats=10, temp=3.0, cs=CS, inner_folds=5,
              pool=None, stage1='hgb', log=print):
-    """在 splits 的測試題上跑各臂，回傳 ({臂: 依 splits 順序合併的預測等級}, {臂: 各折的超參數})。
+    """在 splits 的測試題上跑各方案，回傳 ({方案: 依 splits 順序合併的預測等級}, {方案: 各折的超參數})。
 
     old、hist 是 (data, games)，局與順序要相同；cnn 是每局 CNN 機率；pool 是 train 池的 (data, games) 或 None。
     訓練題用 train_rng(seed, 折)，和 stack_humansl 相同；train 池的題用 rng [seed, POOL_RNG]，每折相同。
     """
     unknown = sorted(set(arms) - set(ALL_ARMS))
     if unknown:
-        raise ValueError('未知的臂：%s' % ', '.join(unknown))
+        raise ValueError('未知的方案：%s' % ', '.join(unknown))
     if not same_games(old[0], hist[0]):
         raise ValueError('舊版與 history 版 jsonl 的局或順序不同')
     if any(a in POOL_ARMS for a in arms) and pool is None:
-        raise ValueError('L、L_s1 需要 train 池')
+        raise ValueError('pool、pool_s1 需要 train 池')
     data_old, games_old = old
     data, games = hist
     two_stage_kinds = [p for p in (POOL_ARMS, EMPTY_POOL_ARMS) if set(p) & set(arms)]
@@ -353,7 +353,7 @@ def evaluate(old, hist, cnn, splits, arms, seed, sizes=SIZES, train_repeats=10, 
     x_old = np.hstack([games_old['hsl'], games_old['hslo']])
     x_hist = np.hstack([games['hsl'], games['hslo']])
     for f, (train, q, _, _) in enumerate(splits):
-        for arm, d, x in (('A', data_old, x_old), ('A_hist', data, x_hist)):
+        for arm, d, x in (('lr_base', data_old, x_old), ('lr_hist', data, x_hist)):
             if arm in arms:
                 p, c = predict_inputs(x, cnn, d, train, q, train_rng(seed, f), sizes, train_repeats, temp, cs=cs,
                                       inner_folds=inner_folds)
@@ -370,11 +370,11 @@ def evaluate(old, hist, cnn, splits, arms, seed, sizes=SIZES, train_repeats=10, 
                 model, best = fit_hgb(f_tr, tr_y, tr_g, seed, inner_folds)
                 preds[arm].append(pick_level(level_probs(model, f_te)))
                 params[arm].append(list(best))
-        if 'K_LR' in arms:
-            f_tr, f_te = fill_nan(stack_groups(m_tr, ARM_GROUPS['K_LR']), stack_groups(m_te, ARM_GROUPS['K_LR']))
+        if 'hgb_all_lr' in arms:
+            f_tr, f_te = fill_nan(stack_groups(m_tr, ARM_GROUPS['hgb_all_lr']), stack_groups(m_te, ARM_GROUPS['hgb_all_lr']))
             c = select_c(f_tr, tr_y, tr_g, cs, inner_folds)
-            preds['K_LR'].append(pick_level(level_probs(new_model(c).fit(f_tr, tr_y), f_te)))
-            params['K_LR'].append(c)
+            preds['hgb_all_lr'].append(pick_level(level_probs(new_model(c).fit(f_tr, tr_y), f_te)))
+            params['hgb_all_lr'].append(c)
         for arm_pair in two_stage_kinds:
             p2, p1, info = two_stage(stage1, (stack_groups(m_tr, STAGE1_GROUPS[stage1]), tr_y, tr_g),
                                      stack_groups(m_te, STAGE1_GROUPS[stage1]),
@@ -398,11 +398,11 @@ def player_vector(score, players, keys):
 
 
 def summarize(scores, players, n_games, base, seed):
-    """印出各臂的不加權、每級等權分數與減 base 的差，以及依每題局數分開的差。"""
+    """印出各方案的不加權、每級等權分數與減 base 的差，以及依每題局數分開的差。"""
     keys = sorted(set(players))
     levels = np.array([int(k.split('|')[0]) for k in keys])
     vec = {a: player_vector(s, players, keys) for a, s in scores.items()}
-    print('| 臂 | 不加權 | 95%% 區間 | 每級等權 | 減 %s | 95%% 區間 | 每級等權差 |' % base)
+    print('| 方案 | 不加權 | 95%% 區間 | 每級等權 | 減 %s | 95%% 區間 | 每級等權差 |' % base)
     print('|---|---|---|---|---|---|---|')
     for a, v in vec.items():
         mean, lo, hi = bootstrap_mean(v, seed=seed)
@@ -411,7 +411,7 @@ def summarize(scores, players, n_games, base, seed):
               % (a, mean, lo, hi, level_weighted(v, levels), d, dlo, dhi, level_weighted(v - vec[base], levels)))
     sizes = sorted(set(n_games.tolist()))
     print('\n依每題局數，減 %s（逐題平均）\n' % base)
-    print('| 臂 | %s |' % ' | '.join('%d 局' % n for n in sizes))
+    print('| 方案 | %s |' % ' | '.join('%d 局' % n for n in sizes))
     print('|' + '---|' * (1 + len(sizes)))
     for a, s in scores.items():
         print('| %s | %s |' % (a, ' | '.join('%+.4f' % (s[n_games == n] - scores[base][n_games == n]).mean()
@@ -457,7 +457,7 @@ def cmd_run(args):
 def load_seed_scores(paths):
     """讀同一個 seed 的多個 run 輸出並合併 score 欄位，assert 逐題 keys 與玩家相同。
 
-    回傳 ({臂: 逐題分數}, player_id, n_games)；同一個臂出現在多個檔案時分數要相同。
+    回傳 ({方案: 逐題分數}, player_id, n_games)；同一個方案出現在多個檔案時分數要相同。
     """
     scores, ref = {}, None
     for path in paths:
@@ -523,16 +523,16 @@ def cmd_compare(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     sub = ap.add_subparsers(dest='cmd', required=True)
-    run = sub.add_parser('run', help='跑一個 seed 的各臂，寫出逐題分數')
-    run.add_argument('--jsonl', required=True, help='A 用的目標側 jsonl')
-    run.add_argument('--opp', required=True, help='A 用的對手側 jsonl')
-    run.add_argument('--hist-jsonl', required=True, help='K、L 與 A_hist 用的目標側 history 版 jsonl，局與順序同 --jsonl')
-    run.add_argument('--hist-opp', required=True, help='K、L 與 A_hist 用的對手側 history 版 jsonl')
+    run = sub.add_parser('run', help='跑一個 seed 的各方案，寫出逐題分數')
+    run.add_argument('--jsonl', required=True, help='lr_base 用的目標側 jsonl')
+    run.add_argument('--opp', required=True, help='lr_base 用的對手側 jsonl')
+    run.add_argument('--hist-jsonl', required=True, help='hgb_all、pool 與 lr_hist 用的目標側 history 版 jsonl，局與順序同 --jsonl')
+    run.add_argument('--hist-opp', required=True, help='hgb_all、pool 與 lr_hist 用的對手側 history 版 jsonl')
     run.add_argument('--cnn-probs', required=True, help='CNN 的 val_probs.npz')
     run.add_argument('--eval-players', help='含 player_id、rank 欄位的 CSV，只有這些玩家出測試題')
     run.add_argument('--arms', default=','.join(DEFAULT_ARMS),
                      help='逗號分隔，第一個是印出時的基準，可用 %s' % ', '.join(ALL_ARMS))
-    run.add_argument('--pool-jsonl', help='train 池的目標側 history 版 jsonl，L、L_s1 需要')
+    run.add_argument('--pool-jsonl', help='train 池的目標側 history 版 jsonl，pool、pool_s1 需要')
     run.add_argument('--pool-opp', help='train 池的對手側 history 版 jsonl')
     run.add_argument('--exclude-players', nargs='*', default=[],
                      help='含 player_id 欄位的 CSV，train 池的玩家不能出現在其中')
@@ -548,9 +548,9 @@ def main():
     cmp_ = sub.add_parser('compare', help='多個 seed 合併的配對比較')
     cmp_.add_argument('--files', nargs='+', required=True, help='run 的輸出，路徑中的 {seed} 會代入各 seed')
     cmp_.add_argument('--seeds', default='42,43,44,45,46')
-    cmp_.add_argument('--main', required=True, help='主要比較的左臂')
-    cmp_.add_argument('--base', required=True, help='主要比較的右臂')
-    cmp_.add_argument('--refs', default='', help='逗號分隔的參考比較，例如 K_LR-A,A_hist-A')
+    cmp_.add_argument('--main', required=True, help='主要比較的左方案')
+    cmp_.add_argument('--base', required=True, help='主要比較的右方案')
+    cmp_.add_argument('--refs', default='', help='逗號分隔的參考比較，例如 hgb_all_lr-lr_base,lr_hist-lr_base')
     args = ap.parse_args()
     if args.cmd == 'run':
         if bool(args.pool_jsonl) != bool(args.pool_opp):

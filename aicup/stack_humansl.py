@@ -1,4 +1,4 @@
-"""CNN 與 Human SL 的 stacking：每題的 CNN log 機率加 Human SL 特徵組 A，用 logistic regression 輸出 10 類機率。
+"""CNN 與 Human SL 的 stacking：每題的 CNN log 機率加 Human SL 基本特徵組 base，用 logistic regression 輸出 10 類機率。
 
 只用 CNN 沒訓練過的 val 玩家擬合。出題方式與依玩家的 5 折沿用 fit_humansl，
 CNN 單獨、Human SL 單獨、stacking 在同一批題目上比較，差用以玩家重抽的配對 bootstrap。
@@ -6,12 +6,12 @@ CNN 單獨、Human SL 單獨、stacking 在同一批題目上比較，差用以�
 
 --combos 給定時改為比較多種特徵組合，組合由特徵塊以 + 連接：
     cnn     CNN 合併後的 10 個 log 機率
-    hsl     Human SL 特徵組 A
+    hsl     Human SL 基本特徵組 base
     se1、se4、se8  SE∞ 前 1、4、8 種對稱的 score 平均與標準差（--se 給定時才有，檔案的對稱數要足夠）
     sl      SL 11 級平均機率的 log（--se 給定時才有）
     hd      讓子或讓先局的方向：目標玩家執黑（被讓、對手較強）為 +1，執白為 -1，HD 0 為 0（--se 給定時才有）
     se1o、se4o、se8o、slo  同上，評的是對手的手（--se-opp 給定時才有）
-    hslo    Human SL 特徵組 A，評的是對手的手（--hsl-opp 給定時才有）
+    hslo    Human SL 基本特徵組 base，評的是對手的手（--hsl-opp 給定時才有）
     pm      逐手模型 10 個等級的平均 log 機率，評的是目標玩家的手（--pm 給定時才有）
     pmo     同上，評的是對手的手（--pm 的每局都有對手側時才有）
 --prior 決定是否去掉訓練題的等級先驗：keep 不處理，balanced 用 class_weight，divide 把機率除以訓練題的等級比例。
@@ -40,7 +40,7 @@ from aicup.fit_humansl import (CS, bootstrap_mean, feature_sets, level_probs, lo
 from aicup.scoring import LEVELS, aggregate_games, apply_temperature, pick_level
 
 EPS = 1e-12  # log 前的下限，與 scoring.aggregate_games 一致
-HSL_C = 0.1  # Human SL 單獨比較用的固定組合 (avg A, C=0.1)
+HSL_C = 0.1  # Human SL 單獨比較用的固定組合 (avg base, C=0.1)
 SE_SYMMETRIES = (1, 4, 8)
 PRIORS = ('keep', 'balanced', 'divide')
 
@@ -103,7 +103,7 @@ def load_se_blocks(path, keys, rank_idx, side='target'):
 
 
 def load_hsl_opp(path, data, allow_missing=False):
-    """analyze_humansl --side opponent 的 jsonl 依 data['key'] 對齊，回傳特徵組 A 的欄位 (len(keys), D)。
+    """analyze_humansl --side opponent 的 jsonl 依 data['key'] 對齊，回傳基本特徵組 base 的欄位 (len(keys), D)。
 
     profiles 與是否有損失欄位要和 data 相同。等級不一致或 side 不是 opponent 時丟 ValueError。
     有 key 不在檔案內時，allow_missing 為 False 丟 ValueError，為 True 則該列填 NaN。
@@ -229,8 +229,8 @@ def question_features(x, cnn_probs, questions, temp, q_fn=None):
 
 
 def hsl_columns(data):
-    """Human SL 特徵組 A 在 data['x'] 的欄位。"""
-    return feature_sets(data['n_profiles'], data['has_loss'])['A']
+    """Human SL 基本特徵組 base 在 data['x'] 的欄位。"""
+    return feature_sets(data['n_profiles'], data['has_loss'])['base']
 
 
 def parse_combo(combo, available):
@@ -304,7 +304,7 @@ def predict_inputs(x, cnn_probs, data, train, questions, rng, sizes, train_repea
 
 def predict_stack(data, cnn_probs, train, questions, rng, sizes, train_repeats, temp, cs=CS, inner_folds=5,
                   use_hsl=True):
-    """CNN 加 Human SL 特徵組 A 的 stacking，參數見 predict_inputs。
+    """CNN 加 Human SL 基本特徵組 base 的 stacking，參數見 predict_inputs。
 
     use_hsl 為 False 時只用 CNN 特徵，用來分開「在 val 上重新擬合」與「加入 Human SL」的貢獻。
     """
@@ -419,7 +419,7 @@ def main():
         hsl.append(predict_avg(data, hsl_cols, HSL_C, train, q, train_rng(args.seed, f), args.sizes,
                                args.train_repeats))
     probs = {'stacking': np.concatenate(stack), 'CNN 重新擬合': np.concatenate(refit),
-             'Human SL avg A C=%g' % HSL_C: np.concatenate(hsl),
+             'Human SL avg base C=%g' % HSL_C: np.concatenate(hsl),
              'CNN': cnn_question_probs(cnn, questions, args.cnn_temp)}
     print('各折選到的 C（stacking / CNN 重新擬合）：%s' % ', '.join('%g/%g' % c for c in chosen))
     means = {}

@@ -178,18 +178,18 @@ def run_combos_preds(monkeypatch, target, opp, cnn, splits, seed, sizes, train_r
     return calls[-1]
 
 
-def test_arm_a_matches_stack_humansl(tmp_path, monkeypatch, capsys):
+def test_lr_base_matches_stack_humansl(tmp_path, monkeypatch, capsys):
     target, opp = toy_files(tmp_path, n_players=60)
     old = sh.load_game_features(target, opp)
     data = old[0]
     cnn = toy_cnn(data)
     eval_players = set(player_keys(data)[:50 * 20:20])  # 其餘 10 位只當訓練
     splits = make_eval_splits(data, (5, 10), 2, eval_players, seed=7)
-    preds, _ = sh.evaluate(old, old, cnn, splits, ('A',), 7, sizes=(5, 10), train_repeats=2, cs=(0.1, 1.0),
+    preds, _ = sh.evaluate(old, old, cnn, splits, ('lr_base',), 7, sizes=(5, 10), train_repeats=2, cs=(0.1, 1.0),
                            inner_folds=3, log=lambda *_: None)
     ref = run_combos_preds(monkeypatch, target, opp, cnn, splits, 7, (5, 10), 2, (0.1, 1.0), 3)
-    assert len(ref) == len(preds['A'])
-    assert np.array_equal(preds['A'], ref)
+    assert len(ref) == len(preds['lr_base'])
+    assert np.array_equal(preds['lr_base'], ref)
 
 
 def test_evaluate_runs_all_arms(tmp_path, fast_hgb):
@@ -212,7 +212,7 @@ def test_evaluate_rejects_mismatched_order(tmp_path):
     order = np.random.default_rng(0).permutation(len(dev[0]['key']))
     other = ({k: (v[order] if isinstance(v, np.ndarray) else v) for k, v in dev[0].items()}, dev[1])
     with pytest.raises(ValueError, match='順序'):
-        sh.evaluate(dev, other, toy_cnn(dev[0]), [], ('A',), 0)
+        sh.evaluate(dev, other, toy_cnn(dev[0]), [], ('lr_base',), 0)
 
 
 def toy_stage_inputs(n_players=30, per_player=4, seed=0, prefix='p'):
@@ -251,7 +251,7 @@ def test_evaluate_rejects_pool_overlapping_dev(tmp_path):
     dev = sh.load_game_features(*toy_files(tmp_path))
     splits = make_eval_splits(dev[0], (5,), 1, None, seed=0)
     with pytest.raises(ValueError, match='player_id'):
-        sh.evaluate(dev, dev, toy_cnn(dev[0]), splits, ('L',), 0, sizes=(5,), pool=dev, log=lambda *_: None)
+        sh.evaluate(dev, dev, toy_cnn(dev[0]), splits, ('pool',), 0, sizes=(5,), pool=dev, log=lambda *_: None)
 
 
 def test_check_disjoint():
@@ -289,18 +289,18 @@ def test_run_and_compare_cli(tmp_path, monkeypatch, capsys):
     for seed in (1, 2):
         monkeypatch.setattr('sys.argv', ['stack_hgb', 'run', '--jsonl', target, '--opp', opp, '--hist-jsonl', target,
                                          '--hist-opp', opp, '--cnn-probs', str(tmp_path / 'cnn.npz'),
-                                         '--arms', 'A,A_hist,K_LR', '--sizes', '5,10', '--train-repeats', '1',
+                                         '--arms', 'lr_base,lr_hist,hgb_all_lr', '--sizes', '5,10', '--train-repeats', '1',
                                          '--test-repeats', '1', '--inner-folds', '2', '--cs', '1',
                                          '--seed', str(seed), '--out', str(tmp_path / ('r-s%d.npz' % seed))])
         sh.main()
     z = np.load(tmp_path / 'r-s1.npz')
-    assert np.array_equal(z['score_A'], z['score_A_hist'])  # 兩組 jsonl 相同
-    assert set(json.loads(str(z['params']))) == {'A', 'A_hist', 'K_LR'}
+    assert np.array_equal(z['score_lr_base'], z['score_lr_hist'])  # 兩組 jsonl 相同
+    assert set(json.loads(str(z['params']))) == {'lr_base', 'lr_hist', 'hgb_all_lr'}
     monkeypatch.setattr('sys.argv', ['stack_hgb', 'compare', '--files', str(tmp_path / 'r-s{seed}.npz'),
-                                     '--seeds', '1,2', '--main', 'K_LR', '--base', 'A', '--refs', 'A_hist-A'])
+                                     '--seeds', '1,2', '--main', 'hgb_all_lr', '--base', 'lr_base', '--refs', 'lr_hist-lr_base'])
     sh.main()
     out = capsys.readouterr().out
-    assert '判定：' in out and 'A_hist 減 A' in out
+    assert '判定：' in out and 'lr_hist 減 lr_base' in out
 
 
 def test_load_game_features_d_is_target_minus_opponent(tmp_path):

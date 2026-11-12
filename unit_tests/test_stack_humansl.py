@@ -140,7 +140,7 @@ def test_main_runs_end_to_end_on_toy_data(tmp_path, monkeypatch, capsys):
                                       '--train-repeats', '2', '--test-repeats', '2', '--inner-folds', '3'])
     sh.main()
     out = capsys.readouterr().out
-    for name in ('stacking', 'CNN 重新擬合', 'Human SL avg A C=0.1', 'CNN', 'stacking - CNN', '暫定門檻'):
+    for name in ('stacking', 'CNN 重新擬合', 'Human SL avg base C=0.1', 'CNN', 'stacking - CNN', '暫定門檻'):
         assert name in out
     # 門檻判定要和印出的區間下限一致
     lo = float(re.search(r'stacking - CNN：\S+，95% 區間 (\S+)～', out).group(1))

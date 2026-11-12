@@ -4,8 +4,8 @@
     val jsonl 的全部玩家都用來擬合，出題方式同 eval_posthoc，C 依玩家切內層折選，擬合函式同 stack_humansl。
     val_probs.npz 要和 val jsonl 出自同一個 CNN 沒訓練過的 val 玩家。
 預測：
-    每題的特徵是 CNN 各局機率以溫度縮放、log 合併後的 log 機率，接各局 Human SL 特徵組 A 的平均。
-    給定 --val-hsl-opp 與 --test-hsl-opp 時再接對手側的特徵組 A 平均，同 stack_humansl 的 cnn+hsl+hslo。
+    每題的特徵是 CNN 各局機率以溫度縮放、log 合併後的 log 機率，接各局 Human SL 基本特徵組 base 的平均。
+    給定 --val-hsl-opp 與 --test-hsl-opp 時再接對手側的基本特徵組 base 平均，同 stack_humansl 的 cnn+hsl+hslo。
     CNN 各局機率讀 predict_rank 的快取，Human SL 讀 analyze_humansl --test-dir 的輸出。
     缺 Human SL 結果（含對手側）或 CNN 機率為 NaN 的局不參與合併；整題都無效時回傳最弱等級，同 predict_rank。
 
@@ -35,7 +35,7 @@ from aicup.stack_humansl import (fit_model, hsl_columns, load_cnn_probs, load_hs
 def fit_stack(data, cnn_probs, sizes, train_repeats, temp, seed, inner_folds=5, prior='keep', x=None):
     """用 data 的全部玩家出題並擬合，回傳 (model, 選到的 C)。
 
-    x 是各局特徵，預設為 data 的 Human SL 特徵組 A。
+    x 是各局特徵，預設為 data 的 Human SL 基本特徵組 base。
     prior 為 balanced 時用 class_weight 去掉 val 玩家的等級先驗，同 stack_humansl 的 --prior balanced。
     """
     rng = np.random.default_rng(seed)
@@ -59,7 +59,7 @@ def check_profiles(fit_data, test_data):
 def align_test(test_data, keys, game_probs, x=None):
     """回傳 (各局特徵, 每局是否可用)，特徵依 keys 排列。
 
-    x 是依 test_data['key'] 排列的各局特徵，預設為 Human SL 特徵組 A。
+    x 是依 test_data['key'] 排列的各局特徵，預設為 Human SL 基本特徵組 base。
     缺 Human SL 結果、特徵有 NaN 或 CNN 機率有 NaN 的局不可用，特徵列填 NaN。
     """
     index = {k: i for i, k in enumerate(test_data['key'])}

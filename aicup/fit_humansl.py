@@ -1,14 +1,14 @@
 """校正 Human SL 分類器：用 analyze_humansl 的 jsonl 訓練 logistic regression，依玩家交叉驗證。
 
 每局特徵是各 profile 的每手平均 log 機率、手數與前 N 手的損失統計，一題的特徵是各局特徵的算術平均。
-profile 數從 jsonl 推得；沒有損失欄位（analyze_humansl 不跑損失 query）時只有特徵組 A。
+profile 數從 jsonl 推得；沒有損失欄位（analyze_humansl 不跑損失 query）時只有基本特徵組 base。
 訓練與驗證都用模擬題，出題方式與 eval_posthoc 相同，同一位玩家不跨折。
 方式 avg 先平均特徵再分類，方式 game 逐局分類後 log 合併。
 
 用法（在 repo 根目錄）：
     python -m aicup.fit_humansl humansl-analysis/pilot-6000-hd.jsonl
     python -m aicup.fit_humansl pilot-6000-hd.jsonl --cnn-probs rank-trained-models/<commit hash>/val_probs.npz
-    python -m aicup.fit_humansl pilot-6000-hd.jsonl --config "avg A C=0.1" --cnn-probs ...   # 固定組合，避免選擇偏差
+    python -m aicup.fit_humansl pilot-6000-hd.jsonl --config "avg base C=0.1" --cnn-probs ...   # 固定組合，避免選擇偏差
 """
 import argparse
 import itertools
@@ -70,15 +70,15 @@ def load_games(path, cuts=CUTS):
 
 
 def feature_sets(n_profiles=10, has_loss=True, cuts=CUTS):
-    """特徵組名稱對應欄位 index：A 不含損失，有損失欄位時 B<cut> 加上該 cut 的損失統計。"""
+    """特徵組名稱對應欄位 index：base 是各 profile 每手平均 log 機率與 log 手數，有損失欄位時 loss<cut> 是 base 加上該 cut 的損失統計。"""
     n_base = n_profiles + 1  # 各 profile 加手數
     base = list(range(n_base))
-    sets = {'A': base}
+    sets = {'base': base}
     if not has_loss:
         return sets
     for i, cut in enumerate(cuts):
         start = n_base + i * N_STATS
-        sets['B%d' % cut] = base + list(range(start, start + N_STATS))
+        sets['loss%d' % cut] = base + list(range(start, start + N_STATS))
     return sets
 
 
@@ -252,7 +252,7 @@ def main():
     ap.add_argument('--top', type=int, default=12, help='印出前幾個組合')
     ap.add_argument('--cnn-probs', help='CNN 的 val_probs.npz，用來在同一批題目上比較')
     ap.add_argument('--cnn-temp', type=float, default=3.0, help='CNN 每局機率的溫度，預設同 predict_rank')
-    ap.add_argument('--config', help='只跑這個組合，例如 "avg A C=0.1"；和 CNN 比較時用來避免選擇偏差')
+    ap.add_argument('--config', help='只跑這個組合，例如 "avg base C=0.1"；和 CNN 比較時用來避免選擇偏差')
     args = ap.parse_args()
 
     data = load_games(args.jsonl)
