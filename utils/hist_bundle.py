@@ -35,6 +35,7 @@ RUNS = {
     'test': dict(base='test', test=True, n=10000),
     'train_p1': dict(base='train-p1', players='train-p1-v180000.csv', n=20000),
     'train_p2': dict(base='train-p2', players='train-p2-v180000.csv', n=20000),
+    'train_p3': dict(base='train-p3', players='train-p3-v180000.csv', n=20000),
     'holdout': dict(base='holdout', players='holdout-v180000.csv', sample=NEW498, n=3200),
 }
 for _name in list(RUNS):
@@ -146,9 +147,11 @@ def make_notebook(run, cfg, move_stats):
              "os.makedirs('/kaggle/working/hist', exist_ok=True)\n"
              "# 自動偵測 Kaggle Dataset 路徑（支援掛載的 Dataset 或直接上傳）\n"
              "dataset_candidates = [\n"
-             "    f'/kaggle/input/{RUN}-dataset',\n"
              "    f'/kaggle/input/{RUN}',\n"
-             "] + glob.glob(f'/kaggle/input/**/{RUN}*', recursive=True)\n"
+             "    f'/kaggle/input/{RUN.replace(\"_\", \"-\")}',\n"
+             "    f'/kaggle/input/{RUN}-dataset',\n"
+             "    f'/kaggle/input/{RUN.replace(\"_\", \"-\")}-dataset',\n"
+             "] + glob.glob(f'/kaggle/input/**/{RUN}*', recursive=True) + glob.glob(f'/kaggle/input/**/{RUN.replace(\"_\", \"-\")}*', recursive=True)\n"
              "DATASET_DIR = None\n"
              "for d in dataset_candidates:\n"
              "    if os.path.exists(d):\n"
@@ -176,18 +179,27 @@ def make_notebook(run, cfg, move_stats):
              "if os.path.exists(LOCAL):\n"
              "    !wc -l {LOCAL}" % (run, total, out)),
         
-        md('### 2. 下載 KataGo 引擎與雙模型權重（一般主模型 + Human SL 模型）'),
+        md('### 2. 設定 KataGo 引擎與雙模型權重'),
         code('%%bash\n'
-             'mkdir -p /kaggle/working/models /kaggle/working/katago\n'
+             'mkdir -p /kaggle/working/katago /kaggle/working/models\n\n'
+             '# 1. 解開 AppImage 並綁定 CUDA 啟動腳本\n'
              'cd /kaggle/working/katago\n'
-             'ZIP=katago-v1.18.2-cuda12.8-cudnn9.8.0-linux-x64.zip\n'
-             '[ -f katago ] || { wget -q https://github.com/lightvector/KataGo/releases/download/v1.18.2/$ZIP && unzip -qjo $ZIP; }\n'
+             'KATAGO_SRC=$(find /kaggle/input -name "katago" -type f | head -n 1)\n'
+             '[ -d squashfs-root ] || "$KATAGO_SRC" --appimage-extract > /dev/null 2>&1\n'
+             'CUDA_PATHS=$(python3 -c "import glob; print(\':\'.join(glob.glob(\'/usr/local/cuda*/lib64\') + glob.glob(\'/usr/local/lib/python3*/dist-packages/nvidia/*/lib\') + [\'/kaggle/working/katago/squashfs-root/usr/lib\']))")\n'
+             'cat << EOF > katago\n'
+             '#!/bin/bash\n'
+             'export LD_LIBRARY_PATH=$CUDA_PATHS:\\$LD_LIBRARY_PATH\n'
+             'exec /kaggle/working/katago/squashfs-root/usr/bin/katago "\\$@"\n'
+             'EOF\n'
              'chmod +x katago\n'
-             '[ -f /kaggle/working/models/b18c384nbt-humanv0.bin.gz ] || wget -q -O /kaggle/working/models/b18c384nbt-humanv0.bin.gz '
-             'https://github.com/lightvector/KataGo/releases/download/v1.15.0/b18c384nbt-humanv0.bin.gz\n'
-             '[ -f /kaggle/working/models/kata1-b28c512nbt-s13255194368-d5935380940.bin.gz ] || wget -q -O /kaggle/working/models/kata1-b28c512nbt-s13255194368-d5935380940.bin.gz '
-             'https://media.katagotraining.org/uploaded/networks/models/kata1/kata1-b28c512nbt-s13255194368-d5935380940.bin.gz\n'
-             'ls -lh /kaggle/working/models /kaggle/working/katago/katago analysis_example.cfg'),
+             'echo -e "logDir = gtp_logs\\n" > analysis_example.cfg\n\n'
+             '# 2. 封裝兩大模型為 KataGo 規格的 .bin.gz\n'
+             'gzip -c "$(find /kaggle/input -type f -path "*kata1*" | head -n 1)" > /kaggle/working/models/kata1-b28c512nbt-s13255194368-d5935380940.bin.gz\n'
+             'gzip -c "$(find /kaggle/input -type f -path "*b18c384*" | head -n 1)" > /kaggle/working/models/b18c384nbt-humanv0.bin.gz\n\n'
+             '# 3. 驗證\n'
+             './katago version\n'
+             'ls -lh /kaggle/working/models'),
         
         md('### 3. 對照組檢驗（確認 KataGo 在此環境計算 11k/1d 完全一致）'),
         code("import json\n"
