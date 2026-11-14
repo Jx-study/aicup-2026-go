@@ -85,3 +85,29 @@ def load_benchmark_players(
         if len(players) >= n_players:
             break
     return players
+
+
+def load_balanced_benchmark_players(
+    train_dir: str = 'training',
+    n_per_level: int = 30,
+    min_games: int = 25,
+    levels: Sequence[str] = ('D', 'C', 'B', 'A', '1D', '2D', '3D', '4D', '5D', '6D')
+) -> Dict[str, List[str]]:
+    """載入跨等級均勻分佈之選手棋譜供真實場景本地驗證。
+
+    回傳字典：{player_id: [sgf_content, ...]}。
+    """
+    players = {}
+    for lv in levels:
+        path = os.path.join(train_dir, f'train_{lv}.csv')
+        if not os.path.exists(path):
+            continue
+        df = pd.read_csv(path)
+        df_b = df[df['color'] == 'B']
+        counts = df_b.groupby('player_id').size()
+        valid_pids = set(counts[counts >= min_games].head(n_per_level).index)
+        sub_df = df_b[df_b['player_id'].isin(valid_pids)]
+        for pid, grp in sub_df.groupby('player_id'):
+            if pid not in players:
+                players[pid] = grp['sgf_content'].tolist()
+    return players
