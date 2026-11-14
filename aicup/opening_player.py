@@ -1,12 +1,6 @@
-"""基於開局指紋（Opening Signature）的圍棋選手識別 Baseline。
+"""基於開局指紋與應手風格的圍棋選手識別模組。
 
-功能：
-1. 從 SGF 提取目標選手前 N 手落子（支援執黑 B 或執白 W）。
-2. 依目標選手的第一手落子，計算 8 軸幾何對稱群（D4 dihedral symmetry）的最佳旋轉/鏡射變換，
-   將整個開局棋譜正規化至標準頂角區域（Canonical Octant）。
-3. 統計選手的開局落點分佈（單步位置、手數序號、相鄰兩手 Bigram），建立稀疏指紋特徵向量。
-4. 對測試題的多局查詢進行特徵累計，比對候選庫各選手的餘弦相似度，輸出 Top-5。
-5. 支援原測試集（pub_/priv_，執黑，每人 100 盤）與新增測試集（pub2_/priv2_，黑白混合，每人 10 盤）。
+提取開局落子與局部應手，經幾何對稱變換正規化後計算特徵分佈與 IDF 加權，比對候選庫餘弦相似度輸出預測名單。
 """
 
 import argparse
@@ -14,23 +8,25 @@ import math
 import os
 import time
 from collections import Counter
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from sgfmill import sgf
 
 TOP_N = 5
-DEFAULT_MAX_MOVES = 30
+DEFAULT_MAX_MOVES = 10
+IDF_POWER = 0.75
+W_RESP = 2.0
 
 
 def get_canonical_moves(
     sgf_str: str,
     target_color: str,
     max_moves: int = DEFAULT_MAX_MOVES
-) -> List[Tuple[str, int, int, int]]:
-    """從 SGF 字串解析出目標選手落子的正規化坐標。
+) -> List[Tuple[str, int, int, int, Optional[Tuple[int, int]]]]:
+    """從 SGF 字串解析出目標選手落子的正規化坐標與對手應手資訊。
 
-    回傳：[(col, target_step_idx, canonical_r, canonical_c), ...]
+    回傳每手落子元組清單，欄位依序為執色、手數、列坐標、行坐標與前手對手落子坐標。
     """
     target_color = str(target_color).strip().lower()
     if target_color not in ('b', 'w'):
@@ -41,20 +37,25 @@ def get_canonical_moves(
     except Exception:
         return []
 
-    # 挑出目標選手的落子（直接過濾，避免因 Pass 或讓子造成雙層截斷誤差）
-    target_moves = []
+    raw_moves = []
     for node in g.get_main_sequence()[1:]:
         col, mv = node.get_move()
-        if mv is not None and col is not None and col.lower() == target_color:
-            target_moves.append((len(target_moves), mv[0], mv[1]))
-            if len(target_moves) >= max_moves:
+        if mv is not None and col is not None:
+            raw_moves.append((col.lower(), mv[0], mv[1]))
+            if len(raw_moves) >= max_moves * 3:
                 break
 
-    if not target_moves:
+    # 找到目標選手第一手以計算對稱變換
+    first_target = None
+    for col, r, c in raw_moves:
+        if col == target_color:
+            first_target = (r, c)
+            break
+
+    if first_target is None:
         return []
 
-    # 依目標選手的第一手計算 canonical symmetry k in 0..7
-    r1, c1 = target_moves[0][1], target_moves[0][2]
+    r1, c1 = first_target
     best_k = 0
     best_coord = (19, 19)
 
@@ -68,47 +69,71 @@ def get_canonical_moves(
             best_coord = (r, c)
             best_k = k
 
-    # 對所有目標落手套用 best_k
-    canonical = []
-    for step_idx, r, c in target_moves:
+    # 對所有落手套用對稱變換
+    transformed_moves = []
+    for col, r, c in raw_moves:
         for _ in range(best_k % 4):
             r, c = 18 - c, r
         if best_k >= 4:
             c = 18 - c
-        canonical.append((target_color, step_idx, r, c))
+        transformed_moves.append((col, r, c))
 
-    return canonical
+    # 抽取目標手數與接續對手手數
+    target_moves_info = []
+    step_idx = 0
+    for i in range(len(transformed_moves)):
+        col, r, c = transformed_moves[i]
+        if col == target_color:
+            opp_move = None
+            if i > 0 and transformed_moves[i - 1][0] != target_color:
+                opp_move = (transformed_moves[i - 1][1], transformed_moves[i - 1][2])
+            target_moves_info.append((target_color, step_idx, r, c, opp_move))
+            step_idx += 1
+            if step_idx >= max_moves:
+                break
+
+    return target_moves_info
 
 
-def extract_profile_from_moves(
-    canonical_moves_list: List[List[Tuple[str, int, int, int]]]
-) -> Dict[tuple, float]:
-    """將同一位選手多局的 canonical moves 轉為 L2 正規化的特徵向量。"""
+def extract_raw_counts(
+    canonical_moves_list: List[List[Tuple[str, int, int, int, Optional[Tuple[int, int]]]]],
+    w_resp: float = W_RESP
+) -> Counter:
+    """從多局開局落子提取未經 IDF 加權的特徵頻率計數。"""
     cnt = Counter()
     for mvs in canonical_moves_list:
-        for col, step_idx, r, c in mvs:
-            # 1. 帶執色與手數的精確特徵
-            cnt[(col, step_idx, r, c)] += 2.0
-            # 2. 帶執色的全域位置分佈
-            cnt[(col, 'any_step', r, c)] += 1.0
-            # 3. 不分執色的全域偏好
-            cnt[('any_col', 'any_step', r, c)] += 0.5
+        for col, step_idx, r, c, opp in mvs:
+            # 帶執色與手數的精確落點
+            cnt[(col, step_idx, r, c)] += 1.5
+            # 全盤落點分佈
+            cnt[('any_col', r, c)] += 0.5
 
-        # 4. 相鄰連續兩手 Bigram
+            # 局部應手與脫先行為
+            if opp is not None and w_resp > 0:
+                dr = r - opp[0]
+                dc = c - opp[1]
+                dist = abs(dr) + abs(dc)
+                if dist <= 3:
+                    cnt[(col, 'local_resp', step_idx, dr, dc)] += w_resp
+                else:
+                    cnt[(col, 'tenuki', step_idx)] += w_resp
+
+        # 相鄰手 Bigram 連續序列
         for i in range(len(mvs) - 1):
-            color, _, r1, c1 = mvs[i]
-            _, _, r2, c2 = mvs[i + 1]
-            cnt[('bi', color, r1, c1, r2, c2)] += 2.5
+            col1, _, r1, c1, _ = mvs[i]
+            col2, _, r2, c2, _ = mvs[i + 1]
+            cnt[('bi', col1, r1, c1, r2, c2)] += 2.0
 
-    norm = math.sqrt(sum(v * v for v in cnt.values())) + 1e-9
-    return {k: v / norm for k, v in cnt.items()}
+    return cnt
 
 
-def build_candidate_profiles(
+def build_candidate_profiles_and_idf(
     cand_csv_path: str,
-    max_moves: int = DEFAULT_MAX_MOVES
-) -> Dict[str, Dict[tuple, float]]:
-    """讀取候選庫 CSV，建立每位 candidate player 的指紋特徵。"""
+    max_moves: int = DEFAULT_MAX_MOVES,
+    idf_power: float = IDF_POWER,
+    w_resp: float = W_RESP
+) -> Tuple[Dict[str, Dict[tuple, float]], Dict[tuple, float]]:
+    """讀取候選庫 CSV，建立候選人指紋特徵與全域 IDF 權重字典。"""
     df = pd.read_csv(cand_csv_path)
     player_moves = {}
 
@@ -121,20 +146,43 @@ def build_candidate_profiles(
             player_moves[pid] = []
         player_moves[pid].append(mvs)
 
-    profiles = {}
-    for pid, moves_list in player_moves.items():
-        profiles[pid] = extract_profile_from_moves(moves_list)
+    cand_raw_counts = {}
+    df_counts = Counter()
+    n_cands = len(player_moves)
 
-    return profiles
+    for pid, moves_list in player_moves.items():
+        cnt = extract_raw_counts(moves_list, w_resp=w_resp)
+        cand_raw_counts[pid] = cnt
+        for k in cnt.keys():
+            df_counts[k] += 1
+
+    # 計算全域特徵 IDF
+    idf_weights = {}
+    for k, df_val in df_counts.items():
+        if idf_power > 0:
+            idf_weights[k] = (math.log((n_cands + 1) / (df_val + 1)) + 1.0) ** idf_power
+        else:
+            idf_weights[k] = 1.0
+
+    # 加權並正規化候選人向量
+    profiles = {}
+    for pid, cnt in cand_raw_counts.items():
+        weighted = {k: val * idf_weights[k] for k, val in cnt.items()}
+        norm = math.sqrt(sum(v * v for v in weighted.values())) + 1e-9
+        profiles[pid] = {k: v / norm for k, v in weighted.items()}
+
+    return profiles, idf_weights
 
 
 def predict_split(
     test_csv_path: str,
     cand_profiles: Dict[str, Dict[tuple, float]],
+    idf_weights: Dict[tuple, float],
     top_n: int = TOP_N,
-    max_moves: int = DEFAULT_MAX_MOVES
+    max_moves: int = DEFAULT_MAX_MOVES,
+    w_resp: float = W_RESP
 ) -> List[List[str]]:
-    """對單一測試題檔案進行預測，回傳 [[question_id, top_1, ..., top_5], ...]"""
+    """對單一測試題檔案進行預測，回傳各題目預測候選人清單。"""
     test_df = pd.read_csv(test_csv_path)
     cand_names = sorted(cand_profiles.keys())
     results = []
@@ -156,19 +204,25 @@ def predict_split(
                 mvs = get_canonical_moves(sgf_content, color, max_moves=max_moves)
                 query_moves.append(mvs)
 
-        q_profile = extract_profile_from_moves(query_moves)
+        q_raw = extract_raw_counts(query_moves, w_resp=w_resp)
+        weighted_q = {}
+        for k, val in q_raw.items():
+            idf = idf_weights.get(k, 1.0)
+            weighted_q[k] = val * idf
 
-        # 計算與每位候選者的餘弦相似度
+        norm = math.sqrt(sum(v * v for v in weighted_q.values())) + 1e-9
+        q_vec = {k: v / norm for k, v in weighted_q.items()}
+
+        # 計算餘弦相似度
         scores = []
         for c_pid in cand_names:
             c_prof = cand_profiles[c_pid]
-            sim = sum(val * c_prof[k] for k, val in q_profile.items() if k in c_prof)
+            sim = sum(val * c_prof[k] for k, val in q_vec.items() if k in c_prof)
             scores.append((sim, c_pid))
 
         scores.sort(key=lambda x: x[0], reverse=True)
         top_candidates = [pid for _, pid in scores[:top_n]]
 
-        # 防呆：確保填滿 top_n 且不重複
         if len(top_candidates) < top_n:
             for c_pid in cand_names:
                 if c_pid not in top_candidates:
@@ -184,9 +238,11 @@ def predict_split(
 def run_full_pipeline(
     tests_dir: str = 'tests',
     out_csv: str = 'submission_player.csv',
-    max_moves: int = DEFAULT_MAX_MOVES
+    max_moves: int = DEFAULT_MAX_MOVES,
+    idf_power: float = IDF_POWER,
+    w_resp: float = W_RESP
 ) -> pd.DataFrame:
-    """執行全量四份測試題預測並輸出最終提交檔。"""
+    """執行全量四份測試題推論並寫出提交檔。"""
     splits_config = [
         ('pub_', 'player_identification_test_public.csv', 'player_identification_candidates_public.csv'),
         ('priv_', 'player_identification_test_private.csv', 'player_identification_candidates_private.csv'),
@@ -203,14 +259,17 @@ def run_full_pipeline(
 
         print(f'[{prefix}] 處理中...')
         t0 = time.time()
-        cand_profiles = build_candidate_profiles(cand_path, max_moves=max_moves)
-        print(f'  - 候選庫 {len(cand_profiles)} 人建置完成 ({time.time() - t0:.1f}s)')
+        cand_profiles, idf_weights = build_candidate_profiles_and_idf(
+            cand_path, max_moves=max_moves, idf_power=idf_power, w_resp=w_resp
+        )
+        print(f'  - 候選庫 {len(cand_profiles)} 人與 IDF 建置完成 ({time.time() - t0:.1f}s)')
 
         t0 = time.time()
-        sub_rows = predict_split(test_path, cand_profiles, top_n=TOP_N, max_moves=max_moves)
+        sub_rows = predict_split(
+            test_path, cand_profiles, idf_weights, top_n=TOP_N, max_moves=max_moves, w_resp=w_resp
+        )
         print(f'  - 測試題 {len(sub_rows)} 題推論完成 ({time.time() - t0:.1f}s)')
 
-        # 檢查 prefix 與相異性
         for r in sub_rows:
             qid = r[0]
             top5 = r[1:]
@@ -237,13 +296,21 @@ def run_full_pipeline(
 
 
 def main():
-    parser = argparse.ArgumentParser(description='開局指紋選手辨識 Baseline')
+    parser = argparse.ArgumentParser(description='開局指紋選手辨識模組')
     parser.add_argument('--tests-dir', default='tests')
     parser.add_argument('--out-csv', default='submission_player.csv')
     parser.add_argument('--max-moves', type=int, default=DEFAULT_MAX_MOVES)
+    parser.add_argument('--idf-power', type=float, default=IDF_POWER)
+    parser.add_argument('--w-resp', type=float, default=W_RESP)
     args = parser.parse_args()
 
-    run_full_pipeline(tests_dir=args.tests_dir, out_csv=args.out_csv, max_moves=args.max_moves)
+    run_full_pipeline(
+        tests_dir=args.tests_dir,
+        out_csv=args.out_csv,
+        max_moves=args.max_moves,
+        idf_power=args.idf_power,
+        w_resp=args.w_resp
+    )
 
 
 if __name__ == '__main__':

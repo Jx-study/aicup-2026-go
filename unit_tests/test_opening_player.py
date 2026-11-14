@@ -1,13 +1,11 @@
 """開局指紋選手辨識的單元測試。"""
+import os
 import tempfile
-import pandas as pd
 import pytest
 
 from aicup.opening_player import (
-    DEFAULT_MAX_MOVES,
     TOP_N,
-    build_candidate_profiles,
-    extract_profile_from_moves,
+    extract_raw_counts,
     get_canonical_moves,
     predict_split,
 )
@@ -17,25 +15,27 @@ SAMPLE_SGF = "(;SZ[19]KM[6.5]RU[Japanese];B[dp];W[pd];B[qp];W[dd];B[oq];W[qf];B[
 
 def test_get_canonical_moves_black():
     moves = get_canonical_moves(SAMPLE_SGF, target_color='b', max_moves=10)
-    assert len(moves) == 4  # Black has 4 moves
-    col, step, r, c = moves[0]
+    assert len(moves) == 4  # 黑棋共 4 手
+    col, step, r, c, opp = moves[0]
     assert col == 'b'
     assert step == 0
-    # First move should be canonicalized to top-left octant: r <= c, r <= 9, c <= 9
+    # 第一手旋轉至標準八分區
     assert 0 <= r <= 9
     assert 0 <= c <= 9
     assert r <= c
+    assert opp is None  # 黑棋第一手無前手對手落子
 
 
 def test_get_canonical_moves_white():
     moves = get_canonical_moves(SAMPLE_SGF, target_color='w', max_moves=10)
-    assert len(moves) == 4  # White has 4 moves
-    col, step, r, c = moves[0]
+    assert len(moves) == 4  # 白棋共 4 手
+    col, step, r, c, opp = moves[0]
     assert col == 'w'
     assert step == 0
     assert 0 <= r <= 9
     assert 0 <= c <= 9
     assert r <= c
+    assert opp is not None  # 白棋第一手前有黑棋首手
 
 
 def test_get_canonical_moves_empty_and_invalid():
@@ -52,24 +52,19 @@ def test_get_canonical_moves_short():
     assert len(moves_w) == 1
 
 
-def test_extract_profile():
+def test_extract_raw_counts():
     moves = get_canonical_moves(SAMPLE_SGF, target_color='b', max_moves=10)
-    profile = extract_profile_from_moves([moves])
-    assert len(profile) > 0
-    # Check L2 norm is ~1.0
-    norm = sum(v * v for v in profile.values())
-    assert abs(norm - 1.0) < 1e-4
+    cnt = extract_raw_counts([moves])
+    assert len(cnt) > 0
 
 
 def test_predict_split_mock():
-    # 建立 6 位 mock 候選人特徵
+    # 建立 6 位測試候選人特徵與 IDF
     cand_profiles = {}
+    idf_weights = {}
     for i in range(1, 7):
         pid = f"pub_p_{i:04d}"
-        # 產生稍微不同的 profile
-        cand_profiles[pid] = extract_profile_from_moves([
-            [('b', 0, 3, 3 + (i % 3)), ('b', 1, 3, 15)]
-        ])
+        cand_profiles[pid] = {('b', 0, 3, 3 + (i % 3)): 1.0}
 
     with tempfile.NamedTemporaryFile('w', suffix='.csv', delete=False) as f:
         temp_test_csv = f.name
@@ -77,16 +72,15 @@ def test_predict_split_mock():
         f.write(f"pub_q_0001,1,\"{SAMPLE_SGF}\",B\n")
 
     try:
-        results = predict_split(temp_test_csv, cand_profiles, top_n=TOP_N)
+        results = predict_split(temp_test_csv, cand_profiles, idf_weights, top_n=TOP_N)
         assert len(results) == 1
         row = results[0]
         assert row[0] == "pub_q_0001"
         top5 = row[1:]
         assert len(top5) == TOP_N
-        assert len(set(top5)) == TOP_N  # 無重複候選人
+        assert len(set(top5)) == TOP_N
         for p in top5:
             assert p.startswith("pub_p_")
     finally:
-        import os
         if os.path.exists(temp_test_csv):
             os.remove(temp_test_csv)
