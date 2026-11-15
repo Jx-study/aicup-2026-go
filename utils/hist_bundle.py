@@ -1,11 +1,12 @@
 """產生 Human SL 分析用的打包檔與 notebook，輸出到 humansl-analysis/hist-<run>/
 
-專為 Kaggle T4 x2 雙 GPU 最佳化：zip 內含程式與棋譜，可直接作為 Kaggle Dataset 或上傳執行。
+在 Google Colab T4 GPU 上執行：zip 內含程式與棋譜，可直接上傳或放 Google Drive。
 從 repo 根目錄執行：
     python utils/hist_bundle.py --run test --move-stats
     python utils/hist_bundle.py --run val648 --move-stats
-    python utils/hist_bundle.py --run trainpool2_p1 --move-stats
-    python utils/hist_bundle.py --run trainpool2_p2 --move-stats
+    python utils/hist_bundle.py --run train_p1 --move-stats
+    python utils/hist_bundle.py --run train_p2 --move-stats
+    python utils/hist_bundle.py --run train_p3 --move-stats
     python utils/hist_bundle.py --run holdout --move-stats
 --move-stats 時主分析多輸出 move_rank、pmax、entropy。
 """
@@ -19,12 +20,9 @@ import zipfile
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, '.')
-from aicup import analyze_humansl as ah
-
 HA = 'humansl-analysis'
 TRAIN_GLOB = 'training-v1.1/training/train_*.csv'
-# 方案乙：最優 3 Profiles 組合
+# Human SL 抽取用的 3 個 profile
 PROFILES3 = ['rank_11k', 'rank_1d', 'rank_2d']
 N_CTRL = 40
 SEED, PER_PLAYER = 42, 20
@@ -47,6 +45,14 @@ GAME_COLS = ['player_id', 'game_id', 'rank', 'color', 'sgf_content']
 BASE_FILES = ['aicup/__init__.py', 'aicup/analyze_humansl.py', 'aicup/scoring.py']
 TEST_FILES = ['aicup/predict_rank.py', 'aicup/color.py', 'aicup/extract_features.py', 'aicup/packed.py']
 TEST_CSVS = ['tests/rank_prediction_test_public.csv', 'tests/rank_prediction_test_private.csv']
+
+
+def analyzer():
+    """從 repo 根目錄載入 aicup.analyze_humansl；只在需要棋譜解析時才載入。"""
+    if '.' not in sys.path:
+        sys.path.insert(0, '.')
+    from aicup import analyze_humansl
+    return analyze_humansl
 
 
 def read_jsonl(path):
@@ -88,6 +94,8 @@ def run_games(run, cfg, df):
     """回傳這個執行的棋譜列，順序是分析順序。測試集回傳 None。"""
     if cfg.get('test'):
         return None
+    ah = analyzer()
+
     if 'old' in cfg and not run.startswith('trainpool'):
         old = read_jsonl(os.path.join(HA, cfg['old']))
         pid_rank = listed_pairs(cfg['players'])
@@ -109,6 +117,8 @@ def out_name(cfg):
 
 def check_run(run, cfg, out):
     """檢查局數，以及局可以從官方 CSV 重新抽樣產生。"""
+    ah = analyzer()
+
     if cfg.get('test'):
         keys = [g['key'] for g in ah.load_test_games(os.path.join(out, 'tests'))]
         assert len(keys) == cfg['n'] == len(set(keys)), len(keys)
@@ -120,102 +130,120 @@ def check_run(run, cfg, out):
 
 def make_notebook(run, cfg, move_stats):
     total, out = cfg['n'], out_name(cfg)
-    src = '--test-dir /kaggle/working/hist/tests' if cfg.get('test') else '--csv /kaggle/working/hist/games.csv'
+    src = '--test-dir /content/hist/tests' if cfg.get('test') else '--csv /content/hist/games.csv'
     flags = '--pre-root-history' + (' --side opponent' if cfg['side'] == 'opponent' else '')
     flags += ' --move-stats' if move_stats else ''
     prof_str = ' '.join(PROFILES3)
-    override_str = 'numAnalysisThreads=32,numSearchThreadsPerAnalysisThread=1,numNNServerThreadsPerModel=2,cudaDeviceToUseThread0=0,cudaDeviceToUseThread1=1'
+    override_str = 'numAnalysisThreads=32,numSearchThreadsPerAnalysisThread=1'
     
     md = lambda s: {'cell_type': 'markdown', 'metadata': {}, 'source': s}
     code = lambda s: {'cell_type': 'code', 'metadata': {}, 'execution_count': None, 'outputs': [], 'source': s}
     
     cells = [
-        md('# Human SL 抽取：%s（Kaggle T4 x2 雙 GPU 版）\n\n'
+        md('# Human SL 抽取：%s（Google Colab T4 GPU 版）\n\n'
            '- 任務：%s（%s，共 %d 局）\n'
            '- Profiles：%s + eval_visits=1（包含目數損失）\n'
-           '- 雙 GPU 平行設定：`%s`\n'
+           '- 平行設定：`%s`\n'
            '- 旗標：`%s`\n'
+           '- 進度每批備份至 Google Drive，斷線後重跑會接續\n'
            % (run, run, '對手側' if cfg['side'] == 'opponent' else '目標側', total, prof_str, override_str, flags)),
         
-        md('### 1. 建立工作目錄與導入資料集'),
+        md('### 1. 掛載 Google Drive 與建立工作目錄'),
         code("BATCH = 400\n"
              "RUN = %r\n"
              "TOTAL = %d\n"
-             "OUT_NAME = %r\n\n"
-             "import os, glob, shutil, time, zipfile\n\n"
-             "# 1. 建立工作目錄\n"
-             "os.makedirs('/kaggle/working/hist', exist_ok=True)\n"
-             "# 自動偵測 Kaggle Dataset 路徑（支援掛載的 Dataset 或直接上傳）\n"
-             "dataset_candidates = [\n"
-             "    f'/kaggle/input/{RUN}',\n"
-             "    f'/kaggle/input/{RUN.replace(\"_\", \"-\")}',\n"
-             "    f'/kaggle/input/{RUN}-dataset',\n"
-             "    f'/kaggle/input/{RUN.replace(\"_\", \"-\")}-dataset',\n"
-             "] + glob.glob(f'/kaggle/input/**/{RUN}*', recursive=True) + glob.glob(f'/kaggle/input/**/{RUN.replace(\"_\", \"-\")}*', recursive=True)\n"
-             "DATASET_DIR = None\n"
-             "for d in dataset_candidates:\n"
-             "    if os.path.exists(d):\n"
-             "        DATASET_DIR = d if os.path.isdir(d) else os.path.dirname(d)\n"
-             "        break\n"
-             "if DATASET_DIR is None:\n"
-             "    found = [p for p in glob.glob('/kaggle/input/**/aicup', recursive=True) if os.path.isdir(p)]\n"
-             "    DATASET_DIR = os.path.dirname(found[0]) if found else f'/kaggle/input/{RUN}-dataset'\n"
-             "print('使用資料集路徑：', DATASET_DIR)\n\n"
-             "# 2. 導入資料\n"
-             "if os.path.exists(f'{DATASET_DIR}/{RUN}.zip'):\n"
-             "    zipfile.ZipFile(f'{DATASET_DIR}/{RUN}.zip').extractall('/kaggle/working/hist')\n"
-             "elif os.path.exists(f'{RUN}.zip'):\n"
-             "    zipfile.ZipFile(f'{RUN}.zip').extractall('/kaggle/working/hist')\n"
+             "OUT_NAME = %r\n"
+             "DRIVE_BACKUP = '/content/drive/MyDrive/aicup-2026/hist'\n\n"
+             "from google.colab import drive\n"
+             "import os, shutil, time, zipfile\n\n"
+             "# 1. 掛載 Google Drive\n"
+             "drive.mount('/content/drive')\n"
+             "os.makedirs(DRIVE_BACKUP, exist_ok=True)\n"
+             "os.makedirs('/content/hist', exist_ok=True)\n\n"
+             "# 2. 導入資料集與程式碼（優先從 Drive 或上傳讀取）\n"
+             "if os.path.exists(f'{DRIVE_BACKUP}/{RUN}.zip'):\n"
+             "    print(f'從 Google Drive 解壓 {RUN}.zip')\n"
+             "    zipfile.ZipFile(f'{DRIVE_BACKUP}/{RUN}.zip').extractall('/content/hist')\n"
+             "elif os.path.exists(f'/content/{RUN}.zip'):\n"
+             "    print(f'從本地上傳解壓 {RUN}.zip')\n"
+             "    zipfile.ZipFile(f'/content/{RUN}.zip').extractall('/content/hist')\n"
+             "elif os.path.exists('/content/games.csv') or os.path.exists('/content/tests'):\n"
+             "    os.system('cp -rf /content/games.csv /content/ctrl.csv /content/ref.json /content/aicup /content/tests /content/hist/ 2>/dev/null || true')\n"
              "else:\n"
-             "    os.system(f'cp -rf {DATASET_DIR}/* /kaggle/working/hist/')\n\n"
+             "    print(f'請將 {RUN}.zip 上傳到 Colab 根目錄或放至 Google Drive：{DRIVE_BACKUP}')\n\n"
+             "if not os.path.exists('/content/hist/ctrl.csv'):\n"
+             "    raise FileNotFoundError(f'未找到 {RUN}.zip 或解壓檔案，請確認檔案位置！')\n\n"
              "# 3. 切換至工作目錄\n"
-             "os.chdir('/kaggle/working/hist')\n\n"
+             "os.chdir('/content/hist')\n\n"
              "# 4. 安裝套件與驗證硬體\n"
              "!pip install -q sgfmill\n"
-             "!nvidia-smi -L\n"
-             "!ls -la /kaggle/working/hist\n\n"
-             "LOCAL = '/kaggle/working/' + OUT_NAME\n"
-             "CTRL = '/kaggle/working/' + RUN + '-ctrl.jsonl'\n"
+             "!nvidia-smi -L\n\n"
+             "LOCAL = f'/content/{OUT_NAME}'\n"
+             "REMOTE = f'{DRIVE_BACKUP}/{OUT_NAME}'\n"
+             "CTRL = f'/content/{RUN}-ctrl.jsonl'\n\n"
+             "# 5. 自動從 Google Drive 還原已完成的進度\n"
+             "if os.path.exists(REMOTE) and not os.path.exists(LOCAL):\n"
+             "    shutil.copy2(REMOTE, LOCAL)\n"
              "if os.path.exists(LOCAL):\n"
              "    !wc -l {LOCAL}" % (run, total, out)),
         
-        md('### 2. 設定 KataGo 引擎與雙模型權重'),
+        md('### 2. 下載 KataGo 引擎與雙模型權重（自動快取至 Google Drive）'),
         code('%%bash\n'
-             'mkdir -p /kaggle/working/katago /kaggle/working/models\n\n'
-             '# 1. 解開 AppImage 並綁定 CUDA 啟動腳本\n'
-             'cd /kaggle/working/katago\n'
-             'KATAGO_SRC=$(find /kaggle/input -name "katago" -type f | head -n 1)\n'
-             '[ -d squashfs-root ] || "$KATAGO_SRC" --appimage-extract > /dev/null 2>&1\n'
-             'CUDA_PATHS=$(python3 -c "import glob; print(\':\'.join(glob.glob(\'/usr/local/cuda*/lib64\') + glob.glob(\'/usr/local/lib/python3*/dist-packages/nvidia/*/lib\') + [\'/kaggle/working/katago/squashfs-root/usr/lib\']))")\n'
-             'cat << EOF > katago\n'
+             'DRIVE_KATAGO=/content/drive/MyDrive/aicup-2026/katago\n'
+             'mkdir -p /content/katago /content/models "$DRIVE_KATAGO"\n\n'
+             '# 1. 取得 KataGo 執行檔\n'
+             'ZIP="katago-v1.18.2-cuda12.8-cudnn9.8.0-linux-x64.zip"\n'
+             'if [ ! -f /content/katago/katago-bin ]; then\n'
+             '    if [ -f "$DRIVE_KATAGO/$ZIP" ]; then\n'
+             '        cp -u "$DRIVE_KATAGO/$ZIP" /content/katago/\n'
+             '    else\n'
+             '        echo "Downloading KataGo binary..."\n'
+             '        wget -q -O "/content/katago/$ZIP" "https://github.com/lightvector/KataGo/releases/download/v1.18.2/$ZIP"\n'
+             '        cp -u "/content/katago/$ZIP" "$DRIVE_KATAGO/" 2>/dev/null || true\n'
+             '    fi\n'
+             '    unzip -qjo "/content/katago/$ZIP" -d /content/katago/\n'
+             '    mv /content/katago/katago /content/katago/katago-bin\n'
+             '    cat << \'EOF\' > /content/katago/katago\n'
              '#!/bin/bash\n'
-             'export LD_LIBRARY_PATH=$CUDA_PATHS:\\$LD_LIBRARY_PATH\n'
-             'exec /kaggle/working/katago/squashfs-root/usr/bin/katago "\\$@"\n'
+             'CUDA_PATHS=$(python3 -c "import glob; print(\':\'.join(glob.glob(\'/usr/local/cuda*/lib64\') + glob.glob(\'/usr/local/lib/python3*/dist-packages/nvidia/*/lib\')))")\n'
+             'export LD_LIBRARY_PATH=$CUDA_PATHS:/usr/local/cuda/lib64:$LD_LIBRARY_PATH\n'
+             'exec /content/katago/katago-bin "$@"\n'
              'EOF\n'
-             'chmod +x katago\n'
-             'echo -e "logDir = gtp_logs\\n" > analysis_example.cfg\n\n'
-             '# 2. 封裝兩大模型為 KataGo 規格的 .bin.gz\n'
-             'gzip -c "$(find /kaggle/input -type f -path "*kata1*" | head -n 1)" > /kaggle/working/models/kata1-b28c512nbt-s13255194368-d5935380940.bin.gz\n'
-             'gzip -c "$(find /kaggle/input -type f -path "*b18c384*" | head -n 1)" > /kaggle/working/models/b18c384nbt-humanv0.bin.gz\n\n'
+             '    chmod +x /content/katago/katago\n'
+             'fi\n'
+             'mkdir -p /content/katago/gtp_logs\n\n'
+             '# 2. 取得雙模型（優先從 Drive 複製，缺失則下載並自動備份回 Drive）\n'
+             'if ls "$DRIVE_KATAGO"/*.bin.gz 1> /dev/null 2>&1; then\n'
+             '    cp -u "$DRIVE_KATAGO"/*.bin.gz /content/models/\n'
+             'fi\n'
+             'if [ ! -f /content/models/b18c384nbt-humanv0.bin.gz ]; then\n'
+             '    echo "Downloading human model..."\n'
+             '    wget -q -O /content/models/b18c384nbt-humanv0.bin.gz https://github.com/lightvector/KataGo/releases/download/v1.15.0/b18c384nbt-humanv0.bin.gz\n'
+             '    cp -u /content/models/b18c384nbt-humanv0.bin.gz "$DRIVE_KATAGO/" 2>/dev/null || true\n'
+             'fi\n'
+             'if [ ! -f /content/models/kata1-b28c512nbt-s13255194368-d5935380940.bin.gz ]; then\n'
+             '    echo "Downloading main 28b model..."\n'
+             '    wget -q -O /content/models/kata1-b28c512nbt-s13255194368-d5935380940.bin.gz https://media.katagotraining.org/uploaded/networks/models/kata1/kata1-b28c512nbt-s13255194368-d5935380940.bin.gz\n'
+             '    cp -u /content/models/kata1-b28c512nbt-s13255194368-d5935380940.bin.gz "$DRIVE_KATAGO/" 2>/dev/null || true\n'
+             'fi\n\n'
              '# 3. 驗證\n'
-             './katago version\n'
-             'ls -lh /kaggle/working/models'),
+             '/content/katago/katago version\n'
+             'ls -lh /content/models'),
         
-        md('### 3. 對照組檢驗（確認 KataGo 在此環境計算 11k/1d 完全一致）'),
+        md('### 3. 對照組檢驗（確認 11k/1d 完全一致）'),
         code("import json\n"
              "import numpy as np\n\n"
-             "os.environ['APPIMAGE_EXTRACT_AND_RUN'] = '1'\n\n"
              "if os.path.exists(CTRL):\n"
              "    os.remove(CTRL)\n"
-             "!python -m aicup.analyze_humansl --csv /kaggle/working/hist/ctrl.csv "
-             "--model-dir /kaggle/working/models --katago-dir /kaggle/working/katago "
+             "!python -m aicup.analyze_humansl --csv /content/hist/ctrl.csv "
+             "--model-dir /content/models --katago-dir /content/katago "
              "--model kata1-b28c512nbt-s13255194368-d5935380940.bin.gz --human-model b18c384nbt-humanv0.bin.gz "
              "--profiles %s --eval-visits 1 "
-             '--override-config "%s" --out {CTRL} 2>&1 | tail -3\n\n'
+             '--override-config "%s" --out {CTRL}\n\n'
              "def mean_logp(probs):\n"
              "    p = np.array(probs, dtype=float)\n"
              "    return np.nanmean(np.log(np.clip(p, 1e-6, None)), axis=1)\n\n"
-             "ref = json.load(open('/kaggle/working/hist/ref.json'))\n"
+             "ref = json.load(open('/content/hist/ref.json'))\n"
              "rows = [json.loads(l) for l in open(CTRL)]\n"
              "diffs = np.concatenate([np.abs(mean_logp(r['probs'])[:2] - np.array(ref[r['key']])[:2]) for r in rows])\n"
              "print('對照組 %%d 局，11k/1d 中位數絕對差 %%.4g，最大差 %%.4g' %% (len(rows), np.median(diffs), diffs.max()))\n"
@@ -224,20 +252,23 @@ def make_notebook(run, cfg, move_stats):
              "    raise SystemExit('對照組不一致')"
              % (prof_str, override_str, N_CTRL)),
         
-        md('### 4. 主分析執行（分批寫入 Checkpoint，中途斷線自動接續）'),
+        md('### 4. 主分析執行（分批寫入 Checkpoint，自動備份至 Google Drive）'),
         code("t0 = time.time()\n"
+             "if os.path.exists(REMOTE) and not os.path.exists(LOCAL):\n"
+             "    shutil.copy2(REMOTE, LOCAL)\n"
              "n0 = sum(1 for _ in open(LOCAL)) if os.path.exists(LOCAL) else 0\n"
              "print('目前已完成：%%d / %d 局' %% n0)\n"
              "for n in sorted({*range(BATCH, TOTAL, BATCH), TOTAL}):\n"
              "    if n <= n0:\n"
              "        continue\n"
              "    !python -m aicup.analyze_humansl %s "
-             "--model-dir /kaggle/working/models --katago-dir /kaggle/working/katago "
+             "--model-dir /content/models --katago-dir /content/katago "
              "--model kata1-b28c512nbt-s13255194368-d5935380940.bin.gz --human-model b18c384nbt-humanv0.bin.gz "
              "--profiles %s --eval-visits 1 %s "
              '--override-config "%s" '
-             "--limit {n} --out {LOCAL} 2>&1 | tail -3\n"
-             "    !wc -l {LOCAL}\n"
+             "--limit {n} --out {LOCAL}\n"
+             "    # 每批自動同步回 Google Drive 備份，斷線不掉局\n"
+             "    !cp -f {LOCAL} {REMOTE} && wc -l {REMOTE}\n"
              "n1 = sum(1 for _ in open(LOCAL))\n"
              "print('本 session 完成 %%d 局，%%.0f 秒，每局 %%.2f 秒' %% (n1 - n0, time.time() - t0, (time.time() - t0) / max(n1 - n0, 1)))"
              % (total, src, prof_str, flags, override_str)),
@@ -251,7 +282,13 @@ def make_notebook(run, cfg, move_stats):
              "print('score_loss 存在：', 'score_loss' in rows[0])\n"
              "print('side：', sorted({r['side'] for r in rows}))\n"
              "print('欄位：', sorted(rows[0]))\n"
-             "print('檔案已成功產出至：', LOCAL)")
+             "print('檔案已成功產出並備份至：', REMOTE)"),
+        
+        md('### 6. 釋放 Runtime（可選）'),
+        code("# 全部完成後可取消註解執行，避免閒置扣除 Colab 運算額度\n"
+             "# from google.colab import drive, runtime\n"
+             "# drive.flush_and_unmount()\n"
+             "# runtime.unassign()")
     ]
     for c in cells:
         lines = c['source'].split('\n')
@@ -294,16 +331,32 @@ def build(run, df, ctrl, ref, move_stats):
     print('OK %-14s games=%d zip=%.1f MB move_stats=%s' % (run, cfg['n'], os.path.getsize(zpath) / 1e6, move_stats))
 
 
+def build_notebook(run, move_stats):
+    cfg = RUNS[run]
+    out = os.path.join(HA, 'hist-' + run)
+    os.makedirs(out, exist_ok=True)
+    nb_path = os.path.join(out, run + '.ipynb')
+    with open(nb_path, 'w', encoding='utf-8') as f:
+        json.dump(make_notebook(run, cfg, move_stats), f, ensure_ascii=False, indent=1)
+    print('OK notebook %-14s -> %s (move_stats=%s)' % (run, nb_path, move_stats))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument('--run', choices=sorted(RUNS))
     g.add_argument('--all', action='store_true')
     ap.add_argument('--move-stats', action='store_true', help='主分析多輸出 move_rank、pmax、entropy')
+    ap.add_argument('--notebook-only', action='store_true', help='只重新產生 notebook，不重新抽樣與打包')
     args = ap.parse_args()
+    runs = sorted(RUNS) if args.all else [args.run]
+    if args.notebook_only:
+        for run in runs:
+            build_notebook(run, args.move_stats)
+        return
     df = load_train()
     ctrl, ref = control_rows(df)
-    for run in (sorted(RUNS) if args.all else [args.run]):
+    for run in runs:
         build(run, df, ctrl, ref, args.move_stats)
 
 
