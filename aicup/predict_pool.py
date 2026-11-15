@@ -11,6 +11,7 @@
     --s1-only 時只擬合第一段、不讀任何 CNN 檔案，只輸出 submission_rank_pool_s1.csv。
     --loss（需 --s1-only）時第一段再加兩側 KataGo 失誤特徵（loss + losso），NaN 用擬合題的欄平均填補。
     --save-probs（需 --s1-only）時另存每題第一段的 10 級機率（.npz：question_id、probs），沒有可用局的題機率為 NaN。
+    --same-color（需 --s1-only）時擬合題改成同色、HD < 2 的題，第一段再加 3 欄 co（執黑、HD1、HD1 × 執黑的題內平均）。
     --profiles 指定兩側 jsonl 的 3 個 profile，預設 rank_11k,rank_1d,rank_2d。
 """
 import argparse
@@ -23,8 +24,8 @@ from sklearn.model_selection import GroupKFold
 
 from aicup.analyze_humansl import test_game_keys
 from aicup.eval_posthoc import SIZES, parse_sizes
-from aicup.fit_humansl import (CS, level_probs, load_games, new_model, player_keys,
-                               questions_of)
+from aicup.fit_humansl import (CS, color_features, level_probs, load_games, new_model, player_keys,
+                               questions_of, same_color_questions)
 from aicup.loss_features import N_LOSS, game_loss_features
 from aicup.predict_rank import read_questions
 from aicup.predict_stack import check_profiles, read_test_probs
@@ -54,10 +55,22 @@ def loss_by_keys(path, keys):
     return np.array([feats.get(k, np.full(N_LOSS, np.nan)) for k in keys])
 
 
+def color_by_keys(test_data, keys):
+    """測試集每局的 co 特徵依 keys 排列成 (len(keys), 3)，不在 test_data 的局為 NaN。"""
+    if 'black' not in test_data:
+        raise ValueError('測試集 jsonl 沒有 color、hd 欄位，無法使用 --same-color')
+    index = {k: i for i, k in enumerate(test_data['key'])}
+    co = color_features(test_data)
+    out = np.full((len(keys), co.shape[1]), np.nan)
+    in_test = np.array([k in index for k in keys])
+    out[in_test] = co[[index[k] for k in np.asarray(keys)[in_test]]]
+    return out
+
+
 def predict_s1_only(args, model, dev_data, out_dir, fill_mean=None):
     """第一段模型直接預測測試題，寫出 submission_rank_pool_s1.csv。
 
-    每題特徵是可用局的 (hsl + hslo) 平均，--loss 時再接兩側失誤特徵的題內 nanmean，剩下的 NaN 用 fill_mean 填補。
+    每題特徵是可用局的 (hsl + hslo) 平均，--loss 時再接兩側失誤特徵的題內 nanmean，--same-color 時最後接 co，剩下的 NaN 用 fill_mean 填補。
     可用局是 hsl + hslo 都有值的局；整題沒有可用局時預測最弱等級。
     """
     qids, games = read_questions(args.test_dir)
@@ -69,6 +82,8 @@ def predict_s1_only(args, model, dev_data, out_dir, fill_mean=None):
     valid = ~np.isnan(x).any(axis=1)
     if args.loss:
         x = np.hstack([x, loss_by_keys(args.test_jsonl, keys), loss_by_keys(args.test_opp, keys)])
+    if args.same_color:
+        x = np.hstack([x, color_by_keys(test_data, keys)])
     print('測試集：%d 題，%d 局，可用 %d 局' % (len(qids), len(games), valid.sum()))
     q_idx = [np.flatnonzero((game_q == q) & valid) for q in range(len(qids))]
     has = np.array([len(i) > 0 for i in q_idx])
@@ -118,6 +133,7 @@ def main():
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--s1-only', action='store_true', help='只用第一段，不讀 CNN 的 val、test 機率')
     ap.add_argument('--loss', action='store_true', help='第一段加兩側 KataGo 失誤特徵，需 --s1-only')
+    ap.add_argument('--same-color', action='store_true', help='擬合題改成同色、HD < 2，第一段加 co 3 欄，需 --s1-only')
     ap.add_argument('--save-probs', help='另存每題第一段 10 級機率的 .npz 路徑，需 --s1-only')
     ap.add_argument('--profiles', type=parse_profiles, default=PROFILES,
                     help='兩側 jsonl 的 3 個 profile，逗號分隔，第三個是強 profile')
@@ -126,7 +142,12 @@ def main():
         ap.error('--loss 需要 --s1-only')
     if args.save_probs and not args.s1_only:
         ap.error('--save-probs 需要 --s1-only')
+    if args.same_color and not args.s1_only:
+        ap.error('--same-color 需要 --s1-only')
     s1_groups = ('hsl', 'hslo', 'loss', 'losso') if args.loss else ('hsl', 'hslo')
+    if args.same_color:
+        s1_groups += ('co',)
+    make_questions = same_color_questions if args.same_color else questions_of
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -143,13 +164,13 @@ def main():
 
     # 2. 準備出題特徵
     print('產生擬合用題目...')
-    dev_q, dev_y, dev_g = questions_of(dev_data, np.ones(len(dev_data['key']), bool),
-                                       args.train_repeats, np.random.default_rng(args.seed), args.sizes)
+    dev_q, dev_y, dev_g = make_questions(dev_data, np.ones(len(dev_data['key']), bool),
+                                         args.train_repeats, np.random.default_rng(args.seed), args.sizes)
     m_dev = question_matrix(dev_games, cnn_val, dev_q, args.cnn_temp)
     f_dev_s1 = stack_groups(m_dev, s1_groups)
 
-    pool_q, pool_y, pool_g = questions_of(pool_data, np.ones(len(pool_data['key']), bool),
-                                         args.train_repeats, np.random.default_rng([args.seed, POOL_RNG]), args.sizes)
+    pool_q, pool_y, pool_g = make_questions(pool_data, np.ones(len(pool_data['key']), bool),
+                                            args.train_repeats, np.random.default_rng([args.seed, POOL_RNG]), args.sizes)
     m_pool = question_matrix(pool_games, None, pool_q, args.cnn_temp)
     f_pool_s1 = stack_groups(m_pool, s1_groups)
 

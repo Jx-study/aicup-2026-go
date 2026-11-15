@@ -75,8 +75,9 @@ def test_predict_pool_smoke_and_empty_question_fallback(tmp_path, monkeypatch):
     assert sub_pool.equals(sub_def)
 
 
-@pytest.mark.parametrize('profiles, loss', [(None, False), (('rank_11k', 'rank_1d', 'rank_6d'), False), (None, True)])
-def test_s1_only_save_probs_matches_csv(tmp_path, monkeypatch, profiles, loss):
+@pytest.mark.parametrize('profiles, loss, same_color', [(None, False, False), (('rank_11k', 'rank_1d', 'rank_6d'), False, False),
+                                                       (None, True, False), (None, True, True)])
+def test_s1_only_save_probs_matches_csv(tmp_path, monkeypatch, profiles, loss, same_color):
     kw = {'loss': loss} if profiles is None else {'profiles': profiles, 'loss': loss}
     dev_target, dev_opp = toy_files(tmp_path, name='dev', n_players=10, **kw)
     pool_target, pool_opp = toy_files(tmp_path, name='pool', n_players=10, prefix='q', seed=7, **kw)
@@ -85,6 +86,9 @@ def test_s1_only_save_probs_matches_csv(tmp_path, monkeypatch, profiles, loss):
     test_keys = {'t0_g0': 'pub_q_0001_g01', 't0_g1': 'pub_q_0001_g02', 't1_g5': 'pub_q_0002_g01',
                  't3_g0': 'priv_q_0002_g01', 't3_g1': 'priv_q_0002_g02', 't3_g2': 'priv_q_0002_g03'}
     rows = [[dict(r, key=test_keys[r['key']]) for r in side if r['key'] in test_keys] for side in (target, opp)]
+    for r in rows[0]:
+        if r['key'] == 'pub_q_0001_g02':  # 第一題的第二局改成白棋讓子
+            r.update(color='W', hd=1)
     test_target = write_jsonl(tmp_path / 'test.jsonl', rows[0])
     test_opp = write_jsonl(tmp_path / 'test-opp.jsonl', rows[1])
     test_dir = tmp_path / 'tests'
@@ -107,9 +111,16 @@ def test_s1_only_save_probs_matches_csv(tmp_path, monkeypatch, profiles, loss):
         argv += ['--profiles', ','.join(profiles)]
     if loss:
         argv += ['--loss']
+    if same_color:
+        argv += ['--same-color']
     monkeypatch.setattr('sys.argv', argv)
+    seen = []
+    real = pp.stage1_log_probs
+    monkeypatch.setattr(pp, 'stage1_log_probs', lambda model, f: seen.append(f) or real(model, f))
     pp.main()
 
+    if same_color:  # 第一題 co 是兩局的平均：執黑 (1 + 0) / 2、HD1 (0 + 1) / 2、HD1 x 執黑 0；其餘題都是黑棋 HD 0
+        np.testing.assert_allclose(seen[-1][:, -3:], [[0.5, 0.5, 0], [1, 0, 0], [1, 0, 0]])
     sub = pd.read_csv(out_dir / 'submission_rank_pool_s1.csv')
     z = np.load(out_dir / 'probs.npz')
     assert list(z['question_id']) == list(sub['question_id'])
@@ -121,8 +132,18 @@ def test_s1_only_save_probs_matches_csv(tmp_path, monkeypatch, profiles, loss):
     assert sub['pred_rank'][~has].tolist() == [LEVELS[0]]
 
 
-@pytest.mark.parametrize('flag', [['--save-probs', 'x.npz'], ['--loss']])
+@pytest.mark.parametrize('flag', [['--save-probs', 'x.npz'], ['--loss'], ['--same-color']])
 def test_s1_only_flags_require_s1_only(monkeypatch, flag):
     monkeypatch.setattr('sys.argv', ['predict_pool'] + flag)
     with pytest.raises(SystemExit):
         pp.main()
+
+
+def test_color_by_keys_aligns_and_pads_nan():
+    data = {'key': np.array(['a', 'b']), 'black': np.array([True, False]), 'hd': np.array([1, 0])}
+    out = pp.color_by_keys(data, ['b', 'zz', 'a'])
+    np.testing.assert_allclose(out[0], [0, 0, 0])
+    assert np.isnan(out[1]).all()
+    np.testing.assert_allclose(out[2], [1, 1, 1])
+    with pytest.raises(ValueError):
+        pp.color_by_keys({'key': np.array(['a'])}, ['a'])
