@@ -1,3 +1,4 @@
+import argparse
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,8 +16,9 @@ ROOT = Path(__file__).resolve().parents[1]
 ANALYSIS = ROOT / 'humansl-analysis'
 
 
-def toy_rows(n_players=50, games=20, moves=30, seed=0, move_stats=True, prefix='p'):
-    """目標側與對手側的 jsonl 列，機率帶有等級訊號。"""
+def toy_rows(n_players=50, games=20, moves=30, seed=0, move_stats=True, prefix='p',
+             profiles=('rank_11k', 'rank_1d', 'rank_2d'), loss=False):
+    """目標側與對手側的 jsonl 列，機率帶有等級訊號。loss 為 True 時加 score_loss、winrate_loss，數值隨等級下降，部分手為 None。"""
     rng = np.random.default_rng(seed)
     target, opp = [], []
     for i in range(n_players):
@@ -28,7 +30,7 @@ def toy_rows(n_players=50, games=20, moves=30, seed=0, move_stats=True, prefix='
                 probs = [np.clip(base * s + rng.normal(0, 0.02, moves), 0, 1) for s in (0.6, 0.8, 1.0)]
                 row = {'key': key, 'rank_idx': rank, 'player_id': '%s%d' % (prefix, i), 'hd': 0, 'color': 'B',
                        'side': side, 'turns': list(range(1, 2 * moves, 2)), 'eval_visits': 0,
-                       'profiles': ['rank_11k', 'rank_1d', 'rank_6d'],
+                       'profiles': list(profiles),
                        'probs': [[round(float(v), 6) for v in p] for p in probs]}
                 row['probs'][0][0] = None  # 不合法的手
                 if move_stats:
@@ -36,6 +38,11 @@ def toy_rows(n_players=50, games=20, moves=30, seed=0, move_stats=True, prefix='
                     row['move_rank'] = [[float(v) for v in rng.integers(0, 10, moves)] for _ in range(3)]
                     row['pmax'] = [[float(v) for v in rng.uniform(0.1, 1, moves)] for _ in range(3)]
                     row['entropy'] = [[float(v) for v in rng.uniform(0, 4, moves)] for _ in range(3)]
+                if loss:
+                    row['score_loss'] = [None if m % 11 == 0 else float(v)
+                                         for m, v in enumerate(rng.exponential(5 - rank / 3, moves))]
+                    row['winrate_loss'] = [None if m % 13 == 0 else float(v)
+                                           for m, v in enumerate(rng.exponential(0.1 - rank / 150, moves))]
                 rows.append(row)
     return target, opp
 
@@ -81,7 +88,7 @@ def test_game_side_features_widths_and_nan():
 
 
 def test_game_side_features_values():
-    row = {'profiles': ['rank_11k', 'rank_1d', 'rank_6d'],
+    row = {'profiles': ['rank_11k', 'rank_1d', 'rank_2d'],
            'probs': [[0.5, 0.001, None], [0.2, 0.2, 0.2], [0.5, 0.5, 0.5]],
            'move_rank': [[0, 1, None], [0, 0, 3], [0, 2, 2]],
            'pmax': [[1, 1, 1], [0.4, 0.6, None], [1, 1, 1]], 'entropy': [[0, 0, 0], [1, 2, 3], [0, 0, 0]]}
@@ -317,7 +324,7 @@ def test_load_game_features_d_is_target_minus_opponent(tmp_path):
 
 
 def test_load_real_history_jsonl(tmp_path):
-    target = ANALYSIS / 'val648-p3-hist.jsonl'
+    target = ANALYSIS / 'hist-val648' / 'val648-p3-hist.jsonl'
     opp = ANALYSIS / 'hist-val648_opp' / 'val648-p3-opp-hist.jsonl'
     if not (target.exists() and opp.exists()):
         pytest.skip('沒有本機的 history 版 jsonl')
@@ -406,3 +413,51 @@ def test_merge_two_stage_outputs_no_conflict(tmp_path, fast_hgb, monkeypatch):
     assert 'pool' in scores
     assert 'pool_hgbhsl' in scores
 
+
+def test_parse_profiles():
+    assert sh.parse_profiles('rank_11k,rank_1d,rank_6d') == ('rank_11k', 'rank_1d', 'rank_6d')
+    assert sh.parse_profiles(' rank_11k, rank_1d, rank_2d ') == sh.PROFILES
+    for bad in ('rank_11k,rank_1d', 'rank_1d,rank_11k,rank_6d', 'rank_11k,rank_1d,rank_2d,rank_6d'):
+        with pytest.raises(argparse.ArgumentTypeError, match='rank_11k,rank_1d'):
+            sh.parse_profiles(bad)
+
+
+def test_load_game_features_profiles_param(tmp_path):
+    p6 = ('rank_11k', 'rank_1d', 'rank_6d')
+    files_6d = toy_files(tmp_path, name='d6', n_players=10, profiles=p6)
+    with pytest.raises(ValueError, match='rank_2d'):
+        sh.load_game_features(*files_6d)
+    _, g6 = sh.load_game_features(*files_6d, profiles=p6)
+    _, g2 = sh.load_game_features(*toy_files(tmp_path, name='d2', n_players=10))
+    # 兩份 toy 只有 profile 名稱不同，特徵要相同
+    for k in ('hsl', 'hslo', 'dist', 'stats', 's', 'r', 'd'):
+        np.testing.assert_array_equal(g6[k], g2[k])
+
+
+def test_game_side_features_uses_top_profile():
+    probs = [[0.1, 0.1], [0.2, 0.2], [0.4, 0.4]]
+    row = {'profiles': list(sh.PROFILES), 'probs': probs,
+           'move_rank': [[0, 1], [0, 0], [3, 3]], 'pmax': [[0.5, 0.5]] * 3, 'entropy': [[1.0, 1.0]] * 3}
+    _, _, s, r = sh.game_side_features(row)
+    assert np.isclose(s, np.log(4.0))
+    assert np.isclose(r, np.log(4.0))
+
+
+def test_two_stage_lr_loss_fills_nan():
+    rng = np.random.default_rng(0)
+    n = 200
+    y = np.repeat(np.arange(10), n // 10)
+    g = np.array(['%d|p%d' % (c, i % 4) for i, c in enumerate(y)])
+    f = rng.normal(size=(n, 4)) + y[:, None] * 0.3
+    f[::7, 2] = np.nan
+    cnn = np.log(np.full((n, 10), 0.1))
+    probs, s1, info = sh.two_stage('lr_loss', (f, y, g), f[:20], None, cnn, cnn[:20], seed=0, inner_folds=2)
+    assert np.isfinite(probs).all() and np.isfinite(s1).all()
+
+
+def test_fill_nan_uses_fit_mean():
+    f = np.array([[1.0, np.nan], [3.0, np.nan]])
+    g = np.array([[np.nan, 5.0]])
+    a, b = sh.fill_nan(f, g)
+    assert np.array_equal(a, [[1.0, 0.0], [3.0, 0.0]])
+    assert np.array_equal(b, [[2.0, 5.0]])

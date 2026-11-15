@@ -7,10 +7,11 @@
     dist     每個 profile 逐手 log 機率的 10、25、50、75、90 分位數與 log 機率 < log(0.01) 的比例，題內 nanmean
     stats    每個 profile 的 move_rank == 0 比例、log(1 + move_rank) 平均，加 rank_1d 的 pmax、entropy 平均，題內 nanmean
     hslo、disto、statso  同上，評的是對手的手
+    loss、losso  KataGo 1-visit 失誤特徵（aicup.loss_features），目標側與對手側，題內 nanmean
     within   每局指標 s、r、d 的題內 20、50、80 分位數與標準差
     logn     log 題內局數
-每局指標：s 是目標側逐手 log P(rank_6d) - log P(rank_11k) 的平均，r 是目標側 rank_6d 的 log(1 + move_rank) 平均，
-d 是同一局目標側的 s 減對手側的 s。
+每局指標：s 是目標側逐手 log P(強 profile) - log P(rank_11k) 的平均，r 是目標側強 profile 的 log(1 + move_rank) 平均，
+d 是同一局目標側的 s 減對手側的 s。強 profile 是 --profiles 的第三個，預設 rank_2d。
 
 方案：
     lr_base       cnn+hsl+hslo 的 logistic regression，用 --jsonl、--opp
@@ -22,6 +23,8 @@ d 是同一局目標側的 s 減對手側的 s。
     pool、pool_s1  兩段式：第一段是 hgb_all 去掉 cnn（--stage1 lr 時只用 hsl+hslo 的 LR），擬合玩家是 train 池加外層訓練玩家；
                   第二段是 cnn 加第一段 out-of-fold 的 log 機率的 LR。pool_s1 是第一段在測試題的輸出直接選等級
     nopool、nopool_s1  train 池為空的 pool、pool_s1
+    pool_lrloss、pool_lrloss_s1  同 pool、pool_s1，第一段是 hsl+hslo+loss+losso 的 LR，NaN 用擬合題的欄平均填補
+    nopool_lrloss、nopool_lrloss_s1  train 池為空的 pool_lrloss、pool_lrloss_s1
 HGB 的 max_depth 與 max_iter 在外層訓練玩家內依玩家切折選，max_iter 的候選用同一個模型的前幾輪預測。
 
 run 的 .npz 欄位：
@@ -57,11 +60,12 @@ from aicup.eval_humansl import PROB_FLOOR
 from aicup.eval_posthoc import SIZES, parse_sizes
 from aicup.fit_humansl import (CS, bootstrap_mean, level_probs, load_games, new_model, player_keys, player_means,
                                question_points, questions_of)
+from aicup.loss_features import N_LOSS, game_loss_features
 from aicup.scoring import LEVELS, pick_level
 from aicup.stack_humansl import (EPS, hsl_columns, level_weighted, load_cnn_probs, load_eval_players, load_hsl_opp,
                                  make_eval_splits, parse_cs, predict_inputs, question_features, select_c, train_rng)
 
-PROFILES = ('rank_11k', 'rank_1d', 'rank_6d')
+PROFILES = ('rank_11k', 'rank_1d', 'rank_2d')
 QUANTILES = (10, 25, 50, 75, 90)
 LOW_LOGP = np.log(0.01)
 WITHIN_QUANTILES = (20, 50, 80)
@@ -76,21 +80,25 @@ GROUP_WIDTH = {'cnn': len(LEVELS), 'hsl': len(PROFILES) + 1, 'dist': len(PROFILE
                'stats': len(PROFILES) * 2 + 2, 'within': len(INDICATORS) * (len(WITHIN_QUANTILES) + 1), 'logn': 1}
 for _g in ('hsl', 'dist', 'stats'):
     GROUP_WIDTH[_g + 'o'] = GROUP_WIDTH[_g]
+GROUP_WIDTH['loss'] = GROUP_WIDTH['losso'] = N_LOSS
 DIST_GROUPS = ('dist', 'stats', 'disto', 'statso')
 K_GROUPS = GROUP_ORDER
 ARM_GROUPS = {'hgb_all': K_GROUPS, 'hgb_all_lr': K_GROUPS,
               'hgb_nodist': tuple(g for g in K_GROUPS if g not in DIST_GROUPS),
               'hgb_nowithin': tuple(g for g in K_GROUPS if g != 'within')}
 STAGE1_GROUPS = {'hgb': tuple(g for g in K_GROUPS if g != 'cnn'), 'lr': ('hsl', 'hslo'),
-                 'hgb_hsl': ('hsl', 'hslo')}
+                 'hgb_hsl': ('hsl', 'hslo'), 'lr_loss': ('hsl', 'hslo', 'loss', 'losso')}
+LR_KINDS = ('lr', 'lr_loss')
 LR_ARMS = ('lr_base', 'lr_hist')
 HGB_ARMS = ('hgb_all', 'hgb_nodist', 'hgb_nowithin')
 POOL_ARMS = ('pool', 'pool_s1')
 EMPTY_POOL_ARMS = ('nopool', 'nopool_s1')
 HGB_HSL_POOL_ARMS = ('pool_hgbhsl', 'pool_hgbhsl_s1')
 HGB_HSL_EMPTY_POOL_ARMS = ('nopool_hgbhsl', 'nopool_hgbhsl_s1')
-ALL_STAGE1_POOL_ARMS = POOL_ARMS + HGB_HSL_POOL_ARMS
-ALL_STAGE1_EMPTY_ARMS = EMPTY_POOL_ARMS + HGB_HSL_EMPTY_POOL_ARMS
+LR_LOSS_POOL_ARMS = ('pool_lrloss', 'pool_lrloss_s1')
+LR_LOSS_EMPTY_POOL_ARMS = ('nopool_lrloss', 'nopool_lrloss_s1')
+ALL_STAGE1_POOL_ARMS = POOL_ARMS + HGB_HSL_POOL_ARMS + LR_LOSS_POOL_ARMS
+ALL_STAGE1_EMPTY_ARMS = EMPTY_POOL_ARMS + HGB_HSL_EMPTY_POOL_ARMS + LR_LOSS_EMPTY_POOL_ARMS
 ALL_ARMS = LR_ARMS + HGB_ARMS + ('hgb_all_lr',) + ALL_STAGE1_POOL_ARMS + ALL_STAGE1_EMPTY_ARMS
 DEFAULT_ARMS = ('lr_base', 'lr_hist', 'hgb_all', 'hgb_all_lr', 'hgb_nodist', 'hgb_nowithin')
 
@@ -121,7 +129,8 @@ def normalize_arms(arms, stage1):
     return tuple(out)
 
 
-def _nanmean(x, axis=None):
+def nanmean(x, axis=None):
+    """np.nanmean，整欄或整列都是 NaN 時不發出警告。"""
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', RuntimeWarning)
         return np.nanmean(x, axis=axis)
@@ -138,9 +147,18 @@ def _finite(v):
     return v[np.isfinite(v)]
 
 
+def parse_profiles(text):
+    """'rank_11k,rank_1d,rank_6d' 轉成 tuple。必須是 3 個，前兩個依序是 rank_11k、rank_1d，否則丟 argparse.ArgumentTypeError。"""
+    profiles = tuple(p.strip() for p in text.split(',') if p.strip())
+    if len(profiles) != len(PROFILES) or profiles[:2] != PROFILES[:2]:
+        raise argparse.ArgumentTypeError('profiles 要是 %s,<強 profile>，收到 %s' % (','.join(PROFILES[:2]), text))
+    return profiles
+
+
 def game_side_features(row, profiles=PROFILES):
     """一局一側的 (dist (18,), stats (8,), s, r)。
 
+    profiles 依序是 rank_11k、rank_1d、強 profile；s、r 用強 profile。
     每項先去掉 NaN 的手；沒有可用的手時為 NaN。沒有 move_rank 欄位（舊版 jsonl）時 stats 與 r 全為 NaN。
     """
     names = list(row['profiles'])
@@ -153,7 +171,7 @@ def game_side_features(row, profiles=PROFILES):
             dist += list(np.quantile(v, np.array(QUANTILES) / 100)) + [float((v < LOW_LOGP).mean())]
         else:
             dist += [np.nan] * (len(QUANTILES) + 1)
-    diff = _finite(logp[profiles.index('rank_6d')] - logp[profiles.index('rank_11k')])
+    diff = _finite(logp[2] - logp[0])
     s = float(diff.mean()) if len(diff) else np.nan
     stats = [np.nan] * GROUP_WIDTH['stats']
     r = np.nan
@@ -162,19 +180,19 @@ def game_side_features(row, profiles=PROFILES):
         for i in idx:
             v = _finite(row['move_rank'][i])
             stats += [float((v == 0).mean()), float(np.log1p(v).mean())] if len(v) else [np.nan, np.nan]
-        mid = idx[profiles.index('rank_1d')]
+        mid = idx[1]
         for name in ('pmax', 'entropy'):
             v = _finite(row[name][mid])
             stats.append(float(v.mean()) if len(v) else np.nan)
-        v = _finite(row['move_rank'][idx[profiles.index('rank_6d')]])
+        v = _finite(row['move_rank'][idx[2]])
         r = float(np.log1p(v).mean()) if len(v) else np.nan
     return np.array(dist), np.array(stats), s, r
 
 
-def load_side(path, data, side):
-    """jsonl 依 data['key'] 對齊，回傳 {'dist', 'stats', 's', 'r'}，每項的列對應 data 的局。
+def load_side(path, data, side, profiles=PROFILES):
+    """jsonl 依 data['key'] 對齊，回傳 {'dist', 'stats', 's', 'r', 'loss'}，每項的列對應 data 的局。
 
-    有 key 不在檔案內、等級不一致、side 不符，或 profiles 不含 rank_11k、rank_1d、rank_6d 時丟 ValueError。
+    有 key 不在檔案內、等級不一致、side 不符，或 jsonl 的 profiles 不含 profiles 時丟 ValueError。
     沒有 side 欄位的列視為 target。
     """
     with open(path, encoding='utf-8') as f:
@@ -182,34 +200,36 @@ def load_side(path, data, side):
     missing = [k for k in data['key'] if k not in rows]
     if missing:
         raise ValueError('%s 缺少 %d 局，例如 %s' % (path, len(missing), missing[0]))
-    out = {'dist': [], 'stats': [], 's': [], 'r': []}
+    out = {'dist': [], 'stats': [], 's': [], 'r': [], 'loss': []}
     for key, y in zip(data['key'], data['rank_idx']):
         row = rows[key]
         if row['rank_idx'] != y:
             raise ValueError('%s 的等級和目標側 jsonl 不一致，例如 %s' % (path, key))
         if row.get('side', 'target') != side:
             raise ValueError('%s 的 side 不是 %s，例如 %s' % (path, side, key))
-        if not set(PROFILES) <= set(row['profiles']):
-            raise ValueError('%s 的 profiles 缺少 %s' % (path, ', '.join(PROFILES)))
-        dist, stats, s, r = game_side_features(row)
+        if not set(profiles) <= set(row['profiles']):
+            raise ValueError('%s 的 profiles 缺少 %s' % (path, ', '.join(profiles)))
+        dist, stats, s, r = game_side_features(row, profiles)
         out['dist'].append(dist)
         out['stats'].append(stats)
         out['s'].append(s)
         out['r'].append(r)
+        out['loss'].append(game_loss_features(row))
     return {k: np.array(v, dtype=np.float64) for k, v in out.items()}
 
 
-def load_game_features(target_path, opp_path):
-    """讀兩側 jsonl，回傳 (data, games)。
+def load_game_features(target_path, opp_path, profiles=PROFILES):
+    """讀兩側 jsonl，回傳 (data, games)。dist、stats、s、r 用 profiles 計算。
 
     data 是 load_games 的目標側結果；games 是 {特徵群: 每局特徵}，含 hsl、dist、stats、hslo、disto、statso，
     以及每局指標 s、r、d（各為 (N,)）。
     """
     data = load_games(target_path)
-    tgt = load_side(target_path, data, 'target')
-    opp = load_side(opp_path, data, 'opponent')
+    tgt = load_side(target_path, data, 'target', profiles)
+    opp = load_side(opp_path, data, 'opponent', profiles)
     games = {'hsl': data['x'][:, hsl_columns(data)], 'dist': tgt['dist'], 'stats': tgt['stats'],
              'hslo': load_hsl_opp(opp_path, data), 'disto': opp['dist'], 'statso': opp['stats'],
+             'loss': tgt['loss'], 'losso': opp['loss'],
              's': tgt['s'], 'r': tgt['r'], 'd': tgt['s'] - opp['s']}
     return data, games
 
@@ -232,8 +252,8 @@ def question_matrix(games, cnn_probs, questions, temp):
         out['cnn'] = question_features(None, cnn_probs, questions, temp)
     for g in ('hsl', 'hslo'):
         out[g] = np.array([games[g][q].mean(axis=0) for q in questions])
-    for g in DIST_GROUPS:
-        out[g] = np.array([_nanmean(games[g][q], axis=0) for q in questions])
+    for g in DIST_GROUPS + ('loss', 'losso'):
+        out[g] = np.array([nanmean(games[g][q], axis=0) for q in questions])
     out['within'] = np.array([sum((within_stats(games[i][q]) for i in INDICATORS), []) for q in questions])
     out['logn'] = np.log(np.array([[len(q)] for q in questions], dtype=np.float64))
     return out
@@ -284,17 +304,27 @@ def fit_hgb(f, y, groups, seed, inner_folds=5):
     return hgb_model(*params, seed).fit(f, y), params
 
 
-def fill_nan(f_train, f_test):
-    """NaN 用 f_train 的欄平均填補；整欄都是 NaN 時填 0。"""
-    mean = np.nan_to_num(_nanmean(f_train, axis=0), nan=0.0)
-    return (np.where(np.isnan(f_train), mean, f_train), np.where(np.isnan(f_test), mean, f_test))
+def column_means(f):
+    """欄平均，忽略 NaN；整欄都是 NaN 時為 0。"""
+    return np.nan_to_num(nanmean(f, axis=0), nan=0.0)
+
+
+def fill_with(f, mean):
+    """f 的 NaN 用 mean（每欄一個值）填補。"""
+    return np.where(np.isnan(f), mean, f)
+
+
+def fill_nan(f_fit, *others):
+    """f_fit 與 others 的 NaN 用 f_fit 的欄平均填補，回傳填補後的 list；整欄都是 NaN 時填 0。"""
+    mean = column_means(f_fit)
+    return [fill_with(f, mean) for f in (f_fit,) + others]
 
 
 def fit_stage1(kind, params, f, y, seed):
     """第一段模型：hgb / hgb_hsl 時 params 是 (max_depth, max_iter)，lr 時是 C。"""
     if kind in ('hgb', 'hgb_hsl'):
         return hgb_model(*params, seed).fit(f, y)
-    elif kind == 'lr':
+    elif kind in LR_KINDS:
         return new_model(params).fit(f, y)
     raise ValueError('未知的 stage1 kind：%s' % kind)
 
@@ -310,8 +340,13 @@ def two_stage(kind, dev_tr, dev_te, pool, cnn_tr, cnn_te, seed, cs=CS, inner_fol
     cnn_tr、cnn_te 是 CNN 的每題 log 機率。第一段的超參數在 train 池加開發組訓練玩家上選一次；
     第二段用的訓練題第一段輸出是 out-of-fold，開發組訓練玩家依玩家切 inner_folds 折。
     info 有 stage1（第一段超參數）、stage2_c 與 fits（每次第一段擬合的 (用途, 擬合玩家的 set)）。
+    kind 為 lr_loss 時特徵先用開發組訓練題加 train 池的欄平均填補 NaN，只做一次，內層 out-of-fold 的被預測折也在平均內。
     """
     f_tr, y_tr, g_tr = dev_tr
+    if kind == 'lr_loss':
+        mean = column_means(f_tr if pool is None else np.vstack([f_tr, pool[0]]))
+        f_tr, dev_te = fill_with(f_tr, mean), fill_with(dev_te, mean)
+        pool = None if pool is None else (fill_with(pool[0], mean), pool[1], pool[2])
     if pool is not None:
         overlap = set(pool[2]) & set(g_tr)
         if overlap:
@@ -327,7 +362,7 @@ def two_stage(kind, dev_tr, dev_te, pool, cnn_tr, cnn_te, seed, cs=CS, inner_fol
     f_all, y_all, g_all = with_pool(every)
     if kind in ('hgb', 'hgb_hsl'):
         params, _ = select_hgb(f_all, y_all, g_all, seed, inner_folds)
-    elif kind == 'lr':
+    elif kind in LR_KINDS:
         params = select_c(f_all, y_all, g_all, cs, inner_folds)
     else:
         raise ValueError('未知的 stage1 kind：%s' % kind)
@@ -393,6 +428,10 @@ def evaluate(old, hist, cnn, splits, arms, seed, sizes=SIZES, train_repeats=10, 
             two_stage_requests.append(('hgb_hsl', HGB_HSL_POOL_ARMS, True))
         if set(HGB_HSL_EMPTY_POOL_ARMS) & set(arms):
             two_stage_requests.append(('hgb_hsl', HGB_HSL_EMPTY_POOL_ARMS, False))
+    if set(LR_LOSS_POOL_ARMS) & set(arms):
+        two_stage_requests.append(('lr_loss', LR_LOSS_POOL_ARMS, True))
+    if set(LR_LOSS_EMPTY_POOL_ARMS) & set(arms):
+        two_stage_requests.append(('lr_loss', LR_LOSS_EMPTY_POOL_ARMS, False))
 
     pool_qs = {}
     for s1, arm_pair, use_pool in two_stage_requests:
@@ -476,7 +515,7 @@ def summarize(scores, players, n_games, base, seed):
 
 def load_pool(args):
     """--pool-jsonl、--pool-opp 讀成 (data, games)，並和 --exclude-players 的清單比對 player_id。"""
-    pool = load_game_features(args.pool_jsonl, args.pool_opp)
+    pool = load_game_features(args.pool_jsonl, args.pool_opp, args.profiles)
     others = {Path(p).name: read_player_ids(p) for p in args.exclude_players}
     check_disjoint(set(pool[0]['player_id']), others)
     return pool
@@ -484,8 +523,8 @@ def load_pool(args):
 
 def cmd_run(args):
     arms = normalize_arms(tuple(a.strip() for a in args.arms.split(',') if a.strip()), args.stage1)
-    old = load_game_features(args.jsonl, args.opp)
-    hist = load_game_features(args.hist_jsonl, args.hist_opp)
+    old = load_game_features(args.jsonl, args.opp, args.profiles)
+    hist = load_game_features(args.hist_jsonl, args.hist_opp, args.profiles)
     data = hist[0]
     cnn = load_cnn_probs(args.cnn_probs, data['key'], data['rank_idx'])
     pool = load_pool(args) if args.pool_jsonl else None
@@ -602,6 +641,8 @@ def main():
     run.add_argument('--test-repeats', type=int, default=10)
     run.add_argument('--inner-folds', type=int, default=5)
     run.add_argument('--cs', type=parse_cs, default=CS)
+    run.add_argument('--profiles', type=parse_profiles, default=PROFILES,
+                     help='dist、stats、s、r 用的 3 個 profile，逗號分隔，第三個是強 profile')
     cmp_ = sub.add_parser('compare', help='多個 seed 合併的配對比較')
     cmp_.add_argument('--files', nargs='+', required=True, help='run 的輸出，路徑中的 {seed} 會代入各 seed')
     cmp_.add_argument('--seeds', default='42,43,44,45,46')
