@@ -58,8 +58,8 @@ from sklearn.model_selection import GroupKFold
 
 from aicup.eval_humansl import PROB_FLOOR
 from aicup.eval_posthoc import SIZES, parse_sizes
-from aicup.fit_humansl import (CS, bootstrap_mean, level_probs, load_games, new_model, player_keys, player_means,
-                               question_points, questions_of)
+from aicup.fit_humansl import (CS, bootstrap_mean, color_features, level_probs, load_games, new_model, player_keys,
+                               player_means, question_points, questions_of)
 from aicup.loss_features import N_LOSS, game_loss_features
 from aicup.scoring import LEVELS, pick_level
 from aicup.stack_humansl import (EPS, hsl_columns, level_weighted, load_cnn_probs, load_eval_players, load_hsl_opp,
@@ -222,7 +222,7 @@ def load_game_features(target_path, opp_path, profiles=PROFILES):
     """讀兩側 jsonl，回傳 (data, games)。dist、stats、s、r 用 profiles 計算。
 
     data 是 load_games 的目標側結果；games 是 {特徵群: 每局特徵}，含 hsl、dist、stats、hslo、disto、statso，
-    以及每局指標 s、r、d（各為 (N,)）。
+    以及每局指標 s、r、d（各為 (N,)）；目標側 jsonl 有 color、hd 時另有 co（(N, 3)，見 fit_humansl.color_features）。
     """
     data = load_games(target_path)
     tgt = load_side(target_path, data, 'target', profiles)
@@ -231,6 +231,8 @@ def load_game_features(target_path, opp_path, profiles=PROFILES):
              'hslo': load_hsl_opp(opp_path, data), 'disto': opp['dist'], 'statso': opp['stats'],
              'loss': tgt['loss'], 'losso': opp['loss'],
              's': tgt['s'], 'r': tgt['r'], 'd': tgt['s'] - opp['s']}
+    if 'black' in data:
+        games['co'] = color_features(data)
     return data, games
 
 
@@ -254,6 +256,8 @@ def question_matrix(games, cnn_probs, questions, temp):
         out[g] = np.array([games[g][q].mean(axis=0) for q in questions])
     for g in DIST_GROUPS + ('loss', 'losso'):
         out[g] = np.array([nanmean(games[g][q], axis=0) for q in questions])
+    if 'co' in games:
+        out['co'] = np.array([games['co'][q].mean(axis=0) for q in questions])
     out['within'] = np.array([sum((within_stats(games[i][q]) for i in INDICATORS), []) for q in questions])
     out['logn'] = np.log(np.array([[len(q)] for q in questions], dtype=np.float64))
     return out

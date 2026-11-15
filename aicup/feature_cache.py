@@ -14,10 +14,16 @@ import numpy as np
 from aicup.stack_hgb import PROFILES, load_game_features, parse_profiles
 
 DATA_ARRAYS = ('x', 'rank_idx', 'player_id', 'key')
+OPTIONAL_ARRAYS = ('black', 'hd')  # 目標側 jsonl 有 color、hd 時才有
 
 
 def source_info(*paths):
     return [{'path': os.path.abspath(p), 'size': os.path.getsize(p), 'mtime': os.path.getmtime(p)} for p in paths]
+
+
+def present(data):
+    """data 中有的選用陣列名稱；兩個要一起有。"""
+    return OPTIONAL_ARRAYS if all(k in data for k in OPTIONAL_ARRAYS) else ()
 
 
 def build(target, opp, out, profiles=PROFILES):
@@ -27,7 +33,7 @@ def build(target, opp, out, profiles=PROFILES):
             'feature_profiles': list(profiles),
             'has_loss': bool(data['has_loss']), 'sources': source_info(target, opp)}
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
-    np.savez(out, meta=json.dumps(meta), **{'d_' + k: data[k] for k in DATA_ARRAYS},
+    np.savez(out, meta=json.dumps(meta), **{'d_' + k: data[k] for k in DATA_ARRAYS + present(data)},
              **{'g_' + k: v for k, v in games.items()})
 
 
@@ -43,6 +49,7 @@ def load(path, check_sources=True):
             if not os.path.exists(s['path']) or source_info(s['path'])[0] != s:
                 raise ValueError('%s 的來源 %s 已變更，請重建快取' % (path, s['path']))
     data = {k: z['d_' + k] for k in DATA_ARRAYS}
+    data.update({k: z['d_' + k] for k in OPTIONAL_ARRAYS if 'd_' + k in z.files})
     data.update(n_profiles=meta['n_profiles'], profiles=tuple(meta['profiles']), has_loss=meta['has_loss'],
                 feature_profiles=tuple(meta.get('feature_profiles', meta['profiles'])))
     games = {k[2:]: z[k] for k in z.files if k.startswith('g_')}
@@ -58,7 +65,9 @@ def concat(parts):
             raise ValueError('快取的 profiles 或損失欄位不同')
         if set(games) != set(games0):
             raise ValueError('快取的特徵群不同')
-    data = {k: np.concatenate([d[k] for d, _ in parts]) for k in DATA_ARRAYS}
+    if len({present(d) for d, _ in parts}) > 1:
+        raise ValueError('快取有些有 color、hd，有些沒有')
+    data = {k: np.concatenate([d[k] for d, _ in parts]) for k in DATA_ARRAYS + present(data0)}
     data.update(n_profiles=data0['n_profiles'], profiles=data0['profiles'], has_loss=data0['has_loss'],
                 feature_profiles=data0['feature_profiles'])
     if len(set(data['key'])) != len(data['key']):

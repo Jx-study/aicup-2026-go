@@ -105,7 +105,7 @@ def test_question_matrix_widths(tmp_path):
     data, games = sh.load_game_features(*toy_files(tmp_path, n_players=10))
     q = [np.arange(5), np.arange(20, 40)]
     m = sh.question_matrix(games, toy_cnn(data), q, 3.0)
-    assert {g: m[g].shape[1] for g in m} == sh.GROUP_WIDTH
+    assert {g: m[g].shape[1] for g in m} == {**sh.GROUP_WIDTH, 'co': 3}
     assert sh.stack_groups(m, sh.K_GROUPS).shape == (2, 83)
     assert sh.stack_groups(m, sh.STAGE1_GROUPS['hgb']).shape == (2, 73)
     assert m['logn'][:, 0] == pytest.approx(np.log([5, 20]))

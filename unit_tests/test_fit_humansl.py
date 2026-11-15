@@ -251,3 +251,70 @@ def test_cnn_question_points_rejects_label_mismatch(tmp_path):
     np.savez(p, key=np.array(['a', 'b']), probs=np.full((2, 10), 0.1), rank_idx=np.array([3, 4]))
     with pytest.raises(ValueError, match='等級'):
         fh.cnn_question_points(str(p), np.array(['a', 'b']), [np.array([0, 1])], np.array([3]), 1.0)
+
+
+def color_data(n_black=6, n_white=3, n_hd=2):
+    # 一位玩家：黑 n_black 局、白 n_white 局，另有 n_hd 局 HD 為 2 的黑棋與一局 HD 為 1 的白棋
+    color = ['B'] * n_black + ['W'] * n_white + ['B'] * n_hd + ['W']
+    hd = [0] * (n_black + n_white) + [2] * n_hd + [1]
+    n = len(color)
+    return {'x': np.zeros((n, 1)), 'rank_idx': np.full(n, 3, np.int64), 'player_id': np.array(['p'] * n),
+            'key': np.array(['k%d' % i for i in range(n)]), 'black': np.array([c == 'B' for c in color]),
+            'hd': np.array(hd, np.int64)}
+
+
+def test_same_color_questions_single_color_no_handicap():
+    data = color_data()
+    qs, y, players = fh.same_color_questions(data, np.ones(len(data['key']), bool), 40, np.random.default_rng(0), (2, 5, 10))
+    assert len(qs) == 40 and set(players) == {'3|p'} and set(y) == {3}
+    for q in qs:
+        assert len(set(data['black'][q])) == 1
+        assert (data['hd'][q] < 2).all() and len(set(q)) == len(q)
+        assert len(q) in (2, 5)  # 黑 6 局、白 4 局（含 HD1），10 局的題不可能出現
+
+
+def test_same_color_questions_skip_color_below_min_size():
+    data = color_data(n_black=6, n_white=3)
+    qs, _, _ = fh.same_color_questions(data, np.ones(len(data['key']), bool), 30, np.random.default_rng(1), (5, 10))
+    assert all(data['black'][q].all() and len(q) == 5 for q in qs)  # 白棋只有 4 局可用，不被選到
+
+
+def test_same_color_questions_player_without_enough_games_skipped():
+    data = color_data(n_black=3, n_white=1)
+    with pytest.raises(ValueError):
+        fh.same_color_questions(data, np.ones(len(data['key']), bool), 3, np.random.default_rng(0), (5, 10))
+
+
+def test_same_color_questions_requires_color_columns():
+    with pytest.raises(ValueError):
+        fh.same_color_questions(make_data(), np.ones(360, bool), 1, np.random.default_rng(0))
+
+
+def test_color_features_question_mean():
+    data = color_data(n_black=2, n_white=2, n_hd=0)  # B B W W 加一局 HD1 的 W
+    co = fh.color_features(data)
+    assert co.shape == (5, 3)
+    np.testing.assert_allclose(co[4], [0, 1, 0])
+    np.testing.assert_allclose(co[[0, 2, 4]].mean(axis=0), [1 / 3, 1 / 3, 0])
+    black_h1 = color_data(n_black=1, n_white=0, n_hd=0)
+    black_h1['hd'][0] = 1
+    np.testing.assert_allclose(fh.color_features(black_h1)[0], [1, 1, 1])
+
+
+def test_load_games_reads_color_and_hd(tmp_path):
+    rows = [dict(row('a', 'p', 1), color='B', hd=0), dict(row('b', 'p', 1), color='W', hd=1)]
+    write_rows(tmp_path / 'g.jsonl', rows)
+    data = fh.load_games(str(tmp_path / 'g.jsonl'))
+    assert data['black'].tolist() == [True, False] and data['hd'].tolist() == [0, 1]
+    write_rows(tmp_path / 'h.jsonl', [row('c', 'p', 1), row('d', 'p', 1)])
+    assert 'black' not in fh.load_games(str(tmp_path / 'h.jsonl'))
+
+
+def test_load_games_rejects_partial_or_bad_color(tmp_path):
+    write_rows(tmp_path / 'm.jsonl', [dict(row('a', 'p', 1), color='B', hd=0), row('c', 'p', 1)])
+    with pytest.raises(ValueError, match='color'):
+        fh.load_games(str(tmp_path / 'm.jsonl'))
+    for bad in ('b', 'Black', ''):
+        write_rows(tmp_path / 'b.jsonl', [dict(row('a', 'p', 1), color=bad, hd=0)])
+        with pytest.raises(ValueError, match='B 或 W'):
+            fh.load_games(str(tmp_path / 'b.jsonl'))

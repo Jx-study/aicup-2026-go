@@ -47,6 +47,7 @@ def load_games(path, cuts=CUTS):
     """讀 jsonl，回傳 dict：x (N, D)、rank_idx、player_id、key、n_profiles、profiles、has_loss。
 
     各局的 profile 數、profile 名稱與是否有損失欄位必須一致，否則拒絕。
+    color 只能是 B 或 W；每局都有 color 與 hd 欄位時另有 black（目標玩家執黑）與 hd（讓子數）兩個每局陣列。
     profiles 是 profile 名稱的 tuple，jsonl 沒有 profiles 欄位時為 None。
     """
     with open(path, encoding='utf-8') as f:
@@ -62,11 +63,21 @@ def load_games(path, cuts=CUTS):
     has_loss = {'score_loss' in r for r in rows}
     if len(has_loss) > 1:
         raise ValueError('%s 有些局有損失欄位、有些沒有' % path)
-    return {'x': np.array([game_features(r, cuts) for r in rows]),
+    data = {'x': np.array([game_features(r, cuts) for r in rows]),
             'rank_idx': np.array([r['rank_idx'] for r in rows], np.int64),
             'player_id': np.array([r['player_id'] for r in rows]),
             'key': np.array([r['key'] for r in rows]),
             'n_profiles': n_profiles.pop(), 'profiles': names.pop(), 'has_loss': has_loss.pop()}
+    has_color = {'color' in r and 'hd' in r for r in rows}
+    if len(has_color) > 1:
+        raise ValueError('%s 有些局有 color、hd 欄位，有些沒有' % path)
+    if has_color.pop():
+        colors = {r['color'] for r in rows}
+        if not colors <= {'B', 'W'}:
+            raise ValueError('%s 的 color 只能是 B 或 W，看到 %s' % (path, sorted(map(str, colors - {'B', 'W'}))))
+        data['black'] = np.array([r['color'] == 'B' for r in rows])
+        data['hd'] = np.array([r['hd'] for r in rows], np.int64)
+    return data
 
 
 def feature_sets(n_profiles=10, has_loss=True, cuts=CUTS):
@@ -117,6 +128,42 @@ def questions_of(data, mask, repeats, rng, sizes):
     if not qs:
         raise ValueError('沒有玩家有 %d 局以上，無法出題' % min(sizes))
     return qs, np.concatenate(labels), keys[[q[0] for q in qs]]
+
+
+def same_color_questions(data, mask, repeats, rng, sizes=SIZES):
+    """同色、HD < 2 的題目，回傳 (questions, labels, players)，格式同 questions_of。
+
+    每位玩家每輪出 1 題：從 HD < 2 的局有 min(sizes) 局以上的顏色中隨機選一種，
+    局數從 sizes 中不超過該顏色可用局數的值隨機選。兩種顏色都不夠的玩家不出題。
+    """
+    if 'black' not in data:
+        raise ValueError('資料沒有 color、hd 欄位，無法出同色題')
+    keys = player_keys(data)
+    by_player = {}
+    for i in np.flatnonzero(mask & (data['hd'] < 2)):
+        by_player.setdefault(keys[i], ([], []))[0 if data['black'][i] else 1].append(i)
+    qs, labels, players = [], [], []
+    for _ in range(repeats):
+        for k in sorted(by_player):
+            opts = [c for c in (0, 1) if len(by_player[k][c]) >= min(sizes)]
+            if not opts:
+                continue
+            games = np.array(by_player[k][opts[rng.integers(len(opts))]])
+            usable = [s for s in sizes if s <= len(games)]
+            q = rng.choice(games, usable[rng.integers(len(usable))], replace=False)
+            qs.append(q)
+            labels.append(data['rank_idx'][q[0]])
+            players.append(k)
+    if not qs:
+        raise ValueError('沒有玩家有 %d 局以上同色、HD < 2 的局，無法出題' % min(sizes))
+    return qs, np.array(labels), np.array(players)
+
+
+def color_features(data):
+    """每局 3 欄 (N, 3)：執黑、HD 為 1、HD 為 1 且執黑；題內平均後是顏色、HD1 比例與兩者乘積的比例。"""
+    black = data['black'].astype(np.float64)
+    h1 = (data['hd'] == 1).astype(np.float64)
+    return np.c_[black, h1, h1 * black]
 
 
 def question_x(x, questions):
