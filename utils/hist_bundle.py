@@ -8,12 +8,17 @@
     python utils/hist_bundle.py --run train_p2 --move-stats
     python utils/hist_bundle.py --run train_p3 --move-stats
     python utils/hist_bundle.py --run holdout --move-stats
+    python utils/hist_bundle.py --run train_p4 --move-stats
 --move-stats 時主分析多輸出 move_rank、pmax、entropy。
+train_p4 第一次執行時寫出玩家清單 train-p4.csv：還沒抽過、HD < 2 的局中多數色 ≥ 10 局的玩家，
+每人抽多數色、HD < 2 的 10 局，主分析不送損失 query。
+train_p4b 是補局：train_p4 玩家中同色未抽局 ≥ 10 局的玩家，同色再抽 10 局，玩家清單 train-p4b.csv。
 """
 import argparse
 import glob
 import json
 import os
+import re
 import sys
 import zipfile
 
@@ -35,6 +40,8 @@ RUNS = {
     'train_p2': dict(base='train-p2', players='train-p2-v180000.csv', n=20000),
     'train_p3': dict(base='train-p3', players='train-p3-v180000.csv', n=20000),
     'holdout': dict(base='holdout', players='holdout-v180000.csv', sample=NEW498, n=3200),
+    'train_p4': dict(base='train-p4', players='train-p4.csv', same_color=10, no_eval=True, n=19950),
+    'train_p4b': dict(base='train-p4b', players='train-p4b.csv', topup='train_p4', same_color=10, no_eval=True, n=11980),
 }
 for _name in list(RUNS):
     RUNS[_name + '_opp'] = dict(RUNS[_name], side='opponent')
@@ -77,6 +84,67 @@ def listed_pairs(players_file):
     return set(zip(listed['player_id'], listed['rank']))
 
 
+def hd_of(sgf):
+    m = re.search(r'HD\[(\d+)\]', sgf)
+    return int(m.group(1)) if m else 0  # 沒有 HD 標記視為互先
+
+
+def make_p4_players(df, k, path):
+    """寫出 train_p4 的玩家清單：不在 humansl-analysis/*.csv 任何清單內，HD < 2 局中多數色 ≥ k 局。"""
+    used = set()
+    for f in glob.glob(os.path.join(HA, '*.csv')):
+        if os.path.abspath(f) == os.path.abspath(path):
+            continue
+        if 'player_id' in pd.read_csv(f, nrows=0).columns:
+            used |= set(pd.read_csv(f, usecols=['player_id'], dtype=str)['player_id'])
+    ok = df[df['sgf_content'].map(hd_of) < 2]
+    cnt = ok.groupby(['player_id', 'rank', 'color']).size().unstack(fill_value=0)
+    cnt = cnt[cnt.max(axis=1) >= k].reset_index()
+    cnt = cnt[~cnt['player_id'].astype(str).isin(used)]
+    cnt[['player_id', 'rank']].sort_values(['rank', 'player_id']).to_csv(path, index=False)
+    print('train_p4 玩家清單 %d 位，排除已抽過 %d 位 -> %s' % (len(cnt), len(used), path))
+
+
+def sample_same_color(df, listed, k, seed):
+    """清單內每位玩家取 HD < 2 局中多數色（同數取黑）的 k 局，seed 固定時結果只由清單決定。"""
+    key = set(zip(listed['player_id'], listed['rank']))
+    d = df[[(str(p), str(r)) in key for p, r in zip(df['player_id'], df['rank'])]]
+    d = d[d['sgf_content'].map(hd_of) < 2].sort_values('key')
+    parts = []
+    for _, g in d.groupby(['player_id', 'rank'], sort=True):
+        nb, nw = (g['color'] == 'B').sum(), (g['color'] == 'W').sum()
+        side = g[g['color'] == ('B' if nb >= nw else 'W')]
+        assert len(side) >= k, (g['player_id'].iloc[0], len(side))
+        parts.append(side.sample(n=k, random_state=seed))
+    assert len(parts) == len(key), (len(parts), len(key))
+    return pd.concat(parts, ignore_index=True)
+
+
+def sample_topup(df, prev_run, k, seed, path):
+    """補局：prev_run 的每位玩家取和 prev_run 相同的顏色、HD < 2、未抽過的局，剩餘 ≥ k 局的玩家抽 k 局。
+
+    第一次執行時寫出玩家清單 path。
+    """
+    prev = pd.read_csv(os.path.join(HA, 'hist-' + prev_run, 'games.csv'), dtype=str)
+    prev['key'] = prev['rank'] + '_' + prev['game_id']
+    color = prev.groupby(['player_id', 'rank'])['color'].agg(lambda c: c.iloc[0])
+    assert (prev.groupby(['player_id', 'rank'])['color'].nunique() == 1).all()
+    d = df[~df['key'].isin(set(prev['key'])) & (df['sgf_content'].map(hd_of) < 2)].copy()
+    d['pk'] = list(zip(d['player_id'].astype(str), d['rank'].astype(str)))
+    want = {pk: c for pk, c in color.items()}
+    d = d[[want.get(pk) == c for pk, c in zip(d['pk'], d['color'])]].sort_values('key')
+    cnt = d.groupby('pk').size()
+    ok = sorted(pk for pk, n in cnt.items() if n >= k)
+    if not os.path.exists(path):
+        pd.DataFrame(ok, columns=['player_id', 'rank']).to_csv(path, index=False)
+        print('%s 補局玩家 %d 位 -> %s' % (prev_run, len(ok), path))
+    listed = pd.read_csv(path, dtype=str)
+    keep = set(zip(listed['player_id'], listed['rank']))
+    assert keep <= set(ok)
+    d = d[d['pk'].isin(keep)]
+    return pd.concat([g.sample(n=k, random_state=seed) for _, g in d.groupby('pk', sort=True)], ignore_index=True)
+
+
 def control_rows(df):
     """對照組：val648-p3.jsonl 前 40 局，回傳 (棋譜列, ref)。"""
     old = []
@@ -104,6 +172,17 @@ def run_games(run, cfg, df):
         rows = df.set_index('key').loc[keys].reset_index()
         assert (rows['player_id'].astype(str).values == np.array([r['player_id'] for r in old])).all()
         return rows[GAME_COLS]
+    if cfg.get('topup'):
+        rows = sample_topup(df, cfg['topup'], cfg['same_color'], SEED, os.path.join(HA, cfg['players']))
+        assert len(rows) == cfg['n'], (len(rows), cfg['n'])
+        return rows[GAME_COLS]
+    if cfg.get('same_color'):
+        path = os.path.join(HA, cfg['players'])
+        if not os.path.exists(path):
+            make_p4_players(df, cfg['same_color'], path)
+        listed = pd.read_csv(path, dtype=str)
+        assert len(listed) * cfg['same_color'] == cfg['n'], (len(listed), cfg['n'])
+        return sample_same_color(df, listed, cfg['same_color'], SEED)[GAME_COLS]
     listed = pd.read_csv(os.path.join(HA, cfg.get('sample', cfg['players'])), dtype=str)
     rows = ah.sample_listed_players(df, listed, PER_PLAYER, SEED)
     keep = listed_pairs(cfg['players'])
@@ -133,6 +212,7 @@ def make_notebook(run, cfg, move_stats):
     src = '--test-dir /content/hist/tests' if cfg.get('test') else '--csv /content/hist/games.csv'
     flags = '--pre-root-history' + (' --side opponent' if cfg['side'] == 'opponent' else '')
     flags += ' --move-stats' if move_stats else ''
+    eval_flag = '--no-eval' if cfg.get('no_eval') else '--eval-visits 1'
     prof_str = ' '.join(PROFILES3)
     override_str = 'numAnalysisThreads=32,numSearchThreadsPerAnalysisThread=1'
     
@@ -142,11 +222,11 @@ def make_notebook(run, cfg, move_stats):
     cells = [
         md('# Human SL 抽取：%s（Google Colab T4 GPU 版）\n\n'
            '- 任務：%s（%s，共 %d 局）\n'
-           '- Profiles：%s + eval_visits=1（包含目數損失）\n'
+           '- Profiles：%s，損失 query：`%s`\n'
            '- 平行設定：`%s`\n'
            '- 旗標：`%s`\n'
            '- 進度每批備份至 Google Drive，斷線後重跑會接續\n'
-           % (run, run, '對手側' if cfg['side'] == 'opponent' else '目標側', total, prof_str, override_str, flags)),
+           % (run, run, '對手側' if cfg['side'] == 'opponent' else '目標側', total, prof_str, eval_flag, override_str, flags)),
         
         md('### 1. 掛載 Google Drive 與建立工作目錄'),
         code("BATCH = 400\n"
@@ -264,14 +344,14 @@ def make_notebook(run, cfg, move_stats):
              "    !python -m aicup.analyze_humansl %s "
              "--model-dir /content/models --katago-dir /content/katago "
              "--model kata1-b28c512nbt-s13255194368-d5935380940.bin.gz --human-model b18c384nbt-humanv0.bin.gz "
-             "--profiles %s --eval-visits 1 %s "
+             "--profiles %s %s %s "
              '--override-config "%s" '
              "--limit {n} --out {LOCAL}\n"
              "    # 每批自動同步回 Google Drive 備份，斷線不掉局\n"
              "    !cp -f {LOCAL} {REMOTE} && wc -l {REMOTE}\n"
              "n1 = sum(1 for _ in open(LOCAL))\n"
              "print('本 session 完成 %%d 局，%%.0f 秒，每局 %%.2f 秒' %% (n1 - n0, time.time() - t0, (time.time() - t0) / max(n1 - n0, 1)))"
-             % (total, src, prof_str, flags, override_str)),
+             % (total, src, prof_str, eval_flag, flags, override_str)),
         
         md('### 5. 輸出完整性驗證'),
         code("rows = [json.loads(l) for l in open(LOCAL)]\n"
