@@ -535,3 +535,17 @@ def test_analyze_group_move_stats_nan_when_illegal():
     for name in ('move_rank', 'pmax', 'entropy'):
         assert np.isnan(np.array(r[name], dtype=float)[:, 0]).all()  # 第一手的 A19 不合法
         assert not np.isnan(np.array(r[name], dtype=float)[:, 1]).any()
+
+
+def test_check_profiles_accepts_preaz_of_same_levels():
+    ah.check_profiles(['rank_11k', 'preaz_1d', 'preaz_11k'])
+    for bad in ('preaz_7d', 'proyear_2020', 'xrank_1d'):
+        with pytest.raises(SystemExit):
+            ah.check_profiles([bad])
+
+
+def test_main_rejects_test_dir_with_keys_from(tmp_path, monkeypatch):
+    monkeypatch.setattr('sys.argv', ['analyze_humansl', '--test-dir', 'tests', '--keys-from', 'k.jsonl',
+                                     '--out', str(tmp_path / 'o.jsonl')])
+    with pytest.raises(SystemExit, match='--keys-from'):
+        ah.main()

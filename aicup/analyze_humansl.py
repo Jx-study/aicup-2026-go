@@ -34,6 +34,8 @@ from aicup.scoring import LEVELS
 # 各等級對應的 profile，取等級範圍的中間值
 PROFILES = ['rank_11k', 'rank_8k', 'rank_5k', 'rank_2k',
             'rank_1d', 'rank_2d', 'rank_3d', 'rank_4d', 'rank_5d', 'rank_6d']
+# preaz_ 是 AlphaZero 之前的棋譜，棋力檔位和 PROFILES 相同
+PREAZ_PROFILES = ['preaz_' + p[len('rank_'):] for p in PROFILES]
 BOARD = 19
 GTP_COLS = 'ABCDEFGHJKLMNOPQRST'  # GTP 座標沒有 I
 PASS_INDEX = BOARD * BOARD
@@ -179,8 +181,8 @@ class Engine:
             self.out.put(json.loads(line))
         self.out.put(None)  # 進程結束
 
-    def run(self, queries, timeout=600):
-        """送出所有 query，回傳 {id: {turnNumber: 回應}}，回應只留 humanPolicy、rootInfo；出錯的 id 值為 None。"""
+    def run(self, queries, timeout=600, keep=('humanPolicy', 'rootInfo')):
+        """送出所有 query，回傳 {id: {turnNumber: 回應}}，回應只留 keep 列出的欄位；出錯的 id 值為 None。"""
         want = {q['id']: len(q['analyzeTurns']) for q in queries}
         for q in queries:
             self.proc.stdin.write(json.dumps(q) + '\n')
@@ -204,7 +206,7 @@ class Engine:
                     got[qid] = None
                 continue
             if got.get(qid) is not None:
-                got[qid][r['turnNumber']] = {k: r[k] for k in ('humanPolicy', 'rootInfo') if k in r}
+                got[qid][r['turnNumber']] = {k: r[k] for k in keep if k in r}
         return got
 
     def close(self):
@@ -334,6 +336,30 @@ def load_games(csv_glob, per_rank, seed, limit, players_per_rank=0, games_per_pl
             for _, r in df.iterrows()]
 
 
+def load_games_by_keys(csv_glob, keys):
+    """依 key（等級_game_id）從 CSV 取局，回傳每局一個 dict；找不到的 key 以 SystemExit 拒絕。"""
+    paths = sorted(glob.glob(csv_glob))
+    if not paths:
+        raise SystemExit('找不到 %s' % csv_glob)
+    found = {}
+    for p in paths:
+        for chunk in pd.read_csv(p, chunksize=20000, dtype={'player_id': str}):
+            chunk = chunk.assign(key=chunk['rank'].astype(str) + '_' + chunk['game_id'].astype(str))
+            for _, r in chunk[chunk['key'].isin(keys)].iterrows():
+                found[r['key']] = {'key': r['key'], 'rank_idx': LEVELS.index(r['rank']),
+                                   'player_id': str(r['player_id']), 'color': r['color'],
+                                   'sgf': r['sgf_content']}
+    missing = keys - set(found)
+    if missing:
+        raise SystemExit('CSV 找不到 %d 局，例如 %s' % (len(missing), sorted(missing)[0]))
+    return [found[k] for k in sorted(found)]
+
+
+def read_keys(path):
+    with open(path, encoding='utf-8') as f:
+        return {json.loads(line)['key'] for line in f if line.strip()}
+
+
 def test_game_keys(qids, games):
     """測試題逐局的 key：question_id 加題內序號，順序同 predict_rank.read_questions 的 games。"""
     seen = {}
@@ -380,9 +406,9 @@ def done_keys(path, eval_visits, profiles=PROFILES, side='target', pre_root_hist
 
 
 def check_profiles(profiles):
-    unknown = [p for p in profiles if p not in PROFILES]
+    unknown = [p for p in profiles if p not in PROFILES + PREAZ_PROFILES]
     if unknown:
-        raise SystemExit('未知的 profile：%s，可用的有 %s' % (' '.join(unknown), ' '.join(PROFILES)))
+        raise SystemExit('未知的 profile：%s，可用的有 %s' % (' '.join(unknown), ' '.join(PROFILES + PREAZ_PROFILES)))
 
 
 def main():
@@ -392,6 +418,7 @@ def main():
     ap.add_argument('--players-per-rank', type=int, default=0, help='每個等級抽幾位玩家，非 0 時忽略 --per-rank')
     ap.add_argument('--games-per-player', type=int, default=20, help='每位玩家抽幾局，局數不足的玩家不抽')
     ap.add_argument('--players-file', help='含 player_id、rank 欄位的 CSV，只抽清單內的玩家，有人局數不足時拒絕')
+    ap.add_argument('--keys-from', help='既有的 jsonl，只分析裡面出現的 key，不能和抽樣參數、--test-dir 同時使用')
     ap.add_argument('--test-dir', help='競賽二測試題所在目錄；給定時不讀 --csv，不能和抽樣參數同時使用')
     ap.add_argument('--limit', type=int, default=0, help='最多分析幾局，用於冒煙測試')
     ap.add_argument('--seed', type=int, default=42)
@@ -420,10 +447,17 @@ def main():
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
     done = done_keys(args.out, eval_visits, args.profiles, args.side, args.pre_root_history)
     todo, bad = [], 0
+    if args.test_dir and args.keys_from:
+        raise SystemExit('--test-dir 不能和 --keys-from 同時使用')
     if args.test_dir:
         if args.per_rank or args.players_per_rank or args.players_file:
             raise SystemExit('--test-dir 不能和 --per-rank、--players-per-rank、--players-file 同時使用')
         games = load_test_games(args.test_dir, args.limit)
+    elif args.keys_from:
+        if args.per_rank or args.players_per_rank or args.players_file:
+            raise SystemExit('--keys-from 不能和 --per-rank、--players-per-rank、--players-file 同時使用')
+        games = load_games_by_keys(args.csv, read_keys(args.keys_from))
+        games = games[:args.limit] if args.limit else games
     else:
         games = load_games(args.csv, args.per_rank, args.seed, args.limit,
                            args.players_per_rank, args.games_per_player, args.players_file)
