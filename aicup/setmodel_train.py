@@ -33,31 +33,43 @@ STD_SAMPLE = 200_000  # 估計標準化的平均與標準差用的向量數
 LRS = (1e-3, 3e-4)
 
 
-def load_games(out_dir):
+def load_games(out_dirs):
     """讀 setmodel_trunk 的輸出，回傳 dict：key、player_id、rank_idx（各 (n,)）、vec (n, PER_GAME, DIM) float16、mask (n, PER_GAME) bool。
 
-    每局向量依序放在 vec 前 count 個位置，其餘補 0。沒有 part 檔或 count 超過 PER_GAME 時以 SystemExit 拒絕。
+    out_dirs 是一個目錄或目錄 list，依序串接。每局向量依序放在 vec 前 count 個位置，其餘補 0。
+    任一目錄沒有 part 檔、count 超過 PER_GAME 或 key 重複時以 SystemExit 拒絕。
     """
-    paths = sorted(glob.glob(os.path.join(out_dir, 'part-*.npz')))
-    if not paths:
-        raise SystemExit('%s 沒有 part 檔' % out_dir)
-    keys, players, ranks, counts, padded = [], [], [], [], []
-    for path in paths:
+    out_dirs = [out_dirs] if isinstance(out_dirs, str) else list(out_dirs)
+    paths = []
+    for out_dir in out_dirs:  # 依目錄順序串接
+        found = sorted(glob.glob(os.path.join(out_dir, 'part-*.npz')))
+        if not found:
+            raise SystemExit('%s 沒有 part 檔' % out_dir)
+        paths += found
+    keys, players, ranks, counts = [], [], [], []
+    for path in paths:  # 先讀小欄位，決定總局數後一次配置 vec，避免串接時記憶體加倍
         with np.load(path) as z:
-            count, vec = z['count'], z['vec']
+            count = z['count']
             if (count > PER_GAME).any():
                 raise SystemExit('%s 有局的向量數超過 %d' % (path, PER_GAME))
             keys.append(z['key'].astype(str))
             players.append(z['player_id'].astype(str))
             ranks.append(z['rank_idx'])
             counts.append(count)
-            out = np.zeros((len(count), PER_GAME, DIM), np.float16)  # 逐 part 補齊，不保留串接後的原始陣列
-            for i, (s, c) in enumerate(zip(np.cumsum(count) - count, count)):
-                out[i, :c] = vec[s:s + c]
-            padded.append(out)
+    out = np.zeros((sum(len(c) for c in counts), PER_GAME, DIM), np.float16)
+    row = 0
+    for path, count in zip(paths, counts):
+        with np.load(path) as z:
+            vec = z['vec']
+        for s, c in zip(np.cumsum(count) - count, count):
+            out[row, :c] = vec[s:s + c]
+            row += 1
+    key = np.concatenate(keys)
+    if len(set(key)) != len(key):
+        raise SystemExit('%s 有重複的局' % out_dirs)
     count = np.concatenate(counts)
-    return {'key': np.concatenate(keys), 'player_id': np.concatenate(players), 'rank_idx': np.concatenate(ranks),
-            'vec': np.concatenate(padded), 'mask': np.arange(PER_GAME)[None, :] < count[:, None]}
+    return {'key': key, 'player_id': np.concatenate(players), 'rank_idx': np.concatenate(ranks),
+            'vec': out, 'mask': np.arange(PER_GAME)[None, :] < count[:, None]}
 
 
 def align(games, keys):
@@ -70,11 +82,15 @@ def align(games, keys):
     return games['vec'][idx], games['mask'][idx]
 
 
-def fit_standardizer(vec, mask, rng, n=STD_SAMPLE):
-    """從 mask 為真的向量中抽 n 個估計每維平均與標準差，回傳 (mean, std) float32。"""
-    valid = np.argwhere(mask)
+def fit_standardizer(vec, mask, rng, n=STD_SAMPLE, rows=None):
+    """從 mask 為真的向量中抽 n 個估計每維平均與標準差，回傳 (mean, std) float32。
+
+    rows 給定時只用這些局，結果和傳入 vec[rows]、mask[rows] 相同，但不複製 vec。
+    """
+    rows = np.arange(len(mask)) if rows is None else np.asarray(rows)
+    valid = np.argwhere(mask[rows])
     pick = valid[rng.choice(len(valid), min(n, len(valid)), replace=False)]
-    x = vec[pick[:, 0], pick[:, 1]].astype(np.float32)
+    x = vec[rows[pick[:, 0]], pick[:, 1]].astype(np.float32)
     return x.mean(axis=0), np.maximum(x.std(axis=0), 1e-3)
 
 
@@ -179,12 +195,25 @@ def evaluate(model, vec, mask, rank_idx, val_games, val_questions, owner, batch=
     return score, loss
 
 
+def class_weights(player_labels):
+    """每級權重 = 玩家總數 / (10 × 該級玩家數)，各級的權重和相同；沒有玩家的等級權重為 0。回傳 (10,) float32。"""
+    counts = np.bincount(np.asarray(player_labels), minlength=N_LEVELS).astype(np.float64)
+    w = np.where(counts > 0, counts.sum() / (N_LEVELS * np.maximum(counts, 1)), 0.0)
+    return w.astype(np.float32)
+
+
 def train_one(vec, mask, rank_idx, train_games, val_games, val_q, val_owner, lr, epochs, args, mean, std, rng, log):
-    """用固定學習率訓練 epochs 個 epoch，回傳 (最佳 epoch 的 state_dict, 最佳得分, 最佳 epoch, 每個 epoch 的紀錄)。"""
+    """用固定學習率訓練 epochs 個 epoch，回傳 (最佳 epoch 的 state_dict, 最佳得分, 最佳 epoch, 每個 epoch 的紀錄)。
+
+    args.balance 為真時，損失依訓練玩家的等級人數倒數加權。
+    """
     import torch
     torch.manual_seed(args.seed)
     model = build_model(mean, std, args.dim, args.dropout)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=args.weight_decay)
+    weight = None
+    if getattr(args, 'balance', False):
+        weight = torch.from_numpy(class_weights([rank_idx[g[0]] for g in train_games]))
     best, history = (None, -1.0, 0), []
     for epoch in range(1, epochs + 1):
         t0 = time.time()
@@ -196,7 +225,7 @@ def train_one(vec, mask, rank_idx, train_games, val_games, val_q, val_owner, lr,
         for s in range(0, len(order), args.batch):
             b = order[s:s + args.batch]
             logits = question_logits(model, vec, mask, [questions[i] for i in b])
-            loss = torch.nn.functional.cross_entropy(logits, torch.from_numpy(labels[b]))
+            loss = torch.nn.functional.cross_entropy(logits, torch.from_numpy(labels[b]), weight=weight)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -263,7 +292,7 @@ def load_model(path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    ap.add_argument('--train-dir', required=True, help='setmodel_trunk extract --set train 的輸出目錄')
+    ap.add_argument('--train-dir', required=True, nargs='+', help='setmodel_trunk extract --set train 的輸出目錄，可給多個')
     ap.add_argument('--out', required=True, help='輸出的 checkpoint 路徑，旁邊另存同名 .json 記錄驗證曲線')
     ap.add_argument('--epochs', type=int, default=12)
     ap.add_argument('--lrs', type=lambda t: tuple(float(v) for v in t.split(',')), default=LRS)
@@ -275,6 +304,7 @@ def main():
     ap.add_argument('--val-frac', type=float, default=0.1)
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--max-games', type=int, help='冒煙測試：只用前 N 局')
+    ap.add_argument('--balance', action='store_true', help='損失依等級人數倒數加權，各級人數不同時用')
     args = ap.parse_args()
 
     games = load_games(args.train_dir)
@@ -290,10 +320,12 @@ def main():
     print('train %d 位，val %d 位' % (len(train_games), len(val_games)), flush=True)
     vec, mask, rank_idx = games['vec'], games['mask'], games['rank_idx']
     train_idx = np.concatenate(train_games)
-    mean, std = fit_standardizer(vec[train_idx], mask[train_idx], rng)  # 只用訓練玩家，驗證玩家不影響標準化
+    mean, std = fit_standardizer(vec, mask, rng, rows=train_idx)  # 只用訓練玩家，驗證玩家不影響標準化
     val_q, val_owner = player_questions(val_games, np.random.default_rng([args.seed, 1]), args.questions_per_player)
     train_labels = np.array([rank_idx[g[0]] for g in train_games])
     prior = np.bincount(train_labels, minlength=N_LEVELS).astype(float) + 1.0
+    if args.balance:
+        prior = np.ones(N_LEVELS)  # 加權後模型輸出不帶等級先驗，沒有向量的題也用均勻先驗
     prior_logp = np.log(prior / prior.sum())
 
     best, runs = None, []

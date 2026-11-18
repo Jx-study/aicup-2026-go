@@ -7,7 +7,8 @@
 
 棋譜都來自 --train-dir，必須是官方訓練集 v1.1（含 HD[n]），舊版沒有讓子資訊時拒絕。
 兩種局集合：
-    train  split_by_player(df, SPLIT_VAL_SIZE) 的 train 玩家中局數 >= 20 者，每級 --players-per-rank 位，每人抽 20 局
+    train  split_by_player(df, SPLIT_VAL_SIZE) 的 train 玩家中局數 >= 20 者，每級 --players-per-rank 位（0 為全取），每人抽 20 局
+           --skip-per-rank N 時去掉每級名單的前 N 位
     eval   --keys-from 指定的 jsonl 的局（開發組 20 局）
 
 輸出目錄每 --chunk 局一個 part-XXXXXX.npz，重跑同一指令會跳過已完成的 part；timing.json 記錄起訖時間。
@@ -57,6 +58,7 @@ def select_train_players(df_train, players_per_rank=PLAYERS_PER_RANK, min_games=
 
     每級依 player_id 排序後以同一個 rng 依 LEVELS 順序洗牌，取前 players_per_rank 位，
     所以縮減人數時取同一份名單的前綴，不會換人。局數不足的等級以 SystemExit 拒絕。
+    players_per_rank <= 0 時每級全取（各級人數不同），順序同樣是洗牌後的名單。
     """
     rng = np.random.default_rng(seed)
     counts = df_train.groupby(['rank', 'player_id']).size()
@@ -64,9 +66,11 @@ def select_train_players(df_train, players_per_rank=PLAYERS_PER_RANK, min_games=
     picked = []
     for rank in LEVELS:
         ids = sorted(counts.xs(rank, level='rank').index.astype(str)) if rank in counts.index.get_level_values('rank') else []
-        if len(ids) < players_per_rank:
+        if 0 < players_per_rank and len(ids) < players_per_rank:
             raise SystemExit('等級 %s 局數 >= %d 的玩家只有 %d 位，不足 %d' % (rank, min_games, len(ids), players_per_rank))
-        order = rng.permutation(len(ids))[:players_per_rank]
+        order = rng.permutation(len(ids))
+        if players_per_rank > 0:
+            order = order[:players_per_rank]
         picked += [(ids[i], rank) for i in order]
     return pd.DataFrame(picked, columns=['player_id', 'rank'])
 
@@ -89,13 +93,19 @@ def check_v11(df, train_dir):
         raise SystemExit('%s 的棋譜沒有 HD[n]，不是官方訓練集 v1.1' % train_dir)
 
 
-def train_games(train_dir, players_per_rank):
-    """train 集合：每局一個 dict（key、rank_idx、player_id、color、sgf）。"""
+def train_games(train_dir, players_per_rank, skip_per_rank=0):
+    """train 集合：每局一個 dict（key、rank_idx、player_id、color、sgf）。
+
+    skip_per_rank > 0 時去掉每級名單的前 skip_per_rank 位，只對剩下的玩家抽局，
+    用來在既有的固定人數抽取之外補抽其餘玩家。
+    """
     df = load_dataframe(train_dir)
     check_v11(df, train_dir)
     df['player_id'] = df['player_id'].astype(str)
     _, df_train = split_by_player(df, SPLIT_VAL_SIZE)
     players = select_train_players(df_train, players_per_rank)
+    if skip_per_rank > 0:
+        players = players[players.groupby('rank').cumcount() >= skip_per_rank]
     sub = sample_listed_players(df_train, players, GAMES_PER_PLAYER, SEED)
     return [to_game(r) for _, r in sub.iterrows()]
 
@@ -182,7 +192,7 @@ def setup_model(args):
 
 def get_games(args):
     if args.set == 'train':
-        return train_games(args.train_dir, args.players_per_rank)
+        return train_games(args.train_dir, args.players_per_rank, args.skip_per_rank)
     if not args.keys_from:
         raise SystemExit('--set eval 要給 --keys-from')
     return eval_games(args.keys_from, args.train_dir)
@@ -191,6 +201,7 @@ def get_games(args):
 def check_config(args):
     """輸出目錄的 extract_config.json 和這次的參數不同時拒絕，沒有則寫入。part 編號只在同一組參數下對得到同一批局。"""
     config = {'set': args.set, 'players_per_rank': args.players_per_rank if args.set == 'train' else None,
+              'skip_per_rank': args.skip_per_rank if args.set == 'train' else None,
               'chunk': args.chunk, 'dtype': args.dtype,
               'keys_from': os.path.basename(args.keys_from) if args.keys_from else None}
     path = os.path.join(args.out, 'extract_config.json')
@@ -306,7 +317,8 @@ def main():
     ap.add_argument('--set', choices=['train', 'eval'], required=True)
     ap.add_argument('--train-dir', default='training-v1.1/training', help='官方訓練集 v1.1 的 train_*.csv 所在目錄，要含 HD[n]')
     ap.add_argument('--keys-from', help='--set eval 用的 jsonl')
-    ap.add_argument('--players-per-rank', type=int, default=PLAYERS_PER_RANK)
+    ap.add_argument('--players-per-rank', type=int, default=PLAYERS_PER_RANK, help='train 每級人數，0 表示每級全取')
+    ap.add_argument('--skip-per-rank', type=int, default=0, help='train 去掉每級名單的前 N 位，補抽既有抽取以外的玩家')
     ap.add_argument('--out', help='extract 的輸出目錄')
     ap.add_argument('--katago-python', help='KataGo 原始碼的 python/ 目錄，缺省時讀環境變數 KATAGO_PYTHON')
     ap.add_argument('--checkpoint')

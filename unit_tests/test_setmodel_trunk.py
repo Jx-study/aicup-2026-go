@@ -42,6 +42,20 @@ def test_select_train_players_prefix_and_counts():
     assert all(counts[(r, p)] >= st.MIN_GAMES for p, r in zip(full['player_id'], full['rank']))
 
 
+def test_select_train_players_all_keeps_prefix():
+    df = make_df(30, 20)
+    df = df[~((df['rank'] == '6D') & (df['player_id'] >= '6D020'))]  # 最後一級少 10 位，不影響前面等級的 rng 狀態
+    full = st.select_train_players(df, 0)
+    some = st.select_train_players(make_df(30, 20), 5)
+    counts = df.groupby(['rank', 'player_id']).size()
+    eligible = counts[counts >= st.MIN_GAMES]
+    for rank in LEVELS:
+        got = list(full[full['rank'] == rank]['player_id'])
+        assert sorted(got) == sorted(eligible.xs(rank, level='rank').index)
+        if rank != LEVELS[-1]:  # 前面各級的 rng 狀態相同，全取的前綴就是固定人數的名單
+            assert got[:5] == list(some[some['rank'] == rank]['player_id'])
+
+
 def test_select_train_players_rejects_short_level():
     with pytest.raises(SystemExit):
         st.select_train_players(make_df(5, 20), 10)
@@ -74,7 +88,7 @@ def test_split_val_size_covers_dev_and_holdout():
 
 def test_check_config_rejects_change(tmp_path):
     import argparse
-    args = argparse.Namespace(set='train', players_per_rank=200, chunk=200, dtype='fp16', keys_from=None,
+    args = argparse.Namespace(set='train', players_per_rank=200, skip_per_rank=0, chunk=200, dtype='fp16', keys_from=None,
                               out=str(tmp_path))
     st.check_config(args)
     st.check_config(args)

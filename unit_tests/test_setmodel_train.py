@@ -94,6 +94,38 @@ def test_training_learns_separable_signal():
     assert score > 0.5 and 1 <= epoch <= 5
 
 
+def test_fit_standardizer_rows_matches_copy():
+    games = toy_games(n_players=20, games_per_player=4)
+    games['mask'][::3, 20:] = False
+    rows = np.arange(5, 60, 2)
+    a = st.fit_standardizer(games['vec'][rows], games['mask'][rows], np.random.default_rng(7), n=500)
+    b = st.fit_standardizer(games['vec'], games['mask'], np.random.default_rng(7), n=500, rows=rows)
+    assert np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1])
+
+
+def test_class_weights_equalize_levels():
+    labels = np.array([0] * 6 + [1] * 2 + [2] * 2)
+    w = st.class_weights(labels)
+    assert w.shape == (st.N_LEVELS,)
+    total = np.bincount(labels, minlength=st.N_LEVELS) * w
+    assert np.allclose(total[:3], total[0]) and np.all(w[3:] == 0)
+    assert np.isclose(total[0], len(labels) / st.N_LEVELS)
+
+
+def test_training_with_balance_runs():
+    games = toy_games(n_players=60, games_per_player=8)
+    args = argparse.Namespace(seed=0, dim=16, dropout=0.0, weight_decay=0.0, batch=16, questions_per_player=4,
+                              balance=True)
+    rng = np.random.default_rng(0)
+    train_p, val_p = st.split_players(games['player_id'], games['rank_idx'], 0.3, rng)
+    mean, std = st.fit_standardizer(games['vec'], games['mask'], rng)
+    val_q, owner = st.player_questions(val_p, np.random.default_rng(1), 4)
+    _, _, _, history = st.train_one(games['vec'], games['mask'], games['rank_idx'], train_p, val_p, val_q, owner,
+                                    lr=3e-3, epochs=2, args=args, mean=mean, std=std,
+                                    rng=np.random.default_rng(2), log=lambda row: None)
+    assert len(history) == 2 and np.isfinite(history[-1]['train_loss'])
+
+
 def test_load_games_pads_and_aligns(tmp_path):
     rng = np.random.default_rng(0)
     vec = rng.normal(size=(5, st.DIM)).astype(np.float16)
@@ -106,3 +138,17 @@ def test_load_games_pads_and_aligns(tmp_path):
     assert m.sum(axis=1).tolist() == [2, 0] and np.array_equal(v[0, :2], vec[3:5])
     with pytest.raises(ValueError):
         st.align(games, ['c', 'zzz'])
+
+
+def test_load_games_multiple_dirs(tmp_path):
+    rng = np.random.default_rng(0)
+    for name, keys in [('a', ['k1', 'k2']), ('b', ['k3'])]:
+        d = tmp_path / name
+        d.mkdir()
+        np.savez(d / 'part-000000.npz', key=np.array(keys), player_id=np.array(['p'] * len(keys)),
+                 rank_idx=np.zeros(len(keys), np.int64), count=np.ones(len(keys), np.int64),
+                 vec=rng.normal(size=(len(keys), st.DIM)).astype(np.float16))
+    games = st.load_games([str(tmp_path / 'a'), str(tmp_path / 'b')])
+    assert list(games['key']) == ['k1', 'k2', 'k3']
+    with pytest.raises(SystemExit):  # 同一個目錄給兩次，key 重複
+        st.load_games([str(tmp_path / 'a'), str(tmp_path / 'a')])
