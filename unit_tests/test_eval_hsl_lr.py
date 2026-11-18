@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from aicup import eval_hsl_lr
+from aicup.scoring import pick_level
 
 
 def test_parse_arm():
@@ -29,6 +30,16 @@ def test_main_rejects_overlapping_pools_and_excluded_players(tmp_path, monkeypat
         run('--pool', 'a=a.npz', '--pool', 'b=b.npz')
     with pytest.raises(ValueError, match='p4'):
         run('--pool', 'c=c.npz', '--exclude-players', str(exclude))
+
+
+def test_main_rejects_pool_with_different_extra(tmp_path, monkeypatch):
+    extra = {'dev.npz': {'group': 'hslx', 'profiles': ['rank_2d']}, 'a.npz': None}
+    monkeypatch.setattr(eval_hsl_lr.feature_cache, 'load', lambda path: (
+        {'player_id': np.array([path]), 'extra': extra[path]}, {}))
+    monkeypatch.setattr('sys.argv', ['eval_hsl_lr', '--dev', 'dev.npz', '--eval-players', 'x', '--out',
+                                     str(tmp_path / 'o.npz'), '--arm', 'm=hsl@a', '--pool', 'a=a.npz'])
+    with pytest.raises(SystemExit):
+        eval_hsl_lr.main()
 
 
 def load_toy(tmp_path, **kw):
@@ -80,3 +91,42 @@ def test_evaluate_runs_color_and_plain_arms(tmp_path):
     only_e = eval_hsl_lr.evaluate(dev, {'pl': pool}, arms[1:], splits, 3, sizes, 2, cs=(0.1, 1.0), inner_folds=2,
                                   log=lambda *_: None)[0]
     assert np.array_equal(only_e['E'], preds['E'])  # 方案之間互不影響
+
+
+def test_evaluate_runs_extra_group_arm(tmp_path):
+    dev = load_toy(tmp_path, name='dev', n_players=20, games=20)
+    pool = load_toy(tmp_path, name='pool', n_players=20, games=20, prefix='q', seed=7)
+    rng = np.random.default_rng(1)
+    for d in (dev, pool):
+        d[1]['hslx'] = rng.normal(size=(len(d[0]['key']), 1))
+    sizes = (2, 5)
+    splits = eval_hsl_lr.retest_splits(dev[0], toy_splits(dev, sizes), 3, sizes, 'sc', 2)
+    arms = [('E', ('hsl', 'hslo', 'co'), ('pl',)), ('X', ('hsl', 'hslo', 'co', 'hslx'), ('pl',))]
+    preds, params = eval_hsl_lr.evaluate(dev, {'pl': pool}, arms, splits, 3, sizes, 2, cs=(0.1, 1.0), inner_folds=2,
+                                         log=lambda *_: None)
+    n = sum(len(s[1]) for s in splits)
+    assert preds['X'].shape == (n,) and set(params) == {'E', 'X'}
+
+
+def test_evaluate_probs_out_matches_preds(tmp_path):
+    dev = load_toy(tmp_path, name='dev', n_players=20, games=20)
+    sizes = (2, 5)
+    splits = eval_hsl_lr.retest_splits(dev[0], toy_splits(dev, sizes), 3, sizes, 'sc', 2)
+    arms = [('E', ('hsl', 'hslo', 'co'), ())]
+    probs = {}
+    preds, _ = eval_hsl_lr.evaluate(dev, {}, arms, splits, 3, sizes, 2, cs=(0.1, 1.0), inner_folds=2,
+                                    log=lambda *_: None, probs_out=probs)
+    n = sum(len(s[1]) for s in splits)
+    assert probs['E'].shape == (n, 10)
+    assert np.allclose(probs['E'].sum(1), 1)
+    assert np.array_equal(pick_level(probs['E']), preds['E'])
+
+
+def test_main_rejects_arm_with_group_missing_from_cache(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(eval_hsl_lr.feature_cache, 'load', lambda path: (
+        {'player_id': np.array(['d'])}, {'hsl': np.zeros((1, 2)), 'hslo': np.zeros((1, 2))}))
+    monkeypatch.setattr('sys.argv', ['eval_hsl_lr', '--dev', 'dev.npz', '--eval-players', 'x', '--out',
+                                     str(tmp_path / 'o.npz'), '--arm', 'm=hsl,hslx@'])
+    with pytest.raises(SystemExit):
+        eval_hsl_lr.main()
+    assert 'hslx' in capsys.readouterr().err

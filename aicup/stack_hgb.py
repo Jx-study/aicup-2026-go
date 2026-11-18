@@ -82,6 +82,7 @@ for _g in ('hsl', 'dist', 'stats'):
     GROUP_WIDTH[_g + 'o'] = GROUP_WIDTH[_g]
 GROUP_WIDTH['loss'] = GROUP_WIDTH['losso'] = N_LOSS
 DIST_GROUPS = ('dist', 'stats', 'disto', 'statso')
+EXTRA_PREFIX = 'hslx'  # feature_cache 額外對手側 profile 的特徵群名稱前綴
 K_GROUPS = GROUP_ORDER
 ARM_GROUPS = {'hgb_all': K_GROUPS, 'hgb_all_lr': K_GROUPS,
               'hgb_nodist': tuple(g for g in K_GROUPS if g not in DIST_GROUPS),
@@ -247,12 +248,13 @@ def within_stats(values):
 def question_matrix(games, cnn_probs, questions, temp):
     """每題的特徵，回傳 {特徵群: (題數, 寬度)}；cnn_probs 為 None 時沒有 cnn。
 
-    只用每題自己的局，不使用標籤。hsl、hslo 用平均（同 stack_humansl），其餘逐局特徵用 nanmean。
+    只用每題自己的局，不使用標籤。hsl、hslo 與 EXTRA_PREFIX 開頭的特徵群用平均（同 stack_humansl），其餘逐局特徵用 nanmean。
     """
     out = {}
     if cnn_probs is not None:
         out['cnn'] = question_features(None, cnn_probs, questions, temp)
-    for g in ('hsl', 'hslo'):
+    extra = sorted(k for k in games if k.startswith(EXTRA_PREFIX))
+    for g in ['hsl', 'hslo'] + extra:
         out[g] = np.array([games[g][q].mean(axis=0) for q in questions])
     for g in DIST_GROUPS + ('loss', 'losso'):
         out[g] = np.array([nanmean(games[g][q], axis=0) for q in questions])

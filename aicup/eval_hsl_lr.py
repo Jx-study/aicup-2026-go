@@ -72,8 +72,11 @@ def retest_splits(data, splits, seed, sizes, test_type, repeats=10):
     return out
 
 
-def evaluate(dev, pools, arms, splits, seed, sizes=SIZES, train_repeats=10, temp=3.0, cs=CS, inner_folds=5, log=print):
+def evaluate(dev, pools, arms, splits, seed, sizes=SIZES, train_repeats=10, temp=3.0, cs=CS, inner_folds=5, log=print,
+             probs_out=None):
     """回傳 ({方案: 依 splits 順序合併的預測等級}, {方案: 各折選到的 C})。
+
+    probs_out 給 dict 時，每個方案的逐題 10 級機率（依 splits 順序合併）寫進 probs_out[方案]。
 
     特徵群含 co 的方案用同色、HD < 2 的擬合題，其餘方案用混色擬合題；同一份測試題給所有方案。
     """
@@ -87,6 +90,7 @@ def evaluate(dev, pools, arms, splits, seed, sizes=SIZES, train_repeats=10, temp
             pool_q[key] = pool_questions(pools, names, seed, train_repeats, sizes, temp, key[1])
     preds = {a[0]: [] for a in arms}
     params = {a[0]: [] for a in arms}
+    probs_of = {a[0]: [] for a in arms}
     for f, (train, q, _, _) in enumerate(splits):
         test_players = set(player_keys(data)[[i[0] for i in q]])
         m_te = question_matrix(games, None, q, temp)
@@ -108,9 +112,13 @@ def evaluate(dev, pools, arms, splits, seed, sizes=SIZES, train_repeats=10, temp
             assert not (test_players & set(g_all)), '擬合玩家含測試玩家'
             f_all, f_te = fill_nan(f_all, stack_groups(m_te, groups))
             c = select_c(f_all, y_all, g_all, cs, inner_folds)
-            preds[name].append(pick_level(level_probs(new_model(c).fit(f_all, y_all), f_te)))
+            probs = level_probs(new_model(c).fit(f_all, y_all), f_te)
+            preds[name].append(pick_level(probs))
+            probs_of[name].append(probs)
             params[name].append(c)
         log('折 %d 完成：%s' % (f, json.dumps({a: params[a][-1] for a in params})))
+    if probs_out is not None:
+        probs_out.update({a: np.concatenate(v) for a, v in probs_of.items()})
     return {a: np.concatenate(v) for a, v in preds.items()}, params
 
 
@@ -129,6 +137,7 @@ def main():
     ap.add_argument('--inner-folds', type=int, default=5)
     ap.add_argument('--cs', type=parse_cs, default=CS)
     ap.add_argument('--out', required=True)
+    ap.add_argument('--save-probs', action='store_true', help='輸出 .npz 另存每個方案的逐題 10 級機率（probs_方案）')
     args = ap.parse_args()
 
     t0 = time.time()
@@ -138,6 +147,9 @@ def main():
     for spec in args.pool:
         name, path = spec.split('=', 1)
         pools[name] = feature_cache.load(path)
+    for name, pool in pools.items():
+        if pool[0].get('extra') != dev[0].get('extra'):
+            ap.error('train 池 %s 的額外 profile 和開發組不同：%s、%s' % (name, pool[0].get('extra'), dev[0].get('extra')))
     others = {'開發組': set(dev[0]['player_id'])}
     others.update({Path(p).name: read_player_ids(p) for p in args.exclude_players})
     for name, pool in pools.items():
@@ -145,6 +157,9 @@ def main():
     names = list(pools)
     for i, a in enumerate(names):
         check_disjoint(set(pools[a][0]['player_id']), {n: set(pools[n][0]['player_id']) for n in names[i + 1:]})
+    missing = sorted({g for _, groups, _ in arms for g in groups} - set(dev[1]) - {'within', 'logn'})
+    if missing:
+        ap.error('開發組快取沒有特徵群：%s' % ', '.join(missing))
     unknown = sorted({n for _, _, names in arms for n in names} - set(pools))
     if unknown:
         ap.error('未定義的 train 池：%s' % ', '.join(unknown))
@@ -159,8 +174,9 @@ def main():
     print('%d 局，%d 位玩家出測試題，%d 題，seed %d，train 池 %s'
           % (len(data['key']), len(set(players)), len(questions), args.seed,
              '、'.join('%s %d 位' % (n, len(set(player_keys(p[0])))) for n, p in pools.items()) or '無'))
+    probs = {} if args.save_probs else None
     preds, params = evaluate(dev, pools, arms, splits, args.seed, args.sizes, args.train_repeats, cs=args.cs,
-                             inner_folds=args.inner_folds)
+                             inner_folds=args.inner_folds, probs_out=probs)
     scores = {a: question_points(labels, p) for a, p in preds.items()}
     n_games = np.array([len(q) for q in questions])
     summarize(scores, players, n_games, arms[0][0], args.seed)
@@ -168,7 +184,8 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez(out, player_id=players, keys=np.array([','.join(data['key'][q]) for q in questions]),
              rank_idx=labels, n_games=n_games, params=json.dumps(params),
-             **{'score_' + a: s for a, s in scores.items()})
+             **{'score_' + a: s for a, s in scores.items()},
+             **{'probs_' + a: v.astype(np.float32) for a, v in (probs or {}).items()})
     print('逐題分數 -> %s（%.0f 秒）' % (out, time.time() - t0))
 
 

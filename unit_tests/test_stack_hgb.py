@@ -461,3 +461,13 @@ def test_fill_nan_uses_fit_mean():
     a, b = sh.fill_nan(f, g)
     assert np.array_equal(a, [[1.0, 0.0], [3.0, 0.0]])
     assert np.array_equal(b, [[2.0, 5.0]])
+
+
+def test_question_matrix_averages_extra_groups(tmp_path):
+    data, games = sh.load_game_features(*toy_files(tmp_path, n_players=10))
+    n = len(data['key'])
+    extra = np.arange(n * 2, dtype=float).reshape(n, 2)
+    games = dict(games, hslx=extra)
+    q = [np.arange(3)]
+    m = sh.question_matrix(games, None, q, 3.0)
+    assert m['hslx'] == pytest.approx(np.array([[(0 + 2 + 4) / 3, (1 + 3 + 5) / 3]]))
