@@ -77,7 +77,8 @@ def epoch_games(player, cap, seed, epoch):
         if seen[p] < cap:
             seen[p] += 1
             keep[j] = True
-    return order[keep]
+    # 再打亂一次：局數多的玩家保留的局集中在前段，不打亂會讓 epoch 後段偏向局數少的玩家
+    return rng.permutation(order[keep])
 
 
 def class_weights(labels, n=N_CLASSES):

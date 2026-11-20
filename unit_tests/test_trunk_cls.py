@@ -30,6 +30,13 @@ def test_epoch_games_cap_and_determinism():
     assert not np.array_equal(a, tc.epoch_games(player, 4, 42, 1))
 
 
+def test_epoch_games_heavy_player_spread():
+    # 1 位 300 局的玩家加 300 位各 1 局的玩家；保留的 20 局應散布在整個 epoch，不集中在前段
+    player = np.concatenate([np.zeros(300, np.int64), np.arange(1, 301)])
+    pos = [np.flatnonzero(tc.epoch_games(player, 20, s, 0) < 300).mean() for s in range(20)]
+    assert 120 < np.mean(pos) < 200  # 全部 320 局，均勻時平均位置約 160
+
+
 def test_class_weights():
     w = tc.class_weights(np.array([0, 0, 0, 1]), n=2)
     assert w.mean() == pytest.approx(1.0)
