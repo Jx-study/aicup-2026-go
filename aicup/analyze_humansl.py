@@ -156,12 +156,9 @@ def build_eval_query(qid, game, turns, rules, max_visits):
 
 
 class Engine:
-    """KataGo analysis engine 子進程。stdout 由另一條 thread 讀，避免回應塞滿 pipe 時雙方互等。
+    """KataGo analysis engine 子進程。stdout 由另一條 thread 讀，避免回應塞滿 pipe 時雙方互等。"""
 
-    human_model 為 None 時只載入主模型。
-    """
-
-    def __init__(self, katago_dir, model, human_model=None, config=None, override=''):
+    def __init__(self, katago_dir, model, human_model, config=None, override=''):
         env = dict(os.environ)
         # KataGo 的 CUDA 12 版要用 pip nvidia 套件的函式庫
         libs = [d for d in glob.glob('/usr/local/lib/python3*/dist-packages/nvidia/*/lib')
@@ -173,9 +170,7 @@ class Engine:
         override = ','.join(filter(None, [override, 'reportAnalysisWinratesAs=BLACK']))
         cmd = [os.path.join(katago_dir, 'katago'), 'analysis',
                '-config', config or os.path.join(katago_dir, 'analysis_example.cfg'),
-               '-model', model, '-override-config', override]
-        if human_model:  # 不給時只載入主模型，rootInfo 沒有 human 欄位
-            cmd += ['-human-model', human_model]
+               '-model', model, '-human-model', human_model, '-override-config', override]
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=self.log, text=True, env=env)
         self.out = queue.Queue()
