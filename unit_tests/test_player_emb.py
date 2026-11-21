@@ -348,6 +348,141 @@ def test_packed_and_sgf_inference_consistency(tmp_path):
         np.testing.assert_allclose(zp['emb'].astype(np.float32), zt['emb'].astype(np.float32), atol=1e-3)
 
 
+def _sgf_with_moves(n_moves, hd=0, offset=0):
+    # 依序落在不重複的點，黑白交替，不會下在已有子的位置
+    coords = [(r, c) for r in range(19) for c in range(19)]
+    letters = 'abcdefghijklmnopqrs'
+    body = ''.join(
+        ';%s[%s%s]' % ('B' if i % 2 == 0 else 'W', letters[c], letters[r])
+        for i, (r, c) in enumerate(coords[offset:offset + n_moves])
+    )
+    return '(;GM[1]FF[4]SZ[19]HD[%d]%s)' % (hd, body)
+
+
+def test_sgf_to_head_features_equals_truncated_sgf():
+    long_sgf = _sgf_with_moves(300)
+    head = infer_player_emb.sgf_to_head_features(long_sgf, 249)
+    expected = predict_rank.sgf_to_features(_sgf_with_moves(249))
+    np.testing.assert_array_equal(head, expected)
+    assert not np.array_equal(head, predict_rank.sgf_to_features(long_sgf))
+
+    # 局長不超過 head_moves 時截斷前後相同，回傳 None 沿用完整視角
+    assert infer_player_emb.sgf_to_head_features(_sgf_with_moves(249), 249) is None
+    assert infer_player_emb.sgf_to_head_features(_sgf_with_moves(10), 249) is None
+    assert infer_player_emb.sgf_to_head_features('not an sgf', 249) is None
+
+
+def test_head_moves_packed_and_test_modes(tmp_path):
+    # 3 局超過 head_moves，2 局沒有；含讓子局與白方
+    head_moves = 6
+    cases = [
+        ('D_g0', 'p0', _sgf_with_moves(12), 'b', 0),
+        ('D_g1', 'p0', _sgf_with_moves(5, offset=20), 'w', 0),
+        ('D_g2', 'p1', _sgf_with_moves(9, hd=3, offset=40), 'w', 3),
+        ('D_g3', 'p1', _sgf_with_moves(6, offset=60), 'b', 0),
+        ('C_g4', 'p2', _sgf_with_moves(15, offset=80), 'w', 0),
+    ]
+    long_mask = np.array([True, False, True, False, True])
+
+    feat_dir = tmp_path / 'feat'
+    val_dir = feat_dir / 'val'
+    val_dir.mkdir(parents=True)
+    packed.save_shard(str(val_dir / 's0.npz'), [{
+        'features': packed.pack(predict_rank.sgf_to_features(s)),
+        'rank_idx': LEVELS.index(k.split('_')[0]),
+        'color': 0 if col == 'b' else 1,
+        'key': k,
+        'player_id': pid,
+    } for k, pid, s, col, _ in cases])
+    np.savez(feat_dir / 'hd.npz', key=np.array([c[0] for c in cases]), hd=np.array([c[4] for c in cases], dtype=np.int8))
+
+    sgf_dir = tmp_path / 'v11'
+    sgf_dir.mkdir()
+    for rk in ('D', 'C'):
+        pd.DataFrame([
+            {'player_id': pid, 'game_id': k.split('_', 1)[1], 'rank': rk, 'color': col.upper(), 'sgf_content': s}
+            for k, pid, s, col, _ in cases if k.startswith(rk + '_')
+        ]).to_csv(sgf_dir / ('train_%s.csv' % rk), index=False)
+
+    ckpt_dir = tmp_path / 'ckpt'
+    ckpt_dir.mkdir()
+    torch.manual_seed(7)
+    model = train_player_emb.GoStyleEmbedNet(in_channels=500, num_channels=8, num_blocks=1, embed_dim=16)
+    torch.save(model.state_dict(), ckpt_dir / 'best_model.pth')
+    (ckpt_dir / 'train_config.json').write_text(
+        '{"channels": 8, "blocks": 1, "embed_dim": 16, "dropout": 0.2, "color": "swap", "raw_color": false}',
+        encoding='utf-8',
+    )
+    common = ['--ckpt', str(ckpt_dir / 'best_model.pth'), '--tta', '4', '--batch-size', '2', '--nproc', '1', '--no-amp']
+
+    head_out = tmp_path / 'newdev_head.npz'
+    infer_player_emb.main([
+        '--mode', 'packed', '--feat-dir', str(feat_dir), '--sgf-dir', str(sgf_dir),
+        '--head-moves', str(head_moves), '--out', str(head_out), *common,
+    ])
+
+    # 對照組：把長局的 SGF 直接截到前 head_moves 手，走一般 test 模式
+    tests_dir = tmp_path / 'tests'
+    tests_dir.mkdir()
+    pd.DataFrame([
+        {'game_id': k, 'player_id': pid, 'sgf_content': s, 'color': col}
+        for k, pid, s, col, _ in cases
+    ]).to_csv(tests_dir / 'player_identification_candidates2_public.csv', index=False)
+    trunc_dir = tmp_path / 'trunc'
+    trunc_dir.mkdir()
+    pd.DataFrame([
+        {'game_id': k, 'player_id': pid, 'color': col,
+         'sgf_content': _sgf_with_moves(head_moves, hd=hd, offset=20 * i)}
+        for i, (k, pid, s, col, hd) in enumerate(cases)
+    ]).to_csv(trunc_dir / 'player_identification_candidates2_public.csv', index=False)
+
+    cache = tmp_path / 'cache'
+    infer_player_emb.main(['--mode', 'test', '--tests-dir', str(tests_dir), '--groups', 'b',
+                           '--head-moves', str(head_moves), '--out-dir', str(cache), *common])
+    infer_player_emb.main(['--mode', 'test', '--tests-dir', str(trunc_dir), '--groups', 'b',
+                           '--out-dir', str(tmp_path / 'ref'), *common])
+
+    with np.load(head_out, allow_pickle=False) as zp, \
+            np.load(cache / 'pub2_cand_head_emb.npz', allow_pickle=False) as zt, \
+            np.load(tmp_path / 'ref' / 'pub2_cand_emb.npz', allow_pickle=False) as zr:
+        np.testing.assert_array_equal(zp['valid'], long_mask)
+        np.testing.assert_array_equal(zt['valid'], long_mask)
+        np.testing.assert_array_equal(zp['key'], [c[0] for c in cases])
+        assert int(zp['head_moves']) == head_moves and int(zt['head_moves']) == head_moves
+        ep, et, er = (z['emb'].astype(np.float32) for z in (zp, zt, zr))
+        np.testing.assert_allclose(ep[long_mask], er[long_mask], atol=1e-3)
+        np.testing.assert_allclose(et[long_mask], er[long_mask], atol=1e-3)
+        assert np.all(ep[~long_mask] == 0) and np.all(et[~long_mask] == 0)
+        assert 'head_moves' not in zr.files
+
+
+def test_head_moves_packed_rejects_color_mismatch(tmp_path):
+    feat_dir = tmp_path / 'feat'
+    (feat_dir / 'val').mkdir(parents=True)
+    s = _sgf_with_moves(8)
+    packed.save_shard(str(feat_dir / 'val' / 's0.npz'), [{
+        'features': packed.pack(predict_rank.sgf_to_features(s)),
+        'rank_idx': 0, 'color': 0, 'key': 'D_g0', 'player_id': 'p0',
+    }])
+    sgf_dir = tmp_path / 'v11'
+    sgf_dir.mkdir()
+    pd.DataFrame([{'game_id': 'g0', 'color': 'W', 'sgf_content': s}]).to_csv(sgf_dir / 'train_D.csv', index=False)
+    ckpt_dir = tmp_path / 'ckpt'
+    ckpt_dir.mkdir()
+    model = train_player_emb.GoStyleEmbedNet(in_channels=500, num_channels=8, num_blocks=1, embed_dim=16)
+    torch.save(model.state_dict(), ckpt_dir / 'best_model.pth')
+    (ckpt_dir / 'train_config.json').write_text(
+        '{"channels": 8, "blocks": 1, "embed_dim": 16, "dropout": 0.2, "color": "swap", "raw_color": false}',
+        encoding='utf-8',
+    )
+    with pytest.raises(SystemExit, match='執色'):
+        infer_player_emb.main([
+            '--mode', 'packed', '--ckpt', str(ckpt_dir / 'best_model.pth'), '--feat-dir', str(feat_dir),
+            '--sgf-dir', str(sgf_dir), '--head-moves', '4', '--out', str(tmp_path / 'o.npz'),
+            '--nproc', '1', '--no-amp',
+        ])
+
+
 def test_aggregate_and_center_similarity_edge_cases():
     from aicup import fuse_player
 

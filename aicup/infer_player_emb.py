@@ -6,14 +6,22 @@
 
 另提供候選池中心化與多局聚合餘弦相似度計算函式，供離線評估與融合使用。
 
+--head-moves N 產生前段視角：SGF 只保留前 N 手再抽特徵，只對超過 N 手的局推論，
+其他局與解析失敗的局填零向量、valid 為 False。packed 模式改由 --sgf-dir 的 CSV 讀 SGF，
+因為打包分片只有最後 250 個盤面。
+
 用法（在 repo 根目錄）：
     python -m aicup.infer_player_emb --mode packed --ckpt player-trained-models/emb/best_model.pth \\
         --feat-dir rank-features-v180000 --players humansl-analysis/val-players-newdev-v180000.csv \\
         --tta 8 --out player-trained-models/emb-cache/newdev_emb.npz
     python -m aicup.infer_player_emb --mode test --ckpt player-trained-models/emb/best_model.pth \\
         --groups b --tta 8 --out-dir player-trained-models/emb-cache
+    python -m aicup.infer_player_emb --mode packed --ckpt player-trained-models/emb/best_model.pth \\
+        --players humansl-analysis/val-players-newdev-v180000.csv --head-moves 249 \\
+        --sgf-dir training-v1.1/training --out player-trained-models/emb-cache/newdev_head_emb.npz
 """
 import argparse
+import functools
 import json
 import os
 import time
@@ -26,6 +34,7 @@ import torch
 from aicup import color, packed
 from aicup.extract_features import COLOR_TO_ID
 from aicup.predict_rank import file_sha256, sgf_to_features
+from aicup.scoring import LEVELS
 from aicup.train_player_emb import (
     GoStyleEmbedNet,
     extract_split_embeddings,
@@ -44,6 +53,8 @@ SPLIT_GROUPS = {
         ('priv2', 'player_identification_candidates2_private.csv', 'player_identification_test2_private.csv'),
     ],
 }
+
+_head_parser = None  # 每個子進程各自建立的 SGF parser
 
 
 def load_emb_model(ckpt_path, device):
@@ -76,6 +87,27 @@ def compute_sgf_feature_colors(sgfs, raw_colors, raw_color_flag=False):
     return color.feature_color(c_arr, hds).astype(np.uint8)
 
 
+def sgf_to_head_features(sgf_content, head_moves):
+    """只保留前 head_moves 手抽特徵，頂層函式供 multiprocessing 使用。
+
+    局長不超過 head_moves 時截斷前後特徵相同，回傳 None 表示沿用完整視角；解析失敗也回傳 None。
+    """
+    global _head_parser
+    if sgf_content.count(';') - 1 <= head_moves:  # 節點數上限
+        return None
+    if _head_parser is None:
+        from utils import SGFParseRankPrediction  # 子進程才載入 sgfmill
+        _head_parser = SGFParseRankPrediction()
+    try:
+        from sgfmill import sgf
+        states = _head_parser._extract_game_states(sgf.Sgf_game.from_string(sgf_content))
+    except Exception:
+        return None
+    if len(states) - 1 <= head_moves:  # 第 0 個盤面是根節點的空盤
+        return None
+    return np.array(_head_parser._extract_features(states[:head_moves + 1]), dtype=np.uint8)
+
+
 def infer_sgf_embeddings(
     model,
     sgfs,
@@ -87,8 +119,12 @@ def infer_sgf_embeddings(
     batch_size=64,
     tta=8,
     nproc=1,
+    head_moves=0,
 ):
-    """批次解析 SGF 並推論 L2 正規化風格向量，解析失敗的局填零向量。"""
+    """批次解析 SGF 並推論 L2 正規化風格向量，沒有推論的局填零向量、valid 為 False。
+
+    head_moves > 0 時只推論超過 head_moves 手的局，特徵取前 head_moves 手。
+    """
     n = len(sgfs)
     embs = np.zeros((n, model.embed_dim), dtype=np.float32)
     valid = np.zeros(n, dtype=bool)
@@ -96,8 +132,9 @@ def infer_sgf_embeddings(
         return embs, valid
 
     feat_colors = compute_sgf_feature_colors(sgfs, raw_colors, raw_color_flag) if color_mode != 'none' else None
+    feat_fn = functools.partial(sgf_to_head_features, head_moves=head_moves) if head_moves > 0 else sgf_to_features
     pool = Pool(nproc) if nproc > 1 else None
-    feats = pool.imap(sgf_to_features, sgfs, chunksize=8) if pool else map(sgf_to_features, sgfs)
+    feats = pool.imap(feat_fn, sgfs, chunksize=8) if pool else map(feat_fn, sgfs)
     buf, idxs = [], []
     t0 = time.time()
 
@@ -142,8 +179,88 @@ def save_npz_atomic(path, **arrays):
     os.replace(tmp, path)
 
 
+def load_split_meta(split_dir):
+    """只讀分片的 key、player_id、rank_idx、color，不載入 features。"""
+    paths = packed.list_shards(split_dir)
+    if not paths:
+        raise FileNotFoundError('%s 下沒有 .npz 分片' % split_dir)
+    metas = packed.load_meta(paths)
+    return {k: np.concatenate([m[k] for m in metas]) for k in metas[0]}
+
+
+def read_sgfs_by_key(sgf_dir, keys):
+    """從 train_<rank>.csv 讀出 keys（<rank>_<game_id>）對應的 SGF 與執色，順序同 keys。"""
+    need = {}
+    for k in keys:
+        rk, gid = str(k).split('_', 1)
+        need.setdefault(rk, set()).add(gid)
+    found = {}
+    for rk in LEVELS:
+        if rk not in need:
+            continue
+        path = os.path.join(sgf_dir, 'train_%s.csv' % rk)
+        if not os.path.exists(path):
+            raise FileNotFoundError('找不到 %s' % path)
+        for chunk in pd.read_csv(path, usecols=['game_id', 'color', 'sgf_content'], chunksize=50000):
+            sub = chunk[chunk['game_id'].isin(need[rk])]
+            for gid, col, s in zip(sub['game_id'], sub['color'], sub['sgf_content']):
+                found['%s_%s' % (rk, gid)] = (str(s), _parse_color_value(col, '%s %s' % (path, gid)))
+    missing = [str(k) for k in keys if str(k) not in found]
+    if missing:
+        raise SystemExit('%s 缺少 %d 局，例如 %s' % (sgf_dir, len(missing), missing[:3]))
+    return [found[str(k)][0] for k in keys], [found[str(k)][1] for k in keys]
+
+
+def run_packed_head_mode(args, model, cfg, device, amp, ckpt_hash):
+    """packed 模式的前段視角：key 與玩家篩選取自分片，SGF 取自 --sgf-dir 的 CSV。"""
+    split_dir = os.path.join(args.feat_dir, args.split)
+    d = load_split_meta(split_dir)
+    if args.players:
+        keep_pids = read_player_ids_csv(args.players)
+        indices = np.array([i for i, pid in enumerate(d['player_id']) if str(pid) in keep_pids], dtype=np.int64)
+    else:
+        indices = np.arange(len(d['key']), dtype=np.int64)
+    if len(indices) == 0:
+        raise SystemExit('篩選後沒有任何對局可推論')
+
+    keys = d['key'][indices]
+    sgfs, colors = read_sgfs_by_key(args.sgf_dir, keys)
+    csv_ids = np.array([COLOR_TO_ID[c.upper()] for c in colors])
+    if not np.array_equal(csv_ids, d['color'][indices]):
+        raise SystemExit('CSV 執色與分片 color 不一致')
+
+    print('packed 前段視角推論：%s，%d 局，head_moves=%d，tta=%d' % (
+        split_dir, len(indices), args.head_moves, args.tta), flush=True)
+    t0 = time.time()
+    embs, valid = infer_sgf_embeddings(
+        model, sgfs, colors, device, amp,
+        color_mode=cfg['color'],
+        raw_color_flag=cfg.get('raw_color', False),
+        batch_size=args.batch_size,
+        tta=args.tta,
+        nproc=args.nproc,
+        head_moves=args.head_moves,
+    )
+    save_npz_atomic(
+        args.out,
+        emb=embs.astype(np.float16),
+        key=keys,
+        player_id=d['player_id'][indices],
+        rank_idx=d['rank_idx'][indices],
+        color=d['color'][indices],
+        valid=valid,
+        head_moves=np.int64(args.head_moves),
+        tta=np.int64(args.tta),
+        ckpt_sha256=np.array(ckpt_hash),
+    )
+    print('寫出 %s（%d 局，前段視角 %d 局，%.1f 秒）' % (
+        args.out, len(indices), int(valid.sum()), time.time() - t0), flush=True)
+
+
 def run_packed_mode(args, model, cfg, device, amp, ckpt_hash):
     """從 bit-packed val 分片抽取 Embedding 並存成單一 .npz 快取。"""
+    if args.head_moves > 0:
+        return run_packed_head_mode(args, model, cfg, device, amp, ckpt_hash)
     split_dir = os.path.join(args.feat_dir, args.split)
     d = packed.load_split(split_dir)
     if args.players:
@@ -230,7 +347,8 @@ def run_test_mode(args, model, cfg, device, amp, ckpt_hash):
                 ('cand', cand_file, _read_cand_csv),
                 ('query', test_file, _read_test_csv),
             ):
-                out_path = os.path.join(args.out_dir, '%s_%s_emb.npz' % (tag, role))
+                suffix = '_head_emb.npz' if args.head_moves > 0 else '_emb.npz'
+                out_path = os.path.join(args.out_dir, '%s_%s%s' % (tag, role, suffix))
                 if os.path.exists(out_path) and not args.overwrite:
                     print('已存在 %s，略過（重跑請加 --overwrite）' % out_path, flush=True)
                     continue
@@ -247,7 +365,9 @@ def run_test_mode(args, model, cfg, device, amp, ckpt_hash):
                     batch_size=args.batch_size,
                     tta=args.tta,
                     nproc=args.nproc,
+                    head_moves=args.head_moves,
                 )
+                extra = {'head_moves': np.int64(args.head_moves)} if args.head_moves > 0 else {}
                 save_npz_atomic(
                     out_path,
                     emb=embs.astype(np.float16),
@@ -256,9 +376,11 @@ def run_test_mode(args, model, cfg, device, amp, ckpt_hash):
                     valid=valid,
                     tta=np.int64(args.tta),
                     ckpt_sha256=np.array(ckpt_hash),
+                    **extra,
                 )
-                failed = int((~valid).sum())
-                print('  寫出 %s（失敗 %d 局）' % (out_path, failed), flush=True)
+                label = '前段視角' if args.head_moves > 0 else '失敗'
+                count = int(valid.sum()) if args.head_moves > 0 else int((~valid).sum())
+                print('  寫出 %s（%s %d 局）' % (out_path, label, count), flush=True)
 
 
 def parse_args(argv=None):
@@ -277,9 +399,15 @@ def parse_args(argv=None):
     ap.add_argument('--nproc', type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument('--no-amp', action='store_true')
     ap.add_argument('--overwrite', action='store_true')
+    ap.add_argument('--head-moves', type=int, default=0,
+                    help='前段視角：只取前 N 手，只推論超過 N 手的局；0 為完整視角')
+    ap.add_argument('--sgf-dir', default=os.path.join('training-v1.1', 'training'),
+                    help='packed 前段視角讀 SGF 的 train_<rank>.csv 目錄')
     args = ap.parse_args(argv)
     if args.mode == 'packed' and not args.out:
         ap.error('--mode packed 必須指定 --out')
+    if args.head_moves < 0:
+        ap.error('--head-moves 要 >= 0')
     return args
 
 
