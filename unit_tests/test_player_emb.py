@@ -568,3 +568,153 @@ def test_fuse_player_predict_split_uses_embeddings_and_validates_args(tmp_path):
         fuse_player.run_full_fused_pipeline(emb_gamma=1.0, emb_cache_dir=None)
     with pytest.raises(ValueError, match='emb_cache_dir'):
         fuse_player.run_full_fused_pipeline(emb_gamma=0.0, pub2_emb_gamma=0.5, emb_cache_dir=None)
+
+
+def test_get_raw_moves_preserves_corner_and_flips_hd2():
+    from aicup import opening_player
+
+    # 兩局落於對稱不同角，canonical 會正規化為同座標，raw 應保留不同座標
+    sgf_a = '(;GM[1]FF[4]SZ[19]HD[0];B[pd];W[dd])'
+    sgf_b = '(;GM[1]FF[4]SZ[19]HD[0];B[dp];W[pp])'
+    can_a = opening_player.get_canonical_moves(sgf_a, 'b')
+    can_b = opening_player.get_canonical_moves(sgf_b, 'b')
+    raw_a = opening_player.get_raw_moves(sgf_a, 'b')
+    raw_b = opening_player.get_raw_moves(sgf_b, 'b')
+    assert (can_a[0][2], can_a[0][3]) == (can_b[0][2], can_b[0][3])
+    assert (raw_a[0][2], raw_a[0][3]) != (raw_b[0][2], raw_b[0][3])
+
+    # HD >= 2 時 SGF 標記黑白相反：實際執黑應取 SGF 內的 W 手，但回傳執色欄位仍為 'b'
+    sgf_hd2 = '(;GM[1]FF[4]SZ[19]HD[2];B[pd];W[dd])'
+    raw_hd2_b = opening_player.get_raw_moves(sgf_hd2, 'b')
+    raw_hd0_w = opening_player.get_raw_moves(sgf_a, 'w')
+    assert raw_hd2_b[0][0] == 'b'
+    assert (raw_hd2_b[0][2], raw_hd2_b[0][3]) == (raw_hd0_w[0][2], raw_hd0_w[0][3])
+
+
+def test_compute_emb_similarity_top2_head_merge_and_multi_model(tmp_path):
+    from aicup import fuse_player
+
+    # 1. top2 局對局細粒度匹配：候選 c1 有一對與查詢極近的局，top2 應推高 c1 分數
+    cands = {
+        'c1': np.array([[1.0, 0.0, 0.0], [0.95, 0.05, 0.0], [0.0, 0.0, 1.0]]),
+        'c2': np.array([[0.5, 0.5, 0.0], [0.5, 0.5, 0.0], [0.5, 0.5, 0.0]]),
+    }
+    queries = {'q1': np.array([[1.0, 0.0, 0.0]])}
+    s_cent = fuse_player.compute_emb_similarity(cands, queries, ['c1', 'c2'], ['q1'], topk_weight=0.0)
+    s_top2 = fuse_player.compute_emb_similarity(cands, queries, ['c1', 'c2'], ['q1'], topk_weight=0.5, topk=2)
+    assert s_top2.shape == (1, 2)
+    assert (s_top2[0, 0] - s_top2[0, 1]) > (s_cent[0, 0] - s_cent[0, 1])
+
+    # 2. head 快取合併與 sha256 校驗
+    base_p = tmp_path / 'b_emb.npz'
+    head_p = tmp_path / 'b_head_emb.npz'
+    bad_head_p = tmp_path / 'b_head_bad.npz'
+    np.savez_compressed(
+        base_p,
+        emb=np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float16),
+        entity_id=np.array(['p1', 'p2'], dtype=str),
+        valid=np.array([True, True], dtype=bool),
+        ckpt_sha256=np.array('sha_ok'),
+    )
+    np.savez_compressed(
+        head_p,
+        emb=np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float16),
+        entity_id=np.array(['p1', 'p2'], dtype=str),
+        valid=np.array([True, False], dtype=bool),
+        ckpt_sha256=np.array('sha_ok'),
+    )
+    np.savez_compressed(
+        bad_head_p,
+        emb=np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float16),
+        entity_id=np.array(['p1', 'p2'], dtype=str),
+        valid=np.array([True, False], dtype=bool),
+        ckpt_sha256=np.array('sha_diff'),
+    )
+    merged = fuse_player._load_emb_cache_npz(str(base_p), head_path=str(head_p))
+    # p1 的 head 有效 -> L2 正規化後為 [sqrt(0.5), sqrt(0.5)]；p2 的 head 無效 -> 維持 [0.0, 1.0]
+    inv_sqrt2 = float(1.0 / np.sqrt(2.0))
+    np.testing.assert_allclose(merged['p1'][0], [inv_sqrt2, inv_sqrt2], atol=1e-3)
+    np.testing.assert_allclose(merged['p2'][0], [0.0, 1.0], atol=1e-3)
+    with pytest.raises(ValueError, match='ckpt_sha256'):
+        fuse_player._load_emb_cache_npz(str(base_p), head_path=str(bad_head_p))
+
+    # entity_id 順序不一致時應報錯
+    bad_order_p = tmp_path / 'b_head_order.npz'
+    np.savez_compressed(
+        bad_order_p,
+        emb=np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float16),
+        entity_id=np.array(['p2', 'p1'], dtype=str),
+        valid=np.array([True, False], dtype=bool),
+        ckpt_sha256=np.array('sha_ok'),
+    )
+    with pytest.raises(ValueError, match='entity_id'):
+        fuse_player._load_emb_cache_npz(str(base_p), head_path=str(bad_order_p))
+
+    # 3. 多模型分數平均（emb_tracks）、單模型向後相容與 head_emb_dirs 子集檢查
+    sgf_same = '(;GM[1]FF[4]SZ[19]HD[0];B[pd];W[dd])'
+    test_csv = tmp_path / 'test_mm.csv'
+    pd.DataFrame([{'question_id': 'pub2_q_1', 'num_games': 1, 'sgf_1': sgf_same, 'color_1': 'b'}]).to_csv(test_csv, index=False)
+    cand_profiles = {f'pub2_p_{i}': {} for i in range(1, 6)}
+    c_m1 = {f'pub2_p_{i}': np.eye(5)[i - 1:i] for i in range(1, 6)}
+    q_m1 = {'pub2_q_1': np.array([[0.0, 1.0, 0.0, 0.0, 0.0]])}
+    q_m2 = {'pub2_q_1': np.array([[0.0, 0.0, 1.0, 0.0, 0.0]])}
+    # 單目錄 emb_tracks 與舊介面 cand_embs/query_embs 結果應完全一致
+    rows_legacy = fuse_player.predict_split_fused(
+        str(test_csv), cand_profiles, {},
+        alpha=0.0, csls_k=2, cand_embs=c_m1, query_embs=q_m1, emb_gamma=1.0,
+    )
+    rows_track1 = fuse_player.predict_split_fused(
+        str(test_csv), cand_profiles, {},
+        alpha=0.0, csls_k=2, emb_gamma=1.0, emb_tracks=[(c_m1, q_m1, 1.0)],
+    )
+    assert rows_track1 == rows_legacy
+
+    # 權重 [0.2, 0.8] 時應由模型 2 主導選出 pub2_p_3
+    rows = fuse_player.predict_split_fused(
+        str(test_csv), cand_profiles, {},
+        alpha=0.0, csls_k=2, emb_gamma=1.0, emb_top2_weight=0.5,
+        emb_tracks=[(c_m1, q_m1, 0.2), (c_m1, q_m2, 0.8)],
+        raw_open=True,
+    )
+    assert rows[0][1] == 'pub2_p_3'
+
+    # head_emb_dirs 包含未列於 emb_cache_dir 的目錄時報錯
+    with pytest.raises(ValueError, match='head_emb_dirs'):
+        fuse_player.run_full_fused_pipeline(
+            emb_cache_dir=[str(tmp_path / 'dir_a')],
+            emb_gamma=1.0,
+            head_emb_dirs=[str(tmp_path / 'dir_b')],
+        )
+
+
+def test_partial_head_emb_dirs_loads_only_specified_dir(tmp_path):
+    from aicup import fuse_player
+
+    # 模擬兩組模型目錄，只有 dir_a 有 head 檔、dir_b 沒有 head 檔
+    dir_a = tmp_path / 'dir_a'
+    dir_b = tmp_path / 'dir_b'
+    dir_a.mkdir()
+    dir_b.mkdir()
+    for d, sha in ((dir_a, 'sha_a'), (dir_b, 'sha_b')):
+        np.savez_compressed(
+            d / 'pub2_cand_emb.npz',
+            emb=np.array([[1.0, 0.0]], dtype=np.float16),
+            entity_id=np.array(['pub2_p_1'], dtype=str),
+            valid=np.array([True], dtype=bool),
+            ckpt_sha256=np.array(sha),
+        )
+    np.savez_compressed(
+        dir_a / 'pub2_cand_head_emb.npz',
+        emb=np.array([[0.0, 1.0]], dtype=np.float16),
+        entity_id=np.array(['pub2_p_1'], dtype=str),
+        valid=np.array([True], dtype=bool),
+        ckpt_sha256=np.array('sha_a'),
+    )
+    head_set = {fuse_player.os.path.normpath(str(dir_a))}
+    loaded = []
+    for d in (dir_a, dir_b):
+        h = str(d / 'pub2_cand_head_emb.npz') if fuse_player.os.path.normpath(str(d)) in head_set else None
+        loaded.append(fuse_player._load_emb_cache_npz(str(d / 'pub2_cand_emb.npz'), head_path=h))
+    inv_sqrt2 = float(1.0 / np.sqrt(2.0))
+    np.testing.assert_allclose(loaded[0]['pub2_p_1'][0], [inv_sqrt2, inv_sqrt2], atol=1e-3)
+    np.testing.assert_allclose(loaded[1]['pub2_p_1'][0], [1.0, 0.0], atol=1e-3)

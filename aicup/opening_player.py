@@ -13,6 +13,8 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 from sgfmill import sgf
 
+from aicup import color as color_util
+
 TOP_N = 5
 DEFAULT_MAX_MOVES = 10
 IDF_POWER = 0.75
@@ -97,6 +99,54 @@ def get_canonical_moves(
                 break
 
     return target_moves_info
+
+
+def get_raw_moves(
+    sgf_str: str,
+    target_color: str,
+    max_moves: int = DEFAULT_MAX_MOVES,
+    fix_hd_color: bool = True,
+) -> List[Tuple[str, int, int, int, Optional[Tuple[int, int]]]]:
+    """從 SGF 字串解析出不做對稱正規化的絕對坐標落子，保留角落位置偏好。
+
+    HD >= 2 讓子局 SGF 內 B/W 標記與實際相反，fix_hd_color 為 True 時先換色再抽取目標方落子，
+    回傳元組第一欄仍維持目標方實際執色以供分色歸類。
+    """
+    target_color = str(target_color).strip().lower()
+    if target_color not in ('b', 'w'):
+        target_color = 'b'
+
+    sgf_color = target_color
+    if fix_hd_color:
+        hd = color_util.parse_hd(sgf_str)
+        if hd is not None and hd >= color_util.MIN_REVERSED_HD:
+            sgf_color = 'w' if target_color == 'b' else 'b'
+
+    try:
+        g = sgf.Sgf_game.from_string(sgf_str)
+    except Exception:
+        return []
+
+    raw_moves = []
+    for node in g.get_main_sequence()[1:]:
+        col, mv = node.get_move()
+        if mv is not None and col is not None:
+            raw_moves.append((col.lower(), mv[0], mv[1]))
+            if len(raw_moves) >= max_moves * 3:
+                break
+
+    out = []
+    step_idx = 0
+    for i, (col, r, c) in enumerate(raw_moves):
+        if col == sgf_color:
+            opp_move = None
+            if i > 0 and raw_moves[i - 1][0] != sgf_color:
+                opp_move = (raw_moves[i - 1][1], raw_moves[i - 1][2])
+            out.append((target_color, step_idx, r, c, opp_move))
+            step_idx += 1
+            if step_idx >= max_moves:
+                break
+    return out
 
 
 def extract_raw_counts(
@@ -246,11 +296,13 @@ def build_candidate_profiles_and_idf(
     max_moves: int = DEFAULT_MAX_MOVES,
     idf_power: float = IDF_POWER,
     w_resp: float = W_RESP,
-    color_cond: bool = False
+    color_cond: bool = False,
+    raw_coords: bool = False,
 ) -> Tuple[Dict[str, dict], Dict[tuple, float]]:
     """讀取候選庫 CSV，建立候選人指紋特徵與全域 IDF 權重字典。"""
     df = pd.read_csv(cand_csv_path)
     player_games = {}
+    move_fn = get_raw_moves if raw_coords else get_canonical_moves
 
     for _, row in df.iterrows():
         pid = str(row['player_id']).strip()
@@ -258,7 +310,7 @@ def build_candidate_profiles_and_idf(
         color = str(row.get('color', 'b')).strip().lower()
         if color not in ('b', 'w'):
             color = 'b'
-        mvs = get_canonical_moves(sgf_content, color, max_moves=max_moves)
+        mvs = move_fn(sgf_content, color, max_moves=max_moves)
         if pid not in player_games:
             player_games[pid] = []
         player_games[pid].append((color, mvs))

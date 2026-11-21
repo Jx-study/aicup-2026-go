@@ -27,6 +27,7 @@ from aicup.opening_player import (
     compute_style_similarity,
     extract_raw_counts,
     get_canonical_moves,
+    get_raw_moves,
 )
 from aicup.pattern_player import (
     Chi2PatternIndex,
@@ -125,13 +126,15 @@ def apply_csls_column_penalty(score_mat: np.ndarray, csls_k: int) -> np.ndarray:
     return out
 
 
-def aggregate_and_center_similarity(
+def compute_emb_similarity(
     cand_embs_by_id: Dict[str, np.ndarray],
     query_embs_by_id: Dict[str, np.ndarray],
     cand_ids: Sequence[str],
     query_ids: Sequence[str],
+    topk_weight: float = 0.0,
+    topk: int = 2,
 ) -> np.ndarray:
-    """計算多局平均、候選池中心化並 L2 正規化後之餘弦相似度矩陣 (Q, C)。
+    """計算候選池中心化質心餘弦，並可選疊加局對局 top-k 相似度矩陣 (Q, C)。
 
     沒有有效向量的候選欄位回傳 -inf，避免排在負相似度候選之前。
     """
@@ -149,10 +152,13 @@ def aggregate_and_center_similarity(
 
     cand_mat = np.zeros((len(cand_ids), dim), dtype=np.float64)
     cand_ok = np.zeros(len(cand_ids), dtype=bool)
+    cand_arrays: List[Optional[np.ndarray]] = [None] * len(cand_ids)
     for i, cid in enumerate(cand_ids):
         arr = cand_embs_by_id.get(cid)
         if arr is not None and len(arr) > 0:
-            cand_mat[i] = np.asarray(arr, dtype=np.float64).mean(axis=0)
+            a64 = np.asarray(arr, dtype=np.float64)
+            cand_arrays[i] = a64
+            cand_mat[i] = a64.mean(axis=0)
             cand_ok[i] = True
 
     mu_cand = cand_mat[cand_ok].mean(axis=0, keepdims=True)
@@ -162,29 +168,102 @@ def aggregate_and_center_similarity(
 
     q_mat = np.zeros((len(query_ids), dim), dtype=np.float64)
     q_ok = np.zeros(len(query_ids), dtype=bool)
+    q_arrays: List[Optional[np.ndarray]] = [None] * len(query_ids)
     for j, qid in enumerate(query_ids):
         arr = query_embs_by_id.get(qid)
         if arr is not None and len(arr) > 0:
-            q_mat[j] = np.asarray(arr, dtype=np.float64).mean(axis=0)
+            a64 = np.asarray(arr, dtype=np.float64)
+            q_arrays[j] = a64
+            q_mat[j] = a64.mean(axis=0)
             q_ok[j] = True
 
     q_centered = q_mat - mu_cand
     q_norms = np.linalg.norm(q_centered, axis=1, keepdims=True)
     q_unit = np.where(q_ok[:, None], q_centered / np.maximum(q_norms, 1e-12), 0.0)
     sim = q_unit @ cand_unit.T
+
+    if topk_weight > 0.0 and topk > 0:
+        valid_c_idx = [i for i in range(len(cand_ids)) if cand_ok[i]]
+        c_chunks = []
+        c_counts = []
+        for i in valid_c_idx:
+            cg = cand_arrays[i] - mu_cand
+            cg_u = cg / np.maximum(np.linalg.norm(cg, axis=1, keepdims=True), 1e-12)
+            c_chunks.append(cg_u)
+            c_counts.append(len(cg_u))
+        c_flat = np.vstack(c_chunks)
+        uniform_n = c_counts[0] if len(set(c_counts)) == 1 else 0
+        offsets = np.concatenate([[0], np.cumsum(c_counts)])
+
+        s_topk = np.zeros((len(query_ids), len(cand_ids)), dtype=np.float64)
+        for j in range(len(query_ids)):
+            if not q_ok[j]:
+                continue
+            qg = q_arrays[j] - mu_cand
+            qg_u = qg / np.maximum(np.linalg.norm(qg, axis=1, keepdims=True), 1e-12)
+            pw = qg_u @ c_flat.T
+            if uniform_n > 0:
+                k_eff = min(topk, uniform_n)
+                pw3 = pw.reshape(len(qg_u), len(valid_c_idx), uniform_n)
+                if k_eff == uniform_n:
+                    vals = pw3.mean(axis=(0, 2))
+                else:
+                    vals = np.partition(pw3, uniform_n - k_eff, axis=2)[:, :, -k_eff:].mean(axis=(0, 2))
+                s_topk[j, valid_c_idx] = vals
+            else:
+                for pos, ci in enumerate(valid_c_idx):
+                    sl = pw[:, offsets[pos]:offsets[pos + 1]]
+                    n_g = sl.shape[1]
+                    k_eff = min(topk, n_g)
+                    if k_eff == n_g:
+                        s_topk[j, ci] = float(sl.mean())
+                    else:
+                        s_topk[j, ci] = float(np.partition(sl, n_g - k_eff, axis=1)[:, -k_eff:].mean())
+        sim = sim + topk_weight * s_topk
+
     if not cand_ok.all():
         sim[:, ~cand_ok] = float("-inf")
     return sim
 
 
-def _load_emb_cache_npz(path: str) -> Dict[str, np.ndarray]:
-    """載入 infer_player_emb 產出之 .npz 快取，依 entity_id 分組為有效局向量陣列。"""
+def aggregate_and_center_similarity(
+    cand_embs_by_id: Dict[str, np.ndarray],
+    query_embs_by_id: Dict[str, np.ndarray],
+    cand_ids: Sequence[str],
+    query_ids: Sequence[str],
+) -> np.ndarray:
+    """計算多局平均、候選池中心化並 L2 正規化後之餘弦相似度矩陣 (Q, C)。"""
+    return compute_emb_similarity(cand_embs_by_id, query_embs_by_id, cand_ids, query_ids, topk_weight=0.0)
+
+
+def _load_emb_cache_npz(path: str, head_path: Optional[str] = None) -> Dict[str, np.ndarray]:
+    """載入 infer_player_emb 產出之 .npz 快取，可選合併前段視角 head 快取。"""
     if not os.path.exists(path):
         raise FileNotFoundError(f"找不到 Embedding 快取檔：{path}")
     with np.load(path, allow_pickle=False) as z:
         embs = z["emb"].astype(np.float64)
         eids = z["entity_id"].astype(str)
         valid = z["valid"].astype(bool) if "valid" in z.files else np.ones(len(eids), dtype=bool)
+        sha = str(z["ckpt_sha256"]) if "ckpt_sha256" in z.files else ""
+
+    if head_path is not None:
+        if not os.path.exists(head_path):
+            raise FileNotFoundError(f"找不到前段視角 Embedding 快取檔：{head_path}")
+        with np.load(head_path, allow_pickle=False) as zh:
+            h_embs = zh["emb"].astype(np.float64)
+            h_eids = zh["entity_id"].astype(str)
+            h_valid = zh["valid"].astype(bool)
+            h_sha = str(zh["ckpt_sha256"]) if "ckpt_sha256" in zh.files else ""
+        if sha and h_sha and sha != h_sha:
+            raise ValueError(f"原快取與 head 快取的 ckpt_sha256 不一致：{path} vs {head_path}")
+        if not np.array_equal(eids, h_eids):
+            raise ValueError(f"原快取與 head 快取的 entity_id 順序不一致：{path} vs {head_path}")
+        merge_mask = valid & h_valid
+        merged = 0.5 * (embs + h_embs)
+        merged_norms = np.linalg.norm(merged, axis=1, keepdims=True)
+        merged_unit = merged / np.maximum(merged_norms, 1e-12)
+        embs = np.where(merge_mask[:, None], merged_unit, embs)
+
     grouped: Dict[str, List[np.ndarray]] = {}
     for eid, vec, ok in zip(eids.tolist(), embs, valid.tolist()):
         if ok:
@@ -213,6 +292,9 @@ def predict_split_fused(
     cand_embs: Optional[Dict[str, np.ndarray]] = None,
     query_embs: Optional[Dict[str, np.ndarray]] = None,
     emb_gamma: float = 0.0,
+    emb_top2_weight: float = 0.0,
+    emb_tracks: Optional[Sequence[Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], float]]] = None,
+    raw_open: bool = False,
 ) -> List[List[str]]:
     """結合開局指紋、局部棋形殘差與棋力相容度對單一測試檔案進行融合預測。"""
     test_df = pd.read_csv(test_csv_path)
@@ -258,21 +340,37 @@ def predict_split_fused(
 
     n_q = len(parsed_rows)
     n_c = len(cand_names)
-    use_emb = emb_gamma > 0.0 and cand_embs is not None and query_embs is not None
+    tracks: List[Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], float]] = []
+    if emb_gamma > 0.0:
+        if emb_tracks is not None:
+            tracks = list(emb_tracks)
+        elif cand_embs is not None and query_embs is not None:
+            tracks = [(cand_embs, query_embs, 1.0)]
+
     emb_sim_mat = None
-    if use_emb:
+    if tracks:
         qids_order = [qid for qid, _ in parsed_rows]
-        emb_sim_mat = aggregate_and_center_similarity(cand_embs, query_embs, cand_names, qids_order)
-        # 若少數候選完全缺有效向量，改補 0.0 以保留其餘特徵的兜底排序
-        emb_sim_mat = np.where(np.isfinite(emb_sim_mat), emb_sim_mat, 0.0)
+        w_total = sum(w for _, _, w in tracks)
+        if w_total <= 0.0:
+            raise ValueError("emb_tracks 權重總和必須 > 0")
+        acc_mat = np.zeros((n_q, n_c), dtype=np.float64)
+        for c_e, q_e, w in tracks:
+            m = compute_emb_similarity(
+                c_e, q_e, cand_names, qids_order, topk_weight=emb_top2_weight, topk=2
+            )
+            # 若少數候選完全缺有效向量，改補 0.0 以保留其餘特徵的兜底排序
+            m = np.where(np.isfinite(m), m, 0.0)
+            acc_mat += (w / w_total) * m
+        emb_sim_mat = acc_mat
 
     score_mat = np.full((n_q, n_c), float("-inf"), dtype=np.float64) if csls_k > 0 else None
     base_mat = np.zeros((n_q, n_c), dtype=np.float64) if csls_k > 0 else None
+    move_fn = get_raw_moves if raw_open else get_canonical_moves
 
     for row_idx, (qid, raw_games) in enumerate(parsed_rows):
         # 抽取題目開局風格
         query_games = [
-            (color, get_canonical_moves(sgf_content, color, max_moves=max_moves))
+            (color, move_fn(sgf_content, color, max_moves=max_moves))
             for sgf_content, color in raw_games
         ]
         q_vecs = build_query_vectors(query_games, idf_weights, w_resp=w_resp, color_cond=color_cond)
@@ -405,9 +503,13 @@ def run_full_fused_pipeline(
     pattern_workers: int = 1,
     csls_k: int = 0,
     pub2_csls_k: Optional[int] = None,
-    emb_cache_dir: Optional[str] = None,
+    emb_cache_dir: Union[None, str, Sequence[str]] = None,
     emb_gamma: float = 0.0,
     pub2_emb_gamma: Optional[float] = None,
+    emb_top2_weight: float = 0.0,
+    emb_weights: Optional[Sequence[float]] = None,
+    head_emb_dirs: Optional[Sequence[str]] = None,
+    raw_open: bool = False,
 ) -> pd.DataFrame:
     """執行全量四份測試題融合推論並輸出提交 CSV。"""
     cand_ranks = _load_rank_cache(cand_cache_path, "候選人棋力快取")
@@ -416,8 +518,35 @@ def run_full_fused_pipeline(
         raise ValueError("cand2_cache_path 與 query2_cache_path 必須同時指定或同時省略")
     if emb_gamma < 0.0 or (pub2_emb_gamma is not None and pub2_emb_gamma < 0.0):
         raise ValueError("emb_gamma 與 pub2_emb_gamma 必須 >= 0")
-    if (emb_gamma > 0.0 or (pub2_emb_gamma is not None and pub2_emb_gamma > 0.0)) and not emb_cache_dir:
+    if emb_top2_weight < 0.0:
+        raise ValueError("emb_top2_weight 必須 >= 0")
+
+    emb_dirs: List[str] = []
+    if isinstance(emb_cache_dir, str):
+        emb_dirs = [emb_cache_dir]
+    elif emb_cache_dir is not None:
+        emb_dirs = list(emb_cache_dir)
+
+    if (emb_gamma > 0.0 or (pub2_emb_gamma is not None and pub2_emb_gamma > 0.0)) and not emb_dirs:
         raise ValueError("emb_gamma 或 pub2_emb_gamma > 0 時必須指定 emb_cache_dir")
+
+    norm_emb_dir_set = {os.path.normpath(d) for d in emb_dirs}
+    head_dir_set = {os.path.normpath(d) for d in (head_emb_dirs or ())}
+    unknown_head = head_dir_set - norm_emb_dir_set
+    if unknown_head:
+        raise ValueError(f"head_emb_dirs 包含未列於 emb_cache_dir 的目錄：{sorted(unknown_head)}")
+
+    if emb_dirs:
+        if emb_weights is None:
+            emb_weight_list = [1.0 / len(emb_dirs)] * len(emb_dirs)
+        else:
+            if len(emb_weights) != len(emb_dirs):
+                raise ValueError("emb_weights 長度必須與 emb_cache_dir 目錄數相同")
+            if any(w < 0.0 for w in emb_weights) or sum(emb_weights) <= 0.0:
+                raise ValueError("emb_weights 必須皆 >= 0 且總和 > 0")
+            emb_weight_list = list(emb_weights)
+    else:
+        emb_weight_list = []
     # 兩份 pub2/priv2 快取同時省略時沿用 pub_/priv_ 的快取
     cand2_ranks = _load_rank_cache(cand2_cache_path, "pub2/priv2 候選人棋力快取") if cand2_cache_path else cand_ranks
     query2_ranks = _load_rank_cache(query2_cache_path, "pub2/priv2 題目棋力快取") if query2_cache_path else query_ranks
@@ -452,12 +581,13 @@ def run_full_fused_pipeline(
 
         print(
             f"\n[{prefix}] 處理中 (alpha={cur_alpha}, delta={cur_delta}, metric={cur_metric}, "
-            f"sigma={cur_sigma}, pat_beta={pattern_beta}, csls_k={cur_csls_k}, emb_gamma={cur_emb_gamma})..."
+            f"sigma={cur_sigma}, pat_beta={pattern_beta}, csls_k={cur_csls_k}, "
+            f"emb_gamma={cur_emb_gamma}, top2={emb_top2_weight}, head_dirs={len(head_dir_set)}, raw_open={raw_open})..."
         )
         t0 = time.time()
         cand_profiles, idf_weights = build_candidate_profiles_and_idf(
             cand_path, max_moves=max_moves, idf_power=idf_power, w_resp=w_resp,
-            color_cond=color_cond
+            color_cond=color_cond, raw_coords=raw_open
         )
         print(f"  - 候選庫開局特徵建置完成 ({time.time() - t0:.1f}s)")
 
@@ -470,13 +600,18 @@ def run_full_fused_pipeline(
             )
             print(f"  - 候選庫局部棋形索引建置完成，詞表 {len(pattern_index.vocab_to_idx)} ({time.time() - t0:.1f}s)")
 
-        cand_embs = None
-        query_embs = None
-        if emb_cache_dir and cur_emb_gamma > 0.0:
+        emb_tracks = None
+        if emb_dirs and cur_emb_gamma > 0.0:
             tag = prefix.rstrip("_")
-            cand_embs = _load_emb_cache_npz(os.path.join(emb_cache_dir, f"{tag}_cand_emb.npz"))
-            query_embs = _load_emb_cache_npz(os.path.join(emb_cache_dir, f"{tag}_query_emb.npz"))
-            print(f"  - 深度風格 Embedding 快取載入完成（候選 {len(cand_embs)} 人、題目 {len(query_embs)} 題）")
+            emb_tracks = []
+            for d_path, w_val in zip(emb_dirs, emb_weight_list):
+                has_head = os.path.normpath(d_path) in head_dir_set
+                c_head = os.path.join(d_path, f"{tag}_cand_head_emb.npz") if has_head else None
+                q_head = os.path.join(d_path, f"{tag}_query_head_emb.npz") if has_head else None
+                c_e = _load_emb_cache_npz(os.path.join(d_path, f"{tag}_cand_emb.npz"), head_path=c_head)
+                q_e = _load_emb_cache_npz(os.path.join(d_path, f"{tag}_query_emb.npz"), head_path=q_head)
+                emb_tracks.append((c_e, q_e, w_val))
+            print(f"  - 深度風格 Embedding 快取載入完成（{len(emb_tracks)} 組模型，首組候選 {len(emb_tracks[0][0])} 人、題目 {len(emb_tracks[0][1])} 題）")
 
         t0 = time.time()
         sub_rows = predict_split_fused(
@@ -490,9 +625,10 @@ def run_full_fused_pipeline(
             pattern_beta=pattern_beta,
             pattern_workers=pattern_workers,
             csls_k=cur_csls_k,
-            cand_embs=cand_embs,
-            query_embs=query_embs,
             emb_gamma=cur_emb_gamma,
+            emb_top2_weight=emb_top2_weight,
+            emb_tracks=emb_tracks,
+            raw_open=raw_open,
         )
         print(f"  - 題目推論完成 ({time.time() - t0:.1f}s)")
 
@@ -549,17 +685,33 @@ def main():
     parser.add_argument("--pattern-workers", type=int, default=1, help="局部棋形平行抽取行程數")
     parser.add_argument("--csls-k", type=int, default=0, help="候選側 CSLS 去樞紐化鄰居數 k（0 為停用）")
     parser.add_argument("--pub2-csls-k", type=int, default=None, help="pub2/priv2 專用 CSLS 鄰居數 k，未指定時沿用 --csls-k")
-    parser.add_argument("--emb-cache-dir", default=None, help="深度風格 Embedding 快取目錄（含 {pub,priv,pub2,priv2}_{cand,query}_emb.npz）")
+    parser.add_argument("--emb-cache-dir", nargs="+", default=None, help="深度風格 Embedding 快取目錄（可傳多個目錄做分數平均集成）")
     parser.add_argument("--emb-gamma", type=float, default=0.0, help="深度風格 Embedding 相似度加權係數（0 為停用）")
     parser.add_argument("--pub2-emb-gamma", type=float, default=None, help="pub2/priv2 專用 Embedding 加權係數，未指定時沿用 --emb-gamma")
+    parser.add_argument("--emb-top2-weight", type=float, default=0.0, help="局對局 top2 細粒度相似度加權係數（0 為停用）")
+    parser.add_argument("--emb-weights", type=float, nargs="+", default=None, help="多組 Embedding 模型的集成權重，預設等權平均")
+    parser.add_argument("--head-emb-dirs", nargs="+", default=None, help="需要合併 *_head_emb.npz 的快取目錄子集，預設空")
+    parser.add_argument("--raw-open", action="store_true", help="開局指紋改用不正規化絕對座標（含 HD>=2 換色）")
     args = parser.parse_args()
 
     if bool(args.cand2_cache) != bool(args.query2_cache):
         parser.error("--cand2-cache 與 --query2-cache 必須同時指定")
     if args.emb_gamma < 0.0 or (args.pub2_emb_gamma is not None and args.pub2_emb_gamma < 0.0):
         parser.error("--emb-gamma 與 --pub2-emb-gamma 必須 >= 0")
+    if args.emb_top2_weight < 0.0:
+        parser.error("--emb-top2-weight 必須 >= 0")
     if (args.emb_gamma > 0.0 or (args.pub2_emb_gamma is not None and args.pub2_emb_gamma > 0.0)) and not args.emb_cache_dir:
         parser.error("--emb-gamma 或 --pub2-emb-gamma > 0 時必須指定 --emb-cache-dir")
+    if args.emb_weights is not None:
+        if not args.emb_cache_dir or len(args.emb_weights) != len(args.emb_cache_dir):
+            parser.error("--emb-weights 長度必須與 --emb-cache-dir 相同")
+        if any(w < 0.0 for w in args.emb_weights) or sum(args.emb_weights) <= 0.0:
+            parser.error("--emb-weights 必須皆 >= 0 且總和 > 0")
+    if args.head_emb_dirs:
+        emb_set = {os.path.normpath(d) for d in (args.emb_cache_dir or ())}
+        bad = {os.path.normpath(d) for d in args.head_emb_dirs} - emb_set
+        if bad:
+            parser.error(f"--head-emb-dirs 包含未列於 --emb-cache-dir 的目錄：{sorted(bad)}")
     # HSL 快取搭配高斯相容度，不啟用硬遮罩
     if args.cand2_cache:
         if args.pub2_metric is None:
@@ -595,6 +747,10 @@ def main():
         emb_cache_dir=args.emb_cache_dir,
         emb_gamma=args.emb_gamma,
         pub2_emb_gamma=args.pub2_emb_gamma,
+        emb_top2_weight=args.emb_top2_weight,
+        emb_weights=args.emb_weights,
+        head_emb_dirs=args.head_emb_dirs,
+        raw_open=args.raw_open,
     )
 
 
