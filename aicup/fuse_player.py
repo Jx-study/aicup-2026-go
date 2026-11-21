@@ -101,6 +101,30 @@ def compute_rank_compatibility(
     return score, True
 
 
+def apply_csls_column_penalty(score_mat: np.ndarray, csls_k: int) -> np.ndarray:
+    """對分數矩陣 (Q, C) 套用候選側 CSLS 去樞紐化，扣除 0.5 倍各欄前 k 大平均。"""
+    if csls_k <= 0 or score_mat.size == 0:
+        return score_mat.copy()
+    n_q, n_c = score_mat.shape
+    if np.all(np.isfinite(score_mat)):
+        k = min(csls_k, n_q)
+        col_hub = np.partition(score_mat, n_q - k, axis=0)[-k:].mean(axis=0)
+        return score_mat - 0.5 * col_hub[None, :]
+
+    out = score_mat.copy()
+    for j in range(n_c):
+        col = score_mat[:, j]
+        finite_mask = np.isfinite(col)
+        n_valid = int(finite_mask.sum())
+        if n_valid == 0:
+            continue
+        valid_vals = col[finite_mask]
+        k = min(csls_k, n_valid)
+        hub = float(np.partition(valid_vals, n_valid - k)[-k:].mean())
+        out[finite_mask, j] -= 0.5 * hub
+    return out
+
+
 def predict_split_fused(
     test_csv_path: str,
     cand_profiles: Dict[str, dict],
@@ -118,6 +142,7 @@ def predict_split_fused(
     pattern_index: Optional[Chi2PatternIndex] = None,
     pattern_beta: float = 0.0,
     pattern_workers: int = 1,
+    csls_k: int = 0,
 ) -> List[List[str]]:
     """結合開局指紋、局部棋形殘差與棋力相容度對單一測試檔案進行融合預測。"""
     test_df = pd.read_csv(test_csv_path)
@@ -161,6 +186,11 @@ def predict_split_fused(
             grouped[r_idx].append(cnt)
         query_pat_counters = [merge_pattern_counters(cs) for cs in grouped]
 
+    n_q = len(parsed_rows)
+    n_c = len(cand_names)
+    score_mat = np.full((n_q, n_c), float("-inf"), dtype=np.float64) if csls_k > 0 else None
+    base_mat = np.zeros((n_q, n_c), dtype=np.float64) if csls_k > 0 else None
+
     for row_idx, (qid, raw_games) in enumerate(parsed_rows):
         # 抽取題目開局風格
         query_games = [
@@ -176,7 +206,7 @@ def predict_split_fused(
         valid_candidates = []
         pruned_candidates = []
 
-        for c_pid in cand_names:
+        for ci, c_pid in enumerate(cand_names):
             style_sim = compute_style_similarity(q_vecs, cand_profiles[c_pid], color_cond=color_cond)
             base_sim = style_sim + pattern_beta * pat_scores.get(c_pid, 0.0) if pat_scores is not None else style_sim
 
@@ -186,12 +216,21 @@ def predict_split_fused(
                 metric=rank_metric, delta_thresh=delta_thresh, sigma=sigma
             )
 
+            if score_mat is not None and base_mat is not None:
+                base_mat[row_idx, ci] = base_sim
+                if passed_mask and not math.isinf(rank_score):
+                    score_mat[row_idx, ci] = base_sim + alpha * rank_score
+                continue
+
             if passed_mask and not math.isinf(rank_score):
                 final_score = base_sim + alpha * rank_score
                 valid_candidates.append((final_score, base_sim, c_pid))
             else:
                 # 被硬性遮罩剔除，記錄下來以供極端兜底
                 pruned_candidates.append((base_sim, c_pid))
+
+        if score_mat is not None:
+            continue
 
         # 依融合總分排序
         valid_candidates.sort(key=lambda x: x[0], reverse=True)
@@ -215,6 +254,34 @@ def predict_split_fused(
                     break
 
         results.append([qid] + top_candidates[:top_n])
+
+    # 啟用 CSLS 時於整批分數矩陣套用候選欄去樞紐化後再排序
+    if score_mat is not None and base_mat is not None:
+        adj_mat = apply_csls_column_penalty(score_mat, csls_k)
+        for row_idx, (qid, _) in enumerate(parsed_rows):
+            row_vals = adj_mat[row_idx]
+            valid_idx = np.flatnonzero(np.isfinite(row_vals))
+            valid_sorted = sorted(valid_idx.tolist(), key=lambda i: (-float(row_vals[i]), cand_names[i]))
+            top_candidates = [cand_names[i] for i in valid_sorted[:top_n]]
+
+            if len(top_candidates) < top_n:
+                pruned_idx = np.flatnonzero(~np.isfinite(row_vals))
+                pruned_sorted = sorted(pruned_idx.tolist(), key=lambda i: (-float(base_mat[row_idx, i]), cand_names[i]))
+                for i in pruned_sorted:
+                    pid = cand_names[i]
+                    if pid not in top_candidates:
+                        top_candidates.append(pid)
+                    if len(top_candidates) == top_n:
+                        break
+
+            if len(top_candidates) < top_n:
+                for pid in cand_names:
+                    if pid not in top_candidates:
+                        top_candidates.append(pid)
+                    if len(top_candidates) == top_n:
+                        break
+
+            results.append([qid] + top_candidates[:top_n])
 
     return results
 
@@ -256,6 +323,8 @@ def run_full_fused_pipeline(
     pattern_eps: float = DEFAULT_PATTERN_EPS,
     pattern_min_df: int = DEFAULT_PATTERN_MIN_DF,
     pattern_workers: int = 1,
+    csls_k: int = 0,
+    pub2_csls_k: Optional[int] = None,
 ) -> pd.DataFrame:
     """執行全量四份測試題融合推論並輸出提交 CSV。"""
     cand_ranks = _load_rank_cache(cand_cache_path, "候選人棋力快取")
@@ -291,8 +360,12 @@ def run_full_fused_pipeline(
         cur_delta = pub2_delta_thresh if (is_v2 and pub2_delta_thresh is not None) else delta_thresh
         cur_metric = pub2_metric if (is_v2 and pub2_metric is not None) else rank_metric
         cur_sigma = pub2_sigma if (is_v2 and pub2_sigma is not None) else sigma
+        cur_csls_k = pub2_csls_k if (is_v2 and pub2_csls_k is not None) else csls_k
 
-        print(f"\n[{prefix}] 處理中 (alpha={cur_alpha}, delta={cur_delta}, metric={cur_metric}, sigma={cur_sigma}, pat_beta={pattern_beta})...")
+        print(
+            f"\n[{prefix}] 處理中 (alpha={cur_alpha}, delta={cur_delta}, metric={cur_metric}, "
+            f"sigma={cur_sigma}, pat_beta={pattern_beta}, csls_k={cur_csls_k})..."
+        )
         t0 = time.time()
         cand_profiles, idf_weights = build_candidate_profiles_and_idf(
             cand_path, max_moves=max_moves, idf_power=idf_power, w_resp=w_resp,
@@ -320,6 +393,7 @@ def run_full_fused_pipeline(
             pattern_index=pattern_index,
             pattern_beta=pattern_beta,
             pattern_workers=pattern_workers,
+            csls_k=cur_csls_k,
         )
         print(f"  - 題目推論完成 ({time.time() - t0:.1f}s)")
 
@@ -374,6 +448,8 @@ def main():
     parser.add_argument("--pattern-eps", type=float, default=DEFAULT_PATTERN_EPS, help="Chi-squared 殘差分母平滑常數")
     parser.add_argument("--pattern-min-df", type=int, default=DEFAULT_PATTERN_MIN_DF, help="局部棋形詞表最小候選人數門檻")
     parser.add_argument("--pattern-workers", type=int, default=1, help="局部棋形平行抽取行程數")
+    parser.add_argument("--csls-k", type=int, default=0, help="候選側 CSLS 去樞紐化鄰居數 k（0 為停用）")
+    parser.add_argument("--pub2-csls-k", type=int, default=None, help="pub2/priv2 專用 CSLS 鄰居數 k，未指定時沿用 --csls-k")
     args = parser.parse_args()
 
     if bool(args.cand2_cache) != bool(args.query2_cache):
@@ -408,6 +484,8 @@ def main():
         pattern_eps=args.pattern_eps,
         pattern_min_df=args.pattern_min_df,
         pattern_workers=args.pattern_workers,
+        csls_k=args.csls_k,
+        pub2_csls_k=args.pub2_csls_k,
     )
 
 

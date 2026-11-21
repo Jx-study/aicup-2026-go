@@ -13,7 +13,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from aicup.fuse_player import compute_rank_compatibility
+from aicup.fuse_player import apply_csls_column_penalty, compute_rank_compatibility
 from aicup.infer_player_hsl import build_target_features, combine_log_mean, fit_hsl_lr
 from aicup.opening_player import (
     DEFAULT_MAX_MOVES,
@@ -46,16 +46,18 @@ class SimConfig(NamedTuple):
     delta_thresh: float
     sigma: float
     pattern_beta: float = 0.0
+    csls_k: int = 0
 
 
 DEFAULT_CONFIGS: Tuple[SimConfig, ...] = (
-    SimConfig("style_flat",          False, None,  0.0, "hybrid",   0.0, 1.5, 0.0),
-    SimConfig("flat_cnn_mask",       False, "cnn", 0.2, "hybrid",   3.0, 1.5, 0.0),
-    SimConfig("color_cnn_mask",      True,  "cnn", 0.2, "hybrid",   3.0, 1.5, 0.0),
-    SimConfig("color_cnn_gauss",     True,  "cnn", 0.2, "gaussian", 0.0, 1.5, 0.0),
-    SimConfig("color_hsl_gauss",     True,  "hsl", 0.2, "gaussian", 0.0, 1.5, 0.0),
-    SimConfig("color_cnn_mask_pat",  True,  "cnn", 0.2, "hybrid",   3.0, 1.5, DEFAULT_PATTERN_BETA),
-    SimConfig("color_hsl_gauss_pat", True,  "hsl", 0.2, "gaussian", 0.0, 1.5, DEFAULT_PATTERN_BETA),
+    SimConfig("style_flat",               False, None,  0.0, "hybrid",   0.0, 1.5, 0.0, 0),
+    SimConfig("flat_cnn_mask",            False, "cnn", 0.2, "hybrid",   3.0, 1.5, 0.0, 0),
+    SimConfig("color_cnn_mask",           True,  "cnn", 0.2, "hybrid",   3.0, 1.5, 0.0, 0),
+    SimConfig("color_cnn_gauss",          True,  "cnn", 0.2, "gaussian", 0.0, 1.5, 0.0, 0),
+    SimConfig("color_hsl_gauss",          True,  "hsl", 0.2, "gaussian", 0.0, 1.5, 0.0, 0),
+    SimConfig("color_cnn_mask_pat",       True,  "cnn", 0.2, "hybrid",   3.0, 1.5, DEFAULT_PATTERN_BETA, 0),
+    SimConfig("color_hsl_gauss_pat",      True,  "hsl", 0.2, "gaussian", 0.0, 1.5, DEFAULT_PATTERN_BETA, 0),
+    SimConfig("color_hsl_gauss_pat_csls", True,  "hsl", 0.2, "gaussian", 0.0, 1.5, DEFAULT_PATTERN_BETA, 10),
 )
 
 
@@ -268,6 +270,16 @@ def evaluate_b_group_seed(
     }
 
     scores_out = {cfg.name: np.zeros(len(q_pids), dtype=np.float64) for cfg in configs}
+    n_q = len(q_pids)
+    n_c = len(chosen)
+    csls_score_mats = {
+        cfg.name: np.full((n_q, n_c), float("-inf"), dtype=np.float64)
+        for cfg in configs if cfg.csls_k > 0
+    }
+    csls_base_mats = {
+        cfg.name: np.zeros((n_q, n_c), dtype=np.float64)
+        for cfg in configs if cfg.csls_k > 0
+    }
 
     for qi, (true_pid, qn) in enumerate(zip(q_pids, q_sizes)):
         q_games = query_pool_raw[true_pid][:qn]
@@ -296,6 +308,23 @@ def evaluate_b_group_seed(
             else:
                 base_sims = sims
 
+            if cfg.csls_k > 0:
+                s_mat = csls_score_mats[cfg.name]
+                b_mat = csls_base_mats[cfg.name]
+                for ci, pid in enumerate(chosen):
+                    b_mat[qi, ci] = base_sims[pid]
+                    if cfg.rank_source is None or cfg.alpha == 0.0:
+                        s_mat[qi, ci] = base_sims[pid]
+                    else:
+                        r_sc, ok = compute_rank_compatibility(
+                            cand_ranks_map[cfg.rank_source][pid],
+                            q_rank_map[cfg.rank_source],
+                            metric=cfg.metric, delta_thresh=cfg.delta_thresh, sigma=cfg.sigma,
+                        )
+                        if ok and not math.isinf(r_sc):
+                            s_mat[qi, ci] = base_sims[pid] + cfg.alpha * r_sc
+                continue
+
             if cfg.rank_source is None or cfg.alpha == 0.0:
                 ranked = sorted(chosen, key=lambda p: base_sims[p], reverse=True)[:TOP_N]
             else:
@@ -321,6 +350,23 @@ def evaluate_b_group_seed(
                             ranked.append(pid)
                         if len(ranked) == TOP_N:
                             break
+            scores_out[cfg.name][qi] = top5_score(true_pid, ranked)
+
+    # 對啟用 CSLS 的方案套用整批候選欄去樞紐化後排序
+    for cfg in configs:
+        if cfg.csls_k <= 0:
+            continue
+        adj_mat = apply_csls_column_penalty(csls_score_mats[cfg.name], cfg.csls_k)
+        b_mat = csls_base_mats[cfg.name]
+        for qi, true_pid in enumerate(q_pids):
+            row = adj_mat[qi]
+            valid_idx = np.flatnonzero(np.isfinite(row))
+            order = valid_idx[np.argsort(row[valid_idx])[::-1]].tolist()
+            if len(order) < TOP_N:
+                pruned_idx = np.flatnonzero(~np.isfinite(row))
+                p_order = pruned_idx[np.argsort(b_mat[qi, pruned_idx])[::-1]].tolist()
+                order.extend(p_order[:TOP_N - len(order)])
+            ranked = [chosen[i] for i in order[:TOP_N]]
             scores_out[cfg.name][qi] = top5_score(true_pid, ranked)
 
     return scores_out, q_sizes, np.array(q_pids, dtype=object), realized_counts
@@ -383,22 +429,23 @@ def run_mode(
     uniq_q = len(set(pids_cat.tolist()))
 
     print(f"\nB 組彙總（{len(seeds)} seeds，共 {len(sizes_cat)} 題，{uniq_q} 位獨立查詢玩家）")
-    print(f"{'方案':<22s} | {'總分':>7s} | {'1 局':>7s} | {'2 局':>7s} | {'3 局':>7s} | {'5 局':>7s}")
-    print("-" * 72)
+    print(f"{'方案':<26s} | {'總分':>7s} | {'1 局':>7s} | {'2 局':>7s} | {'3 局':>7s} | {'5 局':>7s}")
+    print("-" * 76)
     for cfg in DEFAULT_CONFIGS:
         v = cat[cfg.name]
         parts = [f"{v[sizes_cat == q].mean():.4f}" for q in (1, 2, 3, 5)]
-        print(f"{cfg.name:<22s} | {v.mean():7.4f} | " + " | ".join(f"{p:>7s}" for p in parts))
+        print(f"{cfg.name:<26s} | {v.mean():7.4f} | " + " | ".join(f"{p:>7s}" for p in parts))
 
     print("\n玩家層級配對 Bootstrap 比較（95% 區間）")
     pairs = [
-        ("color_cnn_mask",      "flat_cnn_mask",   "執色分離"),
-        ("color_cnn_gauss",     "color_cnn_mask",  "硬遮罩改高斯"),
-        ("color_hsl_gauss",     "color_cnn_gauss", "HSL 取代 CNN"),
-        ("color_hsl_gauss",     "color_cnn_mask",  "HSL 加高斯對 CNN 加遮罩"),
-        ("color_cnn_mask_pat",  "color_cnn_mask",  "局部棋形疊加於 CNN 加遮罩"),
-        ("color_hsl_gauss_pat", "color_hsl_gauss", "局部棋形疊加於 HSL 加高斯"),
-        ("color_hsl_gauss_pat", "color_cnn_mask",  "HSL 與局部棋形總效應"),
+        ("color_cnn_mask",           "flat_cnn_mask",       "執色分離"),
+        ("color_cnn_gauss",          "color_cnn_mask",      "硬遮罩改高斯"),
+        ("color_hsl_gauss",          "color_cnn_gauss",     "HSL 取代 CNN"),
+        ("color_hsl_gauss",          "color_cnn_mask",      "HSL 加高斯對 CNN 加遮罩"),
+        ("color_cnn_mask_pat",       "color_cnn_mask",      "局部棋形疊加於 CNN 加遮罩"),
+        ("color_hsl_gauss_pat",      "color_hsl_gauss",     "局部棋形疊加於 HSL 加高斯"),
+        ("color_hsl_gauss_pat",      "color_cnn_mask",      "HSL 與局部棋形總效應"),
+        ("color_hsl_gauss_pat_csls", "color_hsl_gauss_pat", "CSLS 去樞紐化疊加於 PV3.1"),
     ]
     for a, b, desc in pairs:
         diff = cat[a] - cat[b]

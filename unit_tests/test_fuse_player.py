@@ -7,13 +7,14 @@ import numpy as np
 import pytest
 
 from aicup.fuse_player import (
+    apply_csls_column_penalty,
     rank_overlap,
     rank_gaussian_similarity,
     compute_rank_compatibility,
     predict_split_fused,
     TOP_N
 )
-from aicup.pattern_player import build_chi2_pattern_index, extract_game_local_patterns
+from aicup.pattern_player import build_chi2_pattern_index, extract_game_local_patterns, score_query_patterns
 
 SAMPLE_SGF = "(;SZ[19]KM[6.5]RU[Japanese];B[dp];W[pd];B[qp];W[dd])"
 
@@ -167,6 +168,76 @@ def test_predict_split_fused_with_pattern_track():
             delta_thresh=3.0, pattern_index=pat_index, pattern_beta=0.7,
         )
         assert res_pruned[0][1] == "pub_p_0003"
+    finally:
+        if os.path.exists(temp_test_csv):
+            os.remove(temp_test_csv)
+
+
+def test_apply_csls_column_penalty_and_hub_suppression():
+    # 候選 0 為全場高分樞紐，候選 1 僅對第 0 題高分
+    mat = np.array([
+        [0.80, 0.78],
+        [0.80, 0.10],
+        [0.80, 0.10],
+    ], dtype=np.float64)
+    adj = apply_csls_column_penalty(mat, csls_k=2)
+    # 候選 0 前 2 大平均為 0.80（-> 扣 0.40 -> 0.40）；候選 1 前 2 大平均為 0.44（-> 扣 0.22 -> 0.56）
+    assert adj[0, 0] == pytest.approx(0.40, abs=1e-12)
+    assert adj[0, 1] == pytest.approx(0.56, abs=1e-12)
+    assert adj[0, 1] > adj[0, 0]
+
+    # 含 -inf 遮罩元素時只對有限值計算欄位樞紐分並保留 -inf
+    mat_mask = np.array([
+        [0.80, float("-inf")],
+        [0.60, 0.50],
+        [float("-inf"), 0.30],
+    ], dtype=np.float64)
+    adj_mask = apply_csls_column_penalty(mat_mask, csls_k=2)
+    assert math.isinf(adj_mask[0, 1]) and adj_mask[0, 1] < 0
+    assert math.isinf(adj_mask[2, 0]) and adj_mask[2, 0] < 0
+    assert adj_mask[0, 0] == pytest.approx(0.80 - 0.5 * 0.70, abs=1e-12)
+    assert adj_mask[1, 1] == pytest.approx(0.50 - 0.5 * 0.40, abs=1e-12)
+
+
+
+def test_predict_split_fused_csls_matches_matrix_ranking():
+    # CSLS 路徑的排序應等於整批分數矩陣扣欄樞紐分後逐列排序
+    sgfs = [
+        "(;SZ[19];B[aa];W[ab];B[ba];W[bb];B[ca])",
+        "(;SZ[19];B[jj];W[jk];B[kj];W[kk];B[lj])",
+        "(;SZ[19];B[dd];W[dc];B[cd];W[cc];B[ed])",
+    ]
+    pats = [extract_game_local_patterns(s, "b") for s in sgfs]
+    cand_counters = {
+        "pub_p_0001": pats[0] + pats[1],
+        "pub_p_0002": pats[0] + pats[0] + pats[2],
+        "pub_p_0003": pats[2],
+        "pub_p_0004": pats[1] + pats[2],
+        "pub_p_0005": pats[1],
+        "pub_p_0006": pats[0] + pats[2] + pats[2],
+    }
+    pat_index = build_chi2_pattern_index(cand_counters, min_df=1, eps=1e-3)
+    cand_names = sorted(cand_counters)
+    cand_profiles = {pid: {} for pid in cand_names}
+
+    with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as f:
+        temp_test_csv = f.name
+        f.write("question_id,num_games,sgf_1,color_1\n")
+        for qi, s in enumerate(sgfs, start=1):
+            f.write(f'pub_q_{qi:04d},1,"{s}",B\n')
+
+    try:
+        res = predict_split_fused(
+            temp_test_csv, cand_profiles, {},
+            pattern_index=pat_index, pattern_beta=1.0, csls_k=2,
+        )
+        mat = np.array([
+            [score_query_patterns(pat_index, p)[pid] for pid in cand_names] for p in pats
+        ])
+        adj = apply_csls_column_penalty(mat, 2)
+        for qi, row in enumerate(res):
+            expected = sorted(range(len(cand_names)), key=lambda i: (-adj[qi, i], cand_names[i]))[:TOP_N]
+            assert row[1:] == [cand_names[i] for i in expected]
     finally:
         if os.path.exists(temp_test_csv):
             os.remove(temp_test_csv)
