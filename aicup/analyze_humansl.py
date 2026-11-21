@@ -370,6 +370,22 @@ def test_game_keys(qids, games):
     return keys
 
 
+def load_manifest_games(manifest_csv, limit=0):
+    """讀取自訂清單 CSV（含 key、entity_id、color、sgf_content），回傳每局 dict。"""
+    df = pd.read_csv(manifest_csv)
+    req = {'key', 'entity_id', 'color', 'sgf_content'}
+    if not req.issubset(df.columns):
+        raise SystemExit('%s 缺少必要欄位：%s' % (manifest_csv, ', '.join(sorted(req - set(df.columns)))))
+    out = []
+    for _, r in df.iterrows():
+        col = str(r['color']).strip().upper()
+        if col not in ('B', 'W'):
+            raise SystemExit('%s 出現未知顏色：%s（key=%s）' % (manifest_csv, col, r['key']))
+        out.append({'key': str(r['key']), 'rank_idx': -1, 'player_id': str(r['entity_id']),
+                    'color': col, 'sgf': str(r['sgf_content'])})
+    return out[:limit] if limit else out
+
+
 def load_test_games(test_dir, limit=0):
     """讀競賽二的 public 與 private 測試題，回傳每局一個 dict，欄位同 load_games。
 
@@ -420,6 +436,7 @@ def main():
     ap.add_argument('--players-file', help='含 player_id、rank 欄位的 CSV，只抽清單內的玩家，有人局數不足時拒絕')
     ap.add_argument('--keys-from', help='既有的 jsonl，只分析裡面出現的 key，不能和抽樣參數、--test-dir 同時使用')
     ap.add_argument('--test-dir', help='競賽二測試題所在目錄；給定時不讀 --csv，不能和抽樣參數同時使用')
+    ap.add_argument('--manifest', help='自訂清單 CSV（含 key、entity_id、color、sgf_content），給定時不讀 --csv')
     ap.add_argument('--limit', type=int, default=0, help='最多分析幾局，用於冒煙測試')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--out', default='humansl-analysis/humansl.jsonl')
@@ -447,15 +464,15 @@ def main():
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
     done = done_keys(args.out, eval_visits, args.profiles, args.side, args.pre_root_history)
     todo, bad = [], 0
-    if args.test_dir and args.keys_from:
-        raise SystemExit('--test-dir 不能和 --keys-from 同時使用')
-    if args.test_dir:
-        if args.per_rank or args.players_per_rank or args.players_file:
-            raise SystemExit('--test-dir 不能和 --per-rank、--players-per-rank、--players-file 同時使用')
+    if sum(bool(x) for x in (args.test_dir, args.keys_from, args.manifest)) > 1:
+        raise SystemExit('--test-dir、--keys-from、--manifest 不能同時使用')
+    if (args.manifest or args.test_dir or args.keys_from) and (args.per_rank or args.players_per_rank or args.players_file):
+        raise SystemExit('--manifest、--test-dir、--keys-from 不能和 --per-rank、--players-per-rank、--players-file 同時使用')
+    if args.manifest:
+        games = load_manifest_games(args.manifest, args.limit)
+    elif args.test_dir:
         games = load_test_games(args.test_dir, args.limit)
     elif args.keys_from:
-        if args.per_rank or args.players_per_rank or args.players_file:
-            raise SystemExit('--keys-from 不能和 --per-rank、--players-per-rank、--players-file 同時使用')
         games = load_games_by_keys(args.csv, read_keys(args.keys_from))
         games = games[:args.limit] if args.limit else games
     else:
