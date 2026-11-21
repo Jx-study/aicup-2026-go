@@ -221,6 +221,41 @@ def test_train_player_emb_smoke_and_resume(tmp_path):
     with pytest.raises(SystemExit):
         train_player_emb.main(base_args[:-4] + ['--epochs', '3', '--no-amp', '--log-every', '0'])
 
+    # 測試 --resume-weights 開啟 Stage-2 續訓（不同 lr、epochs、新目錄）
+    s2_dir = tmp_path / 'ckpt_s2'
+    train_player_emb.main([
+        '--feat-dir', str(feat),
+        '--ckpt-dir', str(s2_dir),
+        '--resume-weights', str(ckpt_dir / 'last.pt'),
+        '--dev-players', str(dev_csv),
+        '--channels', '8', '--blocks', '1', '--embed-dim', '16',
+        '--p-players', '3', '--k-games', '2', '--min-games', '5',
+        '--steps-per-epoch', '2', '--epochs', '1', '--bn-batches', '2',
+        '--lr', '3e-4', '--backbone-lr', '1e-4', '--tail-crop', '6',
+        '--eval-seeds', '42', '--no-amp', '--log-every', '0',
+    ])
+    assert (s2_dir / 'best_model.pth').exists()
+    assert len(pd.read_csv(s2_dir / 'history.csv')) == 1
+
+    # 測試 --init 與 --resume-weights 互斥，以及 last.pt 缺欄位時中止
+    with pytest.raises(SystemExit):
+        train_player_emb.main([
+            '--feat-dir', str(feat), '--ckpt-dir', str(tmp_path / 'bad1'),
+            '--init', str(init_ckpt), '--resume-weights', str(ckpt_dir / 'last.pt'),
+            '--dev-players', str(dev_csv), '--epochs', '1', '--no-amp',
+        ])
+    bad_pt = tmp_path / 'bad_last.pt'
+    torch.save({'model': {}}, bad_pt)
+    with pytest.raises(SystemExit, match='arcface'):
+        train_player_emb.main([
+            '--feat-dir', str(feat), '--ckpt-dir', str(tmp_path / 'bad2'),
+            '--resume-weights', str(bad_pt),
+            '--dev-players', str(dev_csv),
+            '--channels', '8', '--blocks', '1', '--embed-dim', '16',
+            '--p-players', '3', '--k-games', '2', '--min-games', '5',
+            '--epochs', '1', '--no-amp',
+        ])
+
 
 def test_compute_sgf_feature_colors_handicap_flip():
     sgfs = [

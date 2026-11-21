@@ -469,8 +469,9 @@ def parse_args(argv=None):
     ap.add_argument('--feat-dir', default='rank-features-v180000')
     ap.add_argument('--ckpt-dir', required=True)
     ap.add_argument('--init', default='', help='預訓練 GoRankResNet 權重路徑，空字串為從零訓練')
+    ap.add_argument('--resume-weights', default='', help='Stage-2 續訓用之既有 last.pt，載入模型與 ArcFace 權重並重置排程')
     ap.add_argument('--dev-players', default=DEFAULT_DEV_PLAYERS,
-                    help='val split 中用於早停評估的 dev 玩家 CSV，找不到且未顯式指定時使用全部 val')
+                    help='val split 中用於早停評估的 dev 玩家 CSV，找不到檔案時中止，空字串為使用全部 val')
     ap.add_argument('--exclude-players', nargs='*', default=[],
                     help='額外從 train 排除的玩家 CSV 清單')
     ap.add_argument('--epochs', type=int, default=10)
@@ -515,6 +516,8 @@ def parse_args(argv=None):
         ap.error('--p-players 要 >= 2，--k-games 與 --sub-centers 要 >= 1')
     if args.min_games < 1 or args.supcon_weight < 0 or args.tail_crop < 0 or args.bn_batches < 0:
         ap.error('--min-games 要 >= 1，--supcon-weight、--tail-crop 與 --bn-batches 要 >= 0')
+    if args.init and args.resume_weights:
+        ap.error('--init 與 --resume-weights 不可同時指定')
     return args
 
 
@@ -582,8 +585,15 @@ def main(argv=None):
     if args.init:
         loaded = load_rank_backbone(model, args.init)
         print('已由 %s 載入主幹權重（%d 個張量）' % (args.init, loaded), flush=True)
+    elif args.resume_weights:
+        src = torch.load(args.resume_weights, map_location='cpu', weights_only=False)
+        if not isinstance(src, dict) or 'model' not in src or 'arcface' not in src:
+            raise SystemExit('--resume-weights 必須指向含 model 與 arcface 的 last.pt：%s' % args.resume_weights)
+        model.load_state_dict(src['model'])
+        arcface.load_state_dict(src['arcface'])
+        print('已由 %s 載入 Stage-2 模型與 ArcFace 權重' % args.resume_weights, flush=True)
 
-    eff_backbone_lr = args.backbone_lr if args.init else args.lr
+    eff_backbone_lr = args.backbone_lr if (args.init or args.resume_weights) else args.lr
     optimizer = torch.optim.AdamW(
         [
             {'params': list(model.backbone_parameters()), 'lr': eff_backbone_lr, 'base_lr': eff_backbone_lr},
@@ -620,6 +630,8 @@ def main(argv=None):
         'num_classes': num_classes,
         'amp': amp,
     }
+    if args.resume_weights:
+        config['resume_weights'] = args.resume_weights
 
     start_epoch, history, best_score = 0, [], -1.0
     if os.path.exists(last_path) and not args.fresh:
