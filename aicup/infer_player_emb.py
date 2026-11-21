@@ -142,55 +142,6 @@ def save_npz_atomic(path, **arrays):
     os.replace(tmp, path)
 
 
-def aggregate_and_center_similarity(cand_embs_by_id, query_embs_by_id, cand_ids, query_ids):
-    """計算多局平均、候選池中心化並 L2 正規化後之餘弦相似度矩陣 (Q, C)。
-
-    cand_embs_by_id  dict[cand_id -> (n_i, D) array]
-    query_embs_by_id dict[query_id -> (m_j, D) array]
-    沒有有效向量的候選欄位回傳 -inf，避免排在負相似度候選之前。
-    """
-    if not cand_ids or not query_ids:
-        return np.zeros((len(query_ids), len(cand_ids)), dtype=np.float64)
-
-    dim = None
-    for cid in cand_ids:
-        arr = cand_embs_by_id.get(cid)
-        if arr is not None and len(arr) > 0:
-            dim = np.asarray(arr).shape[-1]
-            break
-    if dim is None:
-        return np.full((len(query_ids), len(cand_ids)), float('-inf'), dtype=np.float64)
-
-    cand_mat = np.zeros((len(cand_ids), dim), dtype=np.float64)
-    cand_ok = np.zeros(len(cand_ids), dtype=bool)
-    for i, cid in enumerate(cand_ids):
-        arr = cand_embs_by_id.get(cid)
-        if arr is not None and len(arr) > 0:
-            cand_mat[i] = np.asarray(arr, dtype=np.float64).mean(axis=0)
-            cand_ok[i] = True
-
-    mu_cand = cand_mat[cand_ok].mean(axis=0, keepdims=True)
-    cand_centered = cand_mat - mu_cand
-    cand_norms = np.linalg.norm(cand_centered, axis=1, keepdims=True)
-    cand_unit = np.where(cand_ok[:, None], cand_centered / np.maximum(cand_norms, 1e-12), 0.0)
-
-    q_mat = np.zeros((len(query_ids), dim), dtype=np.float64)
-    q_ok = np.zeros(len(query_ids), dtype=bool)
-    for j, qid in enumerate(query_ids):
-        arr = query_embs_by_id.get(qid)
-        if arr is not None and len(arr) > 0:
-            q_mat[j] = np.asarray(arr, dtype=np.float64).mean(axis=0)
-            q_ok[j] = True
-
-    q_centered = q_mat - mu_cand
-    q_norms = np.linalg.norm(q_centered, axis=1, keepdims=True)
-    q_unit = np.where(q_ok[:, None], q_centered / np.maximum(q_norms, 1e-12), 0.0)
-    sim = q_unit @ cand_unit.T
-    if not cand_ok.all():
-        sim[:, ~cand_ok] = float('-inf')
-    return sim
-
-
 def run_packed_mode(args, model, cfg, device, amp, ckpt_hash):
     """從 bit-packed val 分片抽取 Embedding 並存成單一 .npz 快取。"""
     split_dir = os.path.join(args.feat_dir, args.split)

@@ -314,8 +314,10 @@ def test_packed_and_sgf_inference_consistency(tmp_path):
 
 
 def test_aggregate_and_center_similarity_edge_cases():
+    from aicup import fuse_player
+
     # 空字典不應噴 StopIteration
-    empty = infer_player_emb.aggregate_and_center_similarity({}, {}, ['c1'], ['q1'])
+    empty = fuse_player.aggregate_and_center_similarity({}, {}, ['c1'], ['q1'])
     assert empty.shape == (1, 1) and np.isneginf(empty[0, 0])
 
     # 無效候選欄位應為 -inf，不排在負相似度候選之前
@@ -328,8 +330,71 @@ def test_aggregate_and_center_similarity_edge_cases():
         'q1': np.array([[1.0, 0.0, 0.0]]),
         'q2': np.array([[0.0, 1.0, 0.0]]),
     }
-    sim = infer_player_emb.aggregate_and_center_similarity(cands, queries, ['c1', 'c2', 'c_empty'], ['q1', 'q2'])
+    sim = fuse_player.aggregate_and_center_similarity(cands, queries, ['c1', 'c2', 'c_empty'], ['q1', 'q2'])
     assert sim.shape == (2, 3)
     assert sim[0, 0] > sim[0, 1]
     assert sim[1, 1] > sim[1, 0]
     assert np.all(np.isneginf(sim[:, 2]))
+
+
+def test_load_emb_cache_npz_filters_invalid_rows(tmp_path):
+    from aicup import fuse_player
+
+    p = tmp_path / 'sample_emb.npz'
+    np.savez_compressed(
+        p,
+        emb=np.array([[1.0, 0.0], [0.0, 1.0], [9.0, 9.0]], dtype=np.float16),
+        entity_id=np.array(['p1', 'p1', 'p2'], dtype=str),
+        valid=np.array([True, False, True], dtype=bool),
+    )
+    loaded = fuse_player._load_emb_cache_npz(str(p))
+    assert set(loaded.keys()) == {'p1', 'p2'}
+    assert loaded['p1'].shape == (1, 2)
+    np.testing.assert_allclose(loaded['p1'][0], [1.0, 0.0], atol=1e-3)
+
+
+def test_fuse_player_predict_split_uses_embeddings_and_validates_args(tmp_path):
+    from aicup import fuse_player
+
+    sgf_same = '(;GM[1]FF[4]SZ[19]HD[0];B[pd];W[dd];B[pp];W[dp])'
+    test_csv = tmp_path / 'test.csv'
+    pd.DataFrame([
+        {'question_id': 'pub2_q_1', 'num_games': 1, 'sgf_1': sgf_same, 'color_1': 'b'},
+        {'question_id': 'pub2_q_2', 'num_games': 1, 'sgf_1': sgf_same, 'color_1': 'b'},
+    ]).to_csv(test_csv, index=False)
+
+    # 所有候選人的開局特徵完全相同，只能靠深度風格 Embedding 區分
+    cand_profiles = {f'pub2_p_{i}': {} for i in range(1, 7)}
+    cand_embs = {
+        'pub2_p_1': np.array([[1.0, 0.0, 0.0]]),
+        'pub2_p_2': np.array([[0.0, 1.0, 0.0]]),
+        'pub2_p_3': np.array([[0.0, 0.0, 1.0]]),
+        'pub2_p_4': np.array([[-1.0, 0.0, 0.0]]),
+        'pub2_p_5': np.array([[0.0, -1.0, 0.0]]),
+        'pub2_p_6': np.array([[0.0, 0.0, -1.0]]),
+    }
+    query_embs = {
+        'pub2_q_1': np.array([[0.0, 1.0, 0.0]]),
+        'pub2_q_2': np.array([[0.0, 0.0, 1.0]]),
+    }
+    rows = fuse_player.predict_split_fused(
+        str(test_csv), cand_profiles, {},
+        alpha=0.0, csls_k=2,
+        cand_embs=cand_embs, query_embs=query_embs, emb_gamma=1.0,
+    )
+    assert rows[0][0] == 'pub2_q_1' and rows[0][1] == 'pub2_p_2'
+    assert rows[1][0] == 'pub2_q_2' and rows[1][1] == 'pub2_p_3'
+
+    # emb_gamma=0 時結果應與不傳 Embedding 完全一致
+    rows_plain = fuse_player.predict_split_fused(str(test_csv), cand_profiles, {}, alpha=0.0, csls_k=2)
+    rows_zero = fuse_player.predict_split_fused(
+        str(test_csv), cand_profiles, {}, alpha=0.0, csls_k=2,
+        cand_embs=cand_embs, query_embs=query_embs, emb_gamma=0.0,
+    )
+    assert rows_zero == rows_plain
+
+    # emb_gamma > 0 但未提供 emb_cache_dir 時應明確報錯
+    with pytest.raises(ValueError, match='emb_cache_dir'):
+        fuse_player.run_full_fused_pipeline(emb_gamma=1.0, emb_cache_dir=None)
+    with pytest.raises(ValueError, match='emb_cache_dir'):
+        fuse_player.run_full_fused_pipeline(emb_gamma=0.0, pub2_emb_gamma=0.5, emb_cache_dir=None)
