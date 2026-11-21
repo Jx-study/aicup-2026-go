@@ -9,7 +9,7 @@ import json
 import math
 import os
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -27,13 +27,25 @@ from aicup.opening_player import (
 )
 from aicup.scoring import LEVELS
 
-DEFAULT_CONFIGS = (
-    # (名稱, 執色分離, 棋力來源, alpha, metric, delta_thresh, sigma)
-    ("PV1_flat",        False, None,  0.0, "hybrid",   0.0, 1.5),
-    ("PV2_cnn_mask",    False, "cnn", 0.2, "hybrid",   3.0, 1.5),
-    ("PV2.1_cc_mask",   True,  "cnn", 0.2, "hybrid",   3.0, 1.5),
-    ("PV2.1_cc_gauss",  True,  "cnn", 0.2, "gaussian", 0.0, 1.5),
-    ("PV3_hsl_a02_s15", True,  "hsl", 0.2, "gaussian", 0.0, 1.5),
+
+class SimConfig(NamedTuple):
+    """單一模擬評估方案之設定。"""
+
+    name: str
+    color_cond: bool
+    rank_source: Optional[str]
+    alpha: float
+    metric: str
+    delta_thresh: float
+    sigma: float
+
+
+DEFAULT_CONFIGS: Tuple[SimConfig, ...] = (
+    SimConfig("style_flat",      False, None,  0.0, "hybrid",   0.0, 1.5),
+    SimConfig("flat_cnn_mask",   False, "cnn", 0.2, "hybrid",   3.0, 1.5),
+    SimConfig("color_cnn_mask",  True,  "cnn", 0.2, "hybrid",   3.0, 1.5),
+    SimConfig("color_cnn_gauss", True,  "cnn", 0.2, "gaussian", 0.0, 1.5),
+    SimConfig("color_hsl_gauss", True,  "hsl", 0.2, "gaussian", 0.0, 1.5),
 )
 
 
@@ -81,7 +93,7 @@ def load_val648_dataset(
     va = np.load(val_cache, allow_pickle=True)
     cnn = np.load(cnn_probs_path, allow_pickle=True)
 
-    # 強制驗證擬合池與留出玩家完全互斥
+    # 驗證擬合池與留出玩家完全互斥
     tr_pids = set(tr["d_player_id"].tolist())
     va_pids = set(va["d_player_id"].tolist())
     if not tr_pids.isdisjoint(va_pids):
@@ -176,7 +188,7 @@ def sample_candidates(
         chosen = rng.choice(valid_pids, size=min(n_cands, len(valid_pids)), replace=False).tolist()
         return sorted(chosen)
 
-    # 依各級玩家數反比調整抽樣機率，逼近目標段位分佈
+    # 依各級人數反比調整抽樣機率，人數不足時實際分佈會偏平
     rank_counts = np.bincount([player_rank[p] for p in valid_pids], minlength=10).astype(np.float64)
     probs = np.array([
         rank_weights[player_rank[p]] / max(rank_counts[player_rank[p]], 1.0)
@@ -193,17 +205,18 @@ def evaluate_b_group_seed(
     by_player: Dict[str, List[dict]],
     player_rank: Dict[str, int],
     valid_pids: List[str],
-    configs: tuple,
+    configs: Tuple[SimConfig, ...],
     seed: int,
     n_cands: int = 300,
     n_queries: int = 200,
     rank_weights: Optional[np.ndarray] = None,
-) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray]:
-    """執行單一 seed 的 B 組模擬，回傳各方案逐題得分、局數與真實 player_id。"""
+) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
+    """執行單一 seed 的 B 組模擬，回傳各方案逐題得分、局數、真實 player_id 與實際候選段位計數。"""
     rng = np.random.default_rng(seed)
     chosen = sample_candidates(valid_pids, player_rank, n_cands, rng, rank_weights=rank_weights)
+    realized_counts = np.bincount([player_rank[p] for p in chosen], minlength=10)
 
-    # 切分每人的候選 10 局與保留查詢局，強制互斥
+    # 切分每人的候選 10 局與保留查詢局
     cand_games_raw: Dict[str, List[dict]] = {}
     query_pool_raw: Dict[str, List[dict]] = {}
     for pid in chosen:
@@ -211,6 +224,7 @@ def evaluate_b_group_seed(
         perm = rng.permutation(len(g))
         c_idx = perm[:10]
         q_idx = perm[10:]
+        # 防呆檢查候選局與查詢局無重疊
         if not set(c_idx.tolist()).isdisjoint(set(q_idx.tolist())):
             raise ValueError(f"玩家 {pid} 候選局與查詢局重疊")
         cand_games_raw[pid] = [g[i] for i in c_idx]
@@ -231,7 +245,7 @@ def evaluate_b_group_seed(
         "hsl": {pid: agg_rank_info(cand_games_raw[pid], "hsl_probs") for pid in chosen},
     }
 
-    scores_out = {cfg[0]: np.zeros(len(q_pids), dtype=np.float64) for cfg in configs}
+    scores_out = {cfg.name: np.zeros(len(q_pids), dtype=np.float64) for cfg in configs}
 
     for qi, (true_pid, qn) in enumerate(zip(q_pids, q_sizes)):
         q_games = query_pool_raw[true_pid][:qn]
@@ -247,22 +261,22 @@ def evaluate_b_group_seed(
             "hsl": agg_rank_info(q_games, "hsl_probs"),
         }
 
-        for name, cc, rk_src, alpha, metric, d_thresh, sigma in configs:
-            sims = sim_cc if cc else sim_flat
-            if rk_src is None or alpha == 0.0:
+        for cfg in configs:
+            sims = sim_cc if cfg.color_cond else sim_flat
+            if cfg.rank_source is None or cfg.alpha == 0.0:
                 ranked = sorted(chosen, key=lambda p: sims[p], reverse=True)[:TOP_N]
             else:
-                cr_dict = cand_ranks_map[rk_src]
-                qr = q_rank_map[rk_src]
+                cr_dict = cand_ranks_map[cfg.rank_source]
+                qr = q_rank_map[cfg.rank_source]
                 valid_c = []
                 pruned_c = []
                 for pid in chosen:
                     r_sc, ok = compute_rank_compatibility(
                         cr_dict[pid], qr,
-                        metric=metric, delta_thresh=d_thresh, sigma=sigma,
+                        metric=cfg.metric, delta_thresh=cfg.delta_thresh, sigma=cfg.sigma,
                     )
                     if ok and not math.isinf(r_sc):
-                        valid_c.append((sims[pid] + alpha * r_sc, pid))
+                        valid_c.append((sims[pid] + cfg.alpha * r_sc, pid))
                     else:
                         pruned_c.append((sims[pid], pid))
                 valid_c.sort(key=lambda x: x[0], reverse=True)
@@ -274,9 +288,9 @@ def evaluate_b_group_seed(
                             ranked.append(pid)
                         if len(ranked) == TOP_N:
                             break
-            scores_out[name][qi] = top5_score(true_pid, ranked)
+            scores_out[cfg.name][qi] = top5_score(true_pid, ranked)
 
-    return scores_out, q_sizes, np.array(q_pids, dtype=object)
+    return scores_out, q_sizes, np.array(q_pids, dtype=object), realized_counts
 
 
 def player_bootstrap_ci(
@@ -296,6 +310,67 @@ def player_bootstrap_ci(
     return float(p_means.mean()), float(np.percentile(boot_means, 2.5)), float(np.percentile(boot_means, 97.5))
 
 
+def run_mode(
+    by_player: Dict[str, List[dict]],
+    player_rank: Dict[str, int],
+    valid_pids: List[str],
+    seeds: List[int],
+    n_cands: int,
+    n_queries: int,
+    rank_weights: Optional[np.ndarray],
+    label: str,
+) -> None:
+    """執行單一抽樣模式（均勻或段位加權）之多 seed 模擬並列印彙總表。"""
+    all_scores = {cfg.name: [] for cfg in DEFAULT_CONFIGS}
+    all_sizes = []
+    all_pids = []
+    tot_counts = np.zeros(10, dtype=int)
+
+    print(f"\n================ 模式：{label} ================")
+    if rank_weights is not None:
+        print("目標段位分佈：" + " ".join(f"{LEVELS[i]}:{rank_weights[i]:.3f}" for i in range(10)))
+
+    for s in seeds:
+        sc, sz, pids, r_cnt = evaluate_b_group_seed(
+            by_player, player_rank, valid_pids, DEFAULT_CONFIGS,
+            seed=s, n_cands=n_cands, n_queries=n_queries, rank_weights=rank_weights,
+        )
+        for k, v in sc.items():
+            all_scores[k].append(v)
+        all_sizes.append(sz)
+        all_pids.append(pids)
+        tot_counts += r_cnt
+
+    realized_dist = tot_counts / tot_counts.sum()
+    print("實際段位分佈：" + " ".join(f"{LEVELS[i]}:{realized_dist[i]:.3f}" for i in range(10)))
+
+    sizes_cat = np.concatenate(all_sizes)
+    pids_cat = np.concatenate(all_pids)
+    cat = {k: np.concatenate(v) for k, v in all_scores.items()}
+    uniq_q = len(set(pids_cat.tolist()))
+
+    print(f"\nB 組彙總（{len(seeds)} seeds，共 {len(sizes_cat)} 題，{uniq_q} 位獨立查詢玩家）")
+    print(f"{'方案':<18s} | {'總分':>7s} | {'1 局':>7s} | {'2 局':>7s} | {'3 局':>7s} | {'5 局':>7s}")
+    print("-" * 68)
+    for cfg in DEFAULT_CONFIGS:
+        v = cat[cfg.name]
+        parts = [f"{v[sizes_cat == q].mean():.4f}" for q in (1, 2, 3, 5)]
+        print(f"{cfg.name:<18s} | {v.mean():7.4f} | " + " | ".join(f"{p:>7s}" for p in parts))
+
+    print("\n玩家層級配對 Bootstrap 比較（95% 區間）")
+    pairs = [
+        ("color_cnn_mask",  "flat_cnn_mask",   "執色分離"),
+        ("color_cnn_gauss", "color_cnn_mask",  "硬遮罩改高斯"),
+        ("color_hsl_gauss", "color_cnn_gauss", "HSL 取代 CNN"),
+        ("color_hsl_gauss", "color_cnn_mask",  "HSL 加高斯對 CNN 加遮罩"),
+    ]
+    for a, b, desc in pairs:
+        diff = cat[a] - cat[b]
+        m, lo, hi = player_bootstrap_ci(diff, pids_cat)
+        by_q = "，".join(f"{q}局 {diff[sizes_cat == q].mean():+.4f}" for q in (1, 2, 3, 5))
+        print(f"  {a} 減 {b}（{desc}）: {m:+.4f} [{lo:+.4f}, {hi:+.4f}] ({by_q})")
+
+
 def main():
     parser = argparse.ArgumentParser(description="競賽一 B 組真實結構本地模擬評估")
     parser.add_argument("--train-dir", default="training-v1.1/training")
@@ -303,7 +378,7 @@ def main():
     parser.add_argument("--pool-cache", default="humansl-analysis/cache/trainpool-6d.npz")
     parser.add_argument("--cnn-probs", default="rank-trained-models/9a3b6eb/val_probs.npz")
     parser.add_argument("--cand-cache", default="player-trained-models/rank-cache/cand_ranks.json")
-    parser.add_argument("--uniform", action="store_true", help="停用段位加權，改為均勻抽樣")
+    parser.add_argument("--mode", choices=["both", "weighted", "uniform"], default="both")
     parser.add_argument("--n-cands", type=int, default=300, help="每組候選人數")
     parser.add_argument("--n-queries", type=int, default=200, help="每組題數")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44, 45, 46, 47, 48, 49, 50, 51])
@@ -317,50 +392,13 @@ def main():
         cnn_probs_path=args.cnn_probs,
     )
     valid_pids = sorted([pid for pid, gs in by_player.items() if len(gs) >= 15])
-    rank_weights = None if args.uniform else load_target_rank_weights(args.cand_cache)
-    mode_str = "均勻抽樣" if args.uniform else "依 pub2/priv2 棋力直方圖加權"
-    print(f"載入完成 ({time.time() - t0:.1f}s)：可用留出玩家 {len(valid_pids)} 位，模式={mode_str}")
+    print(f"載入完成 ({time.time() - t0:.1f}s)：可用留出玩家 {len(valid_pids)} 位")
 
-    all_scores = {cfg[0]: [] for cfg in DEFAULT_CONFIGS}
-    all_sizes = []
-    all_pids = []
-    for s in args.seeds:
-        t1 = time.time()
-        sc, sz, pids = evaluate_b_group_seed(
-            by_player, player_rank, valid_pids, DEFAULT_CONFIGS,
-            seed=s, n_cands=args.n_cands, n_queries=args.n_queries, rank_weights=rank_weights,
-        )
-        for k, v in sc.items():
-            all_scores[k].append(v)
-        all_sizes.append(sz)
-        all_pids.append(pids)
-        print(f"  seed {s} ({time.time() - t1:.1f}s)：" + "，".join(f"{k}={v.mean():.4f}" for k, v in sc.items()))
-
-    sizes_cat = np.concatenate(all_sizes)
-    pids_cat = np.concatenate(all_pids)
-    cat = {k: np.concatenate(v) for k, v in all_scores.items()}
-
-    uniq_q = len(set(pids_cat.tolist()))
-    print(f"\n=== B 組彙總（{len(args.seeds)} seeds，共 {len(sizes_cat)} 題，{uniq_q} 位獨立查詢玩家，{mode_str}）===")
-    print(f"{'方案':<18s} | {'總分':>7s} | {'1 局':>7s} | {'2 局':>7s} | {'3 局':>7s} | {'5 局':>7s}")
-    print("-" * 68)
-    for cfg in DEFAULT_CONFIGS:
-        name = cfg[0]
-        v = cat[name]
-        parts = [f"{v[sizes_cat == q].mean():.4f}" for q in (1, 2, 3, 5)]
-        print(f"{name:<18s} | {v.mean():7.4f} | " + " | ".join(f"{p:>7s}" for p in parts))
-
-    print("\n=== 玩家層級配對 Bootstrap 比較（95% 區間）===")
-    pairs = [
-        ("PV2.1_cc_mask", "PV2_cnn_mask"),
-        ("PV2.1_cc_gauss", "PV2.1_cc_mask"),
-        ("PV3_hsl_a02_s15", "PV2.1_cc_mask"),
-    ]
-    for a, b in pairs:
-        diff = cat[a] - cat[b]
-        m, lo, hi = player_bootstrap_ci(diff, pids_cat)
-        by_q = "，".join(f"{q}局 {diff[sizes_cat == q].mean():+.4f}" for q in (1, 2, 3, 5))
-        print(f"{a} 減 {b}: {m:+.4f} [{lo:+.4f}, {hi:+.4f}] ({by_q})")
+    if args.mode in ("both", "uniform"):
+        run_mode(by_player, player_rank, valid_pids, args.seeds, args.n_cands, args.n_queries, None, "均勻抽樣")
+    if args.mode in ("both", "weighted"):
+        rw = load_target_rank_weights(args.cand_cache)
+        run_mode(by_player, player_rank, valid_pids, args.seeds, args.n_cands, args.n_queries, rw, "依 pub2/priv2 棋力直方圖加權")
 
 
 if __name__ == "__main__":
