@@ -9,6 +9,7 @@ rank-features/
 rank-features-*/
 permove-features/
 player-features/
+move-seq-features*/
 rank-trained-models/
 player-trained-models/
 humansl-analysis/
