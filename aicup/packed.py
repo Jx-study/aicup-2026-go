@@ -63,6 +63,23 @@ def list_shards(split_dir):
     return sorted(glob.glob(os.path.join(split_dir, '*.npz')))
 
 
+def load_meta(paths, fields=None, workers=None):
+    """平行讀取多個分片的非 features 欄位，回傳逐片的 dict 清單，順序同 paths。
+
+    fields 預設為 FIELDS 中 features 以外的全部欄位；冷快取的 Drive 依序讀檔很慢，所以用 thread。
+    """
+    fields = [k for k in FIELDS if k != 'features'] if fields is None else list(fields)
+
+    def read(p):
+        with np.load(p, allow_pickle=False) as z:
+            return {k: z[k] for k in fields}
+
+    if not paths:
+        return []
+    with ThreadPoolExecutor(min(workers or os.cpu_count() or 1, len(paths))) as ex:
+        return list(ex.map(read, paths))
+
+
 def load_split(split_dir, workers=None):
     """把一個 split 的所有分片載入，回傳 FIELDS 對應的 numpy 陣列。
 
@@ -73,12 +90,7 @@ def load_split(split_dir, workers=None):
     if not paths:
         raise FileNotFoundError('%s 下沒有 .npz 分片' % split_dir)
 
-    def read_meta(p):
-        with np.load(p, allow_pickle=False) as z:
-            return {k: z[k] for k in FIELDS if k != 'features'}
-
-    with ThreadPoolExecutor(workers or os.cpu_count()) as ex:
-        metas = list(ex.map(read_meta, paths))
+    metas = load_meta(paths, workers=workers)
     sizes = [len(m['rank_idx']) for m in metas]
     offsets = np.concatenate([[0], np.cumsum(sizes)])
     features = np.empty((offsets[-1], PACKED_LEN), np.uint8)

@@ -65,3 +65,17 @@ def test_save_empty_shard(tmp_path):
 def test_load_split_missing_dir(tmp_path):
     with pytest.raises(FileNotFoundError):
         packed.load_split(str(tmp_path))
+
+
+def test_load_meta_keeps_order_and_selects_fields(tmp_path):
+    paths = []
+    for i, rows in enumerate([[_row(0, 4, 0), _row(1, 9, 1)], [_row(2, 0, 1)], []]):
+        p = str(tmp_path / ('val-w%d-000000.npz' % i))
+        packed.save_shard(p, rows)
+        paths.append(p)
+    metas = packed.load_meta(paths, workers=3)
+    assert [m['key'].tolist() for m in metas] == [['1D_g_0000000', '1D_g_0000001'], ['1D_g_0000002'], []]
+    assert set(metas[0]) == {'rank_idx', 'color', 'key', 'player_id'}
+    only_rank = packed.load_meta(paths, fields=['rank_idx'])
+    assert [len(m['rank_idx']) for m in only_rank] == [2, 1, 0] and set(only_rank[0]) == {'rank_idx'}
+    assert packed.load_meta([]) == []
