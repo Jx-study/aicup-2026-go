@@ -183,6 +183,20 @@ def predict_split_fused(
     return results
 
 
+def _load_rank_cache(path: Optional[str], label: str) -> Dict[str, dict]:
+    """載入棋力快取 JSON，路徑為空或不存在時回傳空字典。"""
+    if not path:
+        return {}
+    if os.path.exists(path):
+        print(f"[雙軌融合] 載入{label}: {path}")
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        print(f"  - 包含 {len(data)} 筆棋力資料")
+        return data
+    print(f"[警告] 找不到{label} {path}，該分組將退回預設或純開局風格")
+    return {}
+
+
 def run_full_fused_pipeline(
     tests_dir: str = "tests",
     cand_cache_path: str = DEFAULT_CAND_CACHE,
@@ -195,33 +209,28 @@ def run_full_fused_pipeline(
     delta_thresh: float = 3.0,
     rank_metric: str = "hybrid",
     sigma: float = 1.5,
-    color_cond: bool = False
+    color_cond: bool = False,
+    cand2_cache_path: Optional[str] = None,
+    query2_cache_path: Optional[str] = None,
+    pub2_alpha: Optional[float] = None,
+    pub2_delta_thresh: Optional[float] = None,
+    pub2_metric: Optional[str] = None,
+    pub2_sigma: Optional[float] = None,
 ) -> pd.DataFrame:
     """執行全量四份測試題雙軌融合推論並輸出提交 CSV。"""
-    # 載入棋力快取（若存在）
-    cand_ranks = {}
-    query_ranks = {}
-    if os.path.exists(cand_cache_path):
-        print(f"[雙軌融合] 載入候選人棋力快取: {cand_cache_path}")
-        with open(cand_cache_path, "r", encoding="utf-8") as f:
-            cand_ranks = json.load(f)
-        print(f"  - 包含 {len(cand_ranks)} 位候選人棋力資料")
-    else:
-        print(f"[警告] 找不到候選人棋力快取 {cand_cache_path}，將以純開局風格退行運算！")
-
-    if os.path.exists(query_cache_path):
-        print(f"[雙軌融合] 載入題目棋力快取: {query_cache_path}")
-        with open(query_cache_path, "r", encoding="utf-8") as f:
-            query_ranks = json.load(f)
-        print(f"  - 包含 {len(query_ranks)} 道題目棋力資料")
-    else:
-        print(f"[警告] 找不到題目棋力快取 {query_cache_path}，將以純開局風格退行運算！")
+    cand_ranks = _load_rank_cache(cand_cache_path, "候選人棋力快取")
+    query_ranks = _load_rank_cache(query_cache_path, "題目棋力快取")
+    if bool(cand2_cache_path) != bool(query2_cache_path):
+        raise ValueError("cand2_cache_path 與 query2_cache_path 必須同時指定或同時省略")
+    # 兩份 pub2/priv2 快取同時省略時沿用 pub_/priv_ 的快取
+    cand2_ranks = _load_rank_cache(cand2_cache_path, "pub2/priv2 候選人棋力快取") if cand2_cache_path else cand_ranks
+    query2_ranks = _load_rank_cache(query2_cache_path, "pub2/priv2 題目棋力快取") if query2_cache_path else query_ranks
 
     splits_config = [
-        ("pub_", "player_identification_test_public.csv", "player_identification_candidates_public.csv"),
-        ("priv_", "player_identification_test_private.csv", "player_identification_candidates_private.csv"),
-        ("pub2_", "player_identification_test2_public.csv", "player_identification_candidates2_public.csv"),
-        ("priv2_", "player_identification_test2_private.csv", "player_identification_candidates2_private.csv"),
+        ("pub_", "player_identification_test_public.csv", "player_identification_candidates_public.csv", False),
+        ("priv_", "player_identification_test_private.csv", "player_identification_candidates_private.csv", False),
+        ("pub2_", "player_identification_test2_public.csv", "player_identification_candidates2_public.csv", True),
+        ("priv2_", "player_identification_test2_private.csv", "player_identification_candidates2_private.csv", True),
     ]
 
     all_rows = []
@@ -229,11 +238,18 @@ def run_full_fused_pipeline(
 
     print(f"\n[雙軌融合] 開始執行四組測試題推論 (alpha={alpha}, delta_thresh={delta_thresh}, metric={rank_metric})...")
 
-    for prefix, test_file, cand_file in splits_config:
+    for prefix, test_file, cand_file, is_v2 in splits_config:
         test_path = os.path.join(tests_dir, test_file)
         cand_path = os.path.join(tests_dir, cand_file)
 
-        print(f"\n[{prefix}] 處理中...")
+        cur_cand_ranks = cand2_ranks if is_v2 else cand_ranks
+        cur_query_ranks = query2_ranks if is_v2 else query_ranks
+        cur_alpha = pub2_alpha if (is_v2 and pub2_alpha is not None) else alpha
+        cur_delta = pub2_delta_thresh if (is_v2 and pub2_delta_thresh is not None) else delta_thresh
+        cur_metric = pub2_metric if (is_v2 and pub2_metric is not None) else rank_metric
+        cur_sigma = pub2_sigma if (is_v2 and pub2_sigma is not None) else sigma
+
+        print(f"\n[{prefix}] 處理中 (alpha={cur_alpha}, delta={cur_delta}, metric={cur_metric}, sigma={cur_sigma})...")
         t0 = time.time()
         cand_profiles, idf_weights = build_candidate_profiles_and_idf(
             cand_path, max_moves=max_moves, idf_power=idf_power, w_resp=w_resp,
@@ -244,10 +260,10 @@ def run_full_fused_pipeline(
         t0 = time.time()
         sub_rows = predict_split_fused(
             test_path, cand_profiles, idf_weights,
-            cand_ranks=cand_ranks, query_ranks=query_ranks,
+            cand_ranks=cur_cand_ranks, query_ranks=cur_query_ranks,
             top_n=TOP_N, max_moves=max_moves, w_resp=w_resp,
-            alpha=alpha, delta_thresh=delta_thresh,
-            rank_metric=rank_metric, sigma=sigma,
+            alpha=cur_alpha, delta_thresh=cur_delta,
+            rank_metric=cur_metric, sigma=cur_sigma,
             color_cond=color_cond
         )
         print(f"  - 題目推論完成 ({time.time() - t0:.1f}s)")
@@ -293,7 +309,22 @@ def main():
     parser.add_argument("--idf-power", type=float, default=IDF_POWER)
     parser.add_argument("--w-resp", type=float, default=W_RESP)
     parser.add_argument("--color-cond", action="store_true", help="啟用黑白執色分離建檔與比對")
+    parser.add_argument("--cand2-cache", default=None, help="pub2/priv2 專用候選人棋力快取 JSON")
+    parser.add_argument("--query2-cache", default=None, help="pub2/priv2 專用題目棋力快取 JSON")
+    parser.add_argument("--pub2-alpha", type=float, default=None, help="pub2/priv2 專用棋力加權係數")
+    parser.add_argument("--pub2-delta-thresh", type=float, default=None, help="pub2/priv2 專用硬遮罩閥值，指定 --cand2-cache 時預設 0")
+    parser.add_argument("--pub2-metric", choices=["overlap", "gaussian", "hybrid"], default=None, help="pub2/priv2 專用指標，指定 --cand2-cache 時預設 gaussian")
+    parser.add_argument("--pub2-sigma", type=float, default=None, help="pub2/priv2 專用高斯標準差")
     args = parser.parse_args()
+
+    if bool(args.cand2_cache) != bool(args.query2_cache):
+        parser.error("--cand2-cache 與 --query2-cache 必須同時指定")
+    # HSL 快取搭配高斯相容度，不啟用硬遮罩
+    if args.cand2_cache:
+        if args.pub2_metric is None:
+            args.pub2_metric = "gaussian"
+        if args.pub2_delta_thresh is None:
+            args.pub2_delta_thresh = 0.0
 
     run_full_fused_pipeline(
         tests_dir=args.tests_dir,
@@ -307,7 +338,13 @@ def main():
         delta_thresh=args.delta_thresh,
         rank_metric=args.metric,
         sigma=args.sigma,
-        color_cond=args.color_cond
+        color_cond=args.color_cond,
+        cand2_cache_path=args.cand2_cache,
+        query2_cache_path=args.query2_cache,
+        pub2_alpha=args.pub2_alpha,
+        pub2_delta_thresh=args.pub2_delta_thresh,
+        pub2_metric=args.pub2_metric,
+        pub2_sigma=args.pub2_sigma,
     )
 
 
