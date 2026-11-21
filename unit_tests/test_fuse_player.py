@@ -13,6 +13,7 @@ from aicup.fuse_player import (
     predict_split_fused,
     TOP_N
 )
+from aicup.pattern_player import build_chi2_pattern_index, extract_game_local_patterns
 
 SAMPLE_SGF = "(;SZ[19]KM[6.5]RU[Japanese];B[dp];W[pd];B[qp];W[dd])"
 
@@ -118,6 +119,54 @@ def test_predict_split_fused_mock():
         # 候選人 2 棋力吻合且特徵佳，排在第一名
         assert top5[0] == "pub_p_0002"
         assert "pub_p_0001" not in top5[:3]
+    finally:
+        if os.path.exists(temp_test_csv):
+            os.remove(temp_test_csv)
+
+
+def test_predict_split_fused_with_pattern_track():
+    # 所有候選人開局與棋力完全相同，僅局部棋形區分目標候選人 3
+    query_sgf = "(;SZ[19];B[aa];W[ab];B[ba];W[bb];B[ca])"
+    other_sgf = "(;SZ[19];B[jj];W[jk];B[kj];W[kk];B[lj])"
+    q_pat = extract_game_local_patterns(query_sgf, "b")
+    o_pat = extract_game_local_patterns(other_sgf, "b")
+
+    cand_profiles = {f"pub_p_{i:04d}": {} for i in range(1, 7)}
+    cand_counters = {
+        f"pub_p_{i:04d}": (q_pat if i == 3 else o_pat)
+        for i in range(1, 7)
+    }
+    pat_index = build_chi2_pattern_index(cand_counters, min_df=1, eps=1e-3)
+
+    with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as f:
+        temp_test_csv = f.name
+        f.write("question_id,num_games,sgf_1,color_1\n")
+        f.write(f'pub_q_0001,1,"{query_sgf}",B\n')
+
+    try:
+        # pattern_beta=0 時不啟用棋形軌，字母序第一名為 pub_p_0001
+        res_off = predict_split_fused(
+            temp_test_csv, cand_profiles, {},
+            pattern_index=pat_index, pattern_beta=0.0,
+        )
+        assert res_off[0][1] == "pub_p_0001"
+
+        # pattern_beta=0.7 時棋形完全吻合的 pub_p_0003 應排第一名
+        res_on = predict_split_fused(
+            temp_test_csv, cand_profiles, {},
+            pattern_index=pat_index, pattern_beta=0.7,
+        )
+        assert res_on[0][1] == "pub_p_0003"
+
+        # 所有候選人都被硬遮罩剔除時，兜底排序亦應採納 pattern_beta * pat_sim
+        cand_ranks = {f"pub_p_{i:04d}": {"expected_rank": 9.0, "probs": [0.0] * 9 + [1.0]} for i in range(1, 7)}
+        query_ranks = {"pub_q_0001": {"expected_rank": 0.0, "probs": [1.0] + [0.0] * 9}}
+        res_pruned = predict_split_fused(
+            temp_test_csv, cand_profiles, {},
+            cand_ranks=cand_ranks, query_ranks=query_ranks,
+            delta_thresh=3.0, pattern_index=pat_index, pattern_beta=0.7,
+        )
+        assert res_pruned[0][1] == "pub_p_0003"
     finally:
         if os.path.exists(temp_test_csv):
             os.remove(temp_test_csv)

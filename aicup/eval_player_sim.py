@@ -23,6 +23,15 @@ from aicup.opening_player import (
     compute_style_similarity,
     get_canonical_moves,
 )
+from aicup.pattern_player import (
+    DEFAULT_PATTERN_BETA,
+    DEFAULT_PATTERN_EPS,
+    DEFAULT_PATTERN_MIN_DF,
+    build_chi2_pattern_index,
+    extract_patterns_batch,
+    merge_pattern_counters,
+    score_query_patterns_array,
+)
 from aicup.scoring import LEVELS
 
 
@@ -36,14 +45,17 @@ class SimConfig(NamedTuple):
     metric: str
     delta_thresh: float
     sigma: float
+    pattern_beta: float = 0.0
 
 
 DEFAULT_CONFIGS: Tuple[SimConfig, ...] = (
-    SimConfig("style_flat",      False, None,  0.0, "hybrid",   0.0, 1.5),
-    SimConfig("flat_cnn_mask",   False, "cnn", 0.2, "hybrid",   3.0, 1.5),
-    SimConfig("color_cnn_mask",  True,  "cnn", 0.2, "hybrid",   3.0, 1.5),
-    SimConfig("color_cnn_gauss", True,  "cnn", 0.2, "gaussian", 0.0, 1.5),
-    SimConfig("color_hsl_gauss", True,  "hsl", 0.2, "gaussian", 0.0, 1.5),
+    SimConfig("style_flat",          False, None,  0.0, "hybrid",   0.0, 1.5, 0.0),
+    SimConfig("flat_cnn_mask",       False, "cnn", 0.2, "hybrid",   3.0, 1.5, 0.0),
+    SimConfig("color_cnn_mask",      True,  "cnn", 0.2, "hybrid",   3.0, 1.5, 0.0),
+    SimConfig("color_cnn_gauss",     True,  "cnn", 0.2, "gaussian", 0.0, 1.5, 0.0),
+    SimConfig("color_hsl_gauss",     True,  "hsl", 0.2, "gaussian", 0.0, 1.5, 0.0),
+    SimConfig("color_cnn_mask_pat",  True,  "cnn", 0.2, "hybrid",   3.0, 1.5, DEFAULT_PATTERN_BETA),
+    SimConfig("color_hsl_gauss_pat", True,  "hsl", 0.2, "gaussian", 0.0, 1.5, DEFAULT_PATTERN_BETA),
 )
 
 
@@ -82,8 +94,9 @@ def load_val648_dataset(
     pool_cache: str,
     cnn_probs_path: str,
     max_moves: int = DEFAULT_MAX_MOVES,
+    workers: int = 1,
 ) -> Tuple[Dict[str, List[dict]], Dict[str, int]]:
-    """載入留出玩家的對局開局落子、CNN 機率與互斥擬合之 HSL 目標側機率。"""
+    """載入留出玩家的對局開局落子、局部棋形、CNN 機率與互斥擬合之 HSL 目標側機率。"""
     tr = np.load(pool_cache, allow_pickle=True)
     va = np.load(val_cache, allow_pickle=True)
     cnn = np.load(cnn_probs_path, allow_pickle=True)
@@ -129,13 +142,15 @@ def load_val648_dataset(
             "hsl_probs": hsl_probs_va[i],
         }
 
-    # 依等級掃描訓練 CSV 取出對應局的開局落子
+    # 依等級掃描訓練 CSV 取出對應局的開局落子與局部棋形
     needed_by_rank: Dict[str, set] = {}
     for k in key_to_meta:
         rk, gid = k.split("_", 1)
         needed_by_rank.setdefault(rk, set()).add(gid)
 
     by_player: Dict[str, List[dict]] = {}
+    matched_metas: List[dict] = []
+    pat_tasks: List[Tuple[str, str]] = []
     for rk in LEVELS:
         need = needed_by_rank.get(rk)
         if not need:
@@ -149,10 +164,17 @@ def load_val648_dataset(
                 col = str(row["color"]).strip().lower()
                 if col not in ("b", "w"):
                     col = meta["color"]
-                mvs = get_canonical_moves(str(row["sgf_content"]), col, max_moves=max_moves)
+                sgf_str = str(row["sgf_content"])
+                mvs = get_canonical_moves(sgf_str, col, max_moves=max_moves)
                 meta["color"] = col
                 meta["moves"] = mvs
+                matched_metas.append(meta)
+                pat_tasks.append((sgf_str, col))
                 by_player.setdefault(meta["player_id"], []).append(meta)
+
+    pat_counters = extract_patterns_batch(pat_tasks, workers=workers)
+    for meta, cnt in zip(matched_metas, pat_counters):
+        meta["pat"] = cnt
 
     return by_player, player_rank
 
@@ -199,6 +221,8 @@ def evaluate_b_group_seed(
     n_cands: int = 300,
     n_queries: int = 200,
     rank_weights: Optional[np.ndarray] = None,
+    pattern_min_df: int = DEFAULT_PATTERN_MIN_DF,
+    pattern_eps: float = DEFAULT_PATTERN_EPS,
 ) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
     """執行單一 seed 的 B 組模擬，回傳各方案逐題得分、局數、真實 player_id 與實際候選段位計數。"""
     rng = np.random.default_rng(seed)
@@ -229,6 +253,15 @@ def evaluate_b_group_seed(
     prof_flat, idf_flat = build_candidate_profiles_from_moves(player_moves, color_cond=False)
     prof_cc, idf_cc = build_candidate_profiles_from_moves(player_moves, color_cond=True)
 
+    need_pat = any(cfg.pattern_beta > 0.0 for cfg in configs)
+    pat_index = None
+    if need_pat:
+        cand_pat = {
+            pid: merge_pattern_counters(g["pat"] for g in cand_games_raw[pid])
+            for pid in chosen
+        }
+        pat_index = build_chi2_pattern_index(cand_pat, min_df=pattern_min_df, eps=pattern_eps)
+
     cand_ranks_map = {
         "cnn": {pid: agg_rank_info(cand_games_raw[pid], "cnn_probs") for pid in chosen},
         "hsl": {pid: agg_rank_info(cand_games_raw[pid], "hsl_probs") for pid in chosen},
@@ -245,6 +278,12 @@ def evaluate_b_group_seed(
         sim_flat = {pid: compute_style_similarity(qv_flat, prof_flat[pid], color_cond=False) for pid in chosen}
         sim_cc = {pid: compute_style_similarity(qv_cc, prof_cc[pid], color_cond=True) for pid in chosen}
 
+        s_pat_map: Optional[Dict[str, float]] = None
+        if pat_index is not None:
+            q_pat = merge_pattern_counters(g["pat"] for g in q_games)
+            s_pat_arr = score_query_patterns_array(pat_index, q_pat)
+            s_pat_map = dict(zip(pat_index.pids, s_pat_arr.tolist()))
+
         q_rank_map = {
             "cnn": agg_rank_info(q_games, "cnn_probs"),
             "hsl": agg_rank_info(q_games, "hsl_probs"),
@@ -252,8 +291,13 @@ def evaluate_b_group_seed(
 
         for cfg in configs:
             sims = sim_cc if cfg.color_cond else sim_flat
+            if cfg.pattern_beta > 0.0 and s_pat_map is not None:
+                base_sims = {p: sims[p] + cfg.pattern_beta * s_pat_map[p] for p in chosen}
+            else:
+                base_sims = sims
+
             if cfg.rank_source is None or cfg.alpha == 0.0:
-                ranked = sorted(chosen, key=lambda p: sims[p], reverse=True)[:TOP_N]
+                ranked = sorted(chosen, key=lambda p: base_sims[p], reverse=True)[:TOP_N]
             else:
                 cr_dict = cand_ranks_map[cfg.rank_source]
                 qr = q_rank_map[cfg.rank_source]
@@ -265,9 +309,9 @@ def evaluate_b_group_seed(
                         metric=cfg.metric, delta_thresh=cfg.delta_thresh, sigma=cfg.sigma,
                     )
                     if ok and not math.isinf(r_sc):
-                        valid_c.append((sims[pid] + cfg.alpha * r_sc, pid))
+                        valid_c.append((base_sims[pid] + cfg.alpha * r_sc, pid))
                     else:
-                        pruned_c.append((sims[pid], pid))
+                        pruned_c.append((base_sims[pid], pid))
                 valid_c.sort(key=lambda x: x[0], reverse=True)
                 ranked = [pid for _, pid in valid_c[:TOP_N]]
                 if len(ranked) < TOP_N:
@@ -339,19 +383,22 @@ def run_mode(
     uniq_q = len(set(pids_cat.tolist()))
 
     print(f"\nB 組彙總（{len(seeds)} seeds，共 {len(sizes_cat)} 題，{uniq_q} 位獨立查詢玩家）")
-    print(f"{'方案':<18s} | {'總分':>7s} | {'1 局':>7s} | {'2 局':>7s} | {'3 局':>7s} | {'5 局':>7s}")
-    print("-" * 68)
+    print(f"{'方案':<22s} | {'總分':>7s} | {'1 局':>7s} | {'2 局':>7s} | {'3 局':>7s} | {'5 局':>7s}")
+    print("-" * 72)
     for cfg in DEFAULT_CONFIGS:
         v = cat[cfg.name]
         parts = [f"{v[sizes_cat == q].mean():.4f}" for q in (1, 2, 3, 5)]
-        print(f"{cfg.name:<18s} | {v.mean():7.4f} | " + " | ".join(f"{p:>7s}" for p in parts))
+        print(f"{cfg.name:<22s} | {v.mean():7.4f} | " + " | ".join(f"{p:>7s}" for p in parts))
 
     print("\n玩家層級配對 Bootstrap 比較（95% 區間）")
     pairs = [
-        ("color_cnn_mask",  "flat_cnn_mask",   "執色分離"),
-        ("color_cnn_gauss", "color_cnn_mask",  "硬遮罩改高斯"),
-        ("color_hsl_gauss", "color_cnn_gauss", "HSL 取代 CNN"),
-        ("color_hsl_gauss", "color_cnn_mask",  "HSL 加高斯對 CNN 加遮罩"),
+        ("color_cnn_mask",      "flat_cnn_mask",   "執色分離"),
+        ("color_cnn_gauss",     "color_cnn_mask",  "硬遮罩改高斯"),
+        ("color_hsl_gauss",     "color_cnn_gauss", "HSL 取代 CNN"),
+        ("color_hsl_gauss",     "color_cnn_mask",  "HSL 加高斯對 CNN 加遮罩"),
+        ("color_cnn_mask_pat",  "color_cnn_mask",  "局部棋形疊加於 CNN 加遮罩"),
+        ("color_hsl_gauss_pat", "color_hsl_gauss", "局部棋形疊加於 HSL 加高斯"),
+        ("color_hsl_gauss_pat", "color_cnn_mask",  "HSL 與局部棋形總效應"),
     ]
     for a, b, desc in pairs:
         diff = cat[a] - cat[b]
@@ -371,6 +418,7 @@ def main():
     parser.add_argument("--n-cands", type=int, default=300, help="每組候選人數")
     parser.add_argument("--n-queries", type=int, default=200, help="每組題數")
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44, 45, 46, 47, 48, 49, 50, 51])
+    parser.add_argument("--workers", type=int, default=1, help="局部棋形平行抽取行程數")
     args = parser.parse_args()
 
     t0 = time.time()
@@ -379,6 +427,7 @@ def main():
         val_cache=args.val_cache,
         pool_cache=args.pool_cache,
         cnn_probs_path=args.cnn_probs,
+        workers=args.workers,
     )
     valid_pids = sorted([pid for pid, gs in by_player.items() if len(gs) >= 15])
     print(f"載入完成 ({time.time() - t0:.1f}s)：可用留出玩家 {len(valid_pids)} 位")

@@ -28,6 +28,16 @@ from aicup.opening_player import (
     extract_raw_counts,
     get_canonical_moves,
 )
+from aicup.pattern_player import (
+    Chi2PatternIndex,
+    DEFAULT_PATTERN_EPS,
+    DEFAULT_PATTERN_MIN_DF,
+    build_candidate_pattern_counters,
+    build_chi2_pattern_index,
+    extract_patterns_batch,
+    merge_pattern_counters,
+    score_query_patterns,
+)
 
 DEFAULT_CAND_CACHE = os.path.join("player-trained-models", "rank-cache", "cand_ranks.json")
 DEFAULT_QUERY_CACHE = os.path.join("player-trained-models", "rank-cache", "query_ranks.json")
@@ -104,24 +114,31 @@ def predict_split_fused(
     delta_thresh: float = 3.0,
     rank_metric: str = "hybrid",
     sigma: float = 1.5,
-    color_cond: bool = False
+    color_cond: bool = False,
+    pattern_index: Optional[Chi2PatternIndex] = None,
+    pattern_beta: float = 0.0,
+    pattern_workers: int = 1,
 ) -> List[List[str]]:
-    """結合開局指紋特徵與棋力相容度對單一測試檔案進行雙軌融合預測。"""
+    """結合開局指紋、局部棋形殘差與棋力相容度對單一測試檔案進行融合預測。"""
     test_df = pd.read_csv(test_csv_path)
     cand_names = sorted(cand_profiles.keys())
     results = []
 
     cand_ranks = cand_ranks or {}
     query_ranks = query_ranks or {}
+    use_pattern = pattern_index is not None and pattern_beta > 0.0
 
     sgf_cols = [c for c in test_df.columns if c.startswith("sgf_")]
 
-    for _, row in test_df.iterrows():
+    # 預先收集各題有效 SGF 與執色，啟用局部棋形時可整批平行抽取
+    parsed_rows = []
+    pat_tasks: List[Tuple[str, str]] = []
+    pat_row_indices: List[int] = []
+
+    for row_idx, (_, row) in enumerate(test_df.iterrows()):
         qid = str(row["question_id"]).strip()
         num_games = int(row.get("num_games", len(sgf_cols)))
-
-        # 抽取題目開局風格
-        query_games = []
+        raw_games: List[Tuple[str, str]] = []
         for i in range(1, num_games + 1):
             s_col = f"sgf_{i}"
             c_col = f"color_{i}"
@@ -130,11 +147,29 @@ def predict_split_fused(
                 color = str(row[c_col]).strip().lower() if c_col in row and pd.notna(row[c_col]) else "b"
                 if color not in ("b", "w"):
                     color = "b"
-                mvs = get_canonical_moves(sgf_content, color, max_moves=max_moves)
-                query_games.append((color, mvs))
+                raw_games.append((sgf_content, color))
+                if use_pattern:
+                    pat_tasks.append((sgf_content, color))
+                    pat_row_indices.append(row_idx)
+        parsed_rows.append((qid, raw_games))
 
+    query_pat_counters: Optional[List[Counter]] = None
+    if use_pattern:
+        flat_counters = extract_patterns_batch(pat_tasks, workers=pattern_workers)
+        grouped: List[List[Counter]] = [[] for _ in range(len(parsed_rows))]
+        for r_idx, cnt in zip(pat_row_indices, flat_counters):
+            grouped[r_idx].append(cnt)
+        query_pat_counters = [merge_pattern_counters(cs) for cs in grouped]
+
+    for row_idx, (qid, raw_games) in enumerate(parsed_rows):
+        # 抽取題目開局風格
+        query_games = [
+            (color, get_canonical_moves(sgf_content, color, max_moves=max_moves))
+            for sgf_content, color in raw_games
+        ]
         q_vecs = build_query_vectors(query_games, idf_weights, w_resp=w_resp, color_cond=color_cond)
 
+        pat_scores = score_query_patterns(pattern_index, query_pat_counters[row_idx]) if use_pattern else None
         q_rank_info = query_ranks.get(qid)
 
         # 評估所有候選人
@@ -143,6 +178,7 @@ def predict_split_fused(
 
         for c_pid in cand_names:
             style_sim = compute_style_similarity(q_vecs, cand_profiles[c_pid], color_cond=color_cond)
+            base_sim = style_sim + pattern_beta * pat_scores.get(c_pid, 0.0) if pat_scores is not None else style_sim
 
             c_rank_info = cand_ranks.get(c_pid)
             rank_score, passed_mask = compute_rank_compatibility(
@@ -151,11 +187,11 @@ def predict_split_fused(
             )
 
             if passed_mask and not math.isinf(rank_score):
-                final_score = style_sim + alpha * rank_score
-                valid_candidates.append((final_score, style_sim, c_pid))
+                final_score = base_sim + alpha * rank_score
+                valid_candidates.append((final_score, base_sim, c_pid))
             else:
                 # 被硬性遮罩剔除，記錄下來以供極端兜底
-                pruned_candidates.append((style_sim, c_pid))
+                pruned_candidates.append((base_sim, c_pid))
 
         # 依融合總分排序
         valid_candidates.sort(key=lambda x: x[0], reverse=True)
@@ -216,8 +252,12 @@ def run_full_fused_pipeline(
     pub2_delta_thresh: Optional[float] = None,
     pub2_metric: Optional[str] = None,
     pub2_sigma: Optional[float] = None,
+    pattern_beta: float = 0.0,
+    pattern_eps: float = DEFAULT_PATTERN_EPS,
+    pattern_min_df: int = DEFAULT_PATTERN_MIN_DF,
+    pattern_workers: int = 1,
 ) -> pd.DataFrame:
-    """執行全量四份測試題雙軌融合推論並輸出提交 CSV。"""
+    """執行全量四份測試題融合推論並輸出提交 CSV。"""
     cand_ranks = _load_rank_cache(cand_cache_path, "候選人棋力快取")
     query_ranks = _load_rank_cache(query_cache_path, "題目棋力快取")
     if bool(cand2_cache_path) != bool(query2_cache_path):
@@ -236,7 +276,10 @@ def run_full_fused_pipeline(
     all_rows = []
     t_start = time.time()
 
-    print(f"\n[雙軌融合] 開始執行四組測試題推論 (alpha={alpha}, delta_thresh={delta_thresh}, metric={rank_metric})...")
+    print(
+        f"\n[雙軌融合] 開始執行四組測試題推論 "
+        f"(alpha={alpha}, delta_thresh={delta_thresh}, metric={rank_metric}, pattern_beta={pattern_beta})..."
+    )
 
     for prefix, test_file, cand_file, is_v2 in splits_config:
         test_path = os.path.join(tests_dir, test_file)
@@ -249,13 +292,22 @@ def run_full_fused_pipeline(
         cur_metric = pub2_metric if (is_v2 and pub2_metric is not None) else rank_metric
         cur_sigma = pub2_sigma if (is_v2 and pub2_sigma is not None) else sigma
 
-        print(f"\n[{prefix}] 處理中 (alpha={cur_alpha}, delta={cur_delta}, metric={cur_metric}, sigma={cur_sigma})...")
+        print(f"\n[{prefix}] 處理中 (alpha={cur_alpha}, delta={cur_delta}, metric={cur_metric}, sigma={cur_sigma}, pat_beta={pattern_beta})...")
         t0 = time.time()
         cand_profiles, idf_weights = build_candidate_profiles_and_idf(
             cand_path, max_moves=max_moves, idf_power=idf_power, w_resp=w_resp,
             color_cond=color_cond
         )
-        print(f"  - 候選庫特徵建置完成 ({time.time() - t0:.1f}s)")
+        print(f"  - 候選庫開局特徵建置完成 ({time.time() - t0:.1f}s)")
+
+        pattern_index = None
+        if pattern_beta > 0.0:
+            t0 = time.time()
+            cand_pat_counters = build_candidate_pattern_counters(cand_path, workers=pattern_workers)
+            pattern_index = build_chi2_pattern_index(
+                cand_pat_counters, min_df=pattern_min_df, eps=pattern_eps
+            )
+            print(f"  - 候選庫局部棋形索引建置完成，詞表 {len(pattern_index.vocab_to_idx)} ({time.time() - t0:.1f}s)")
 
         t0 = time.time()
         sub_rows = predict_split_fused(
@@ -264,7 +316,10 @@ def run_full_fused_pipeline(
             top_n=TOP_N, max_moves=max_moves, w_resp=w_resp,
             alpha=cur_alpha, delta_thresh=cur_delta,
             rank_metric=cur_metric, sigma=cur_sigma,
-            color_cond=color_cond
+            color_cond=color_cond,
+            pattern_index=pattern_index,
+            pattern_beta=pattern_beta,
+            pattern_workers=pattern_workers,
         )
         print(f"  - 題目推論完成 ({time.time() - t0:.1f}s)")
 
@@ -315,6 +370,10 @@ def main():
     parser.add_argument("--pub2-delta-thresh", type=float, default=None, help="pub2/priv2 專用硬遮罩閥值，指定 --cand2-cache 時預設 0")
     parser.add_argument("--pub2-metric", choices=["overlap", "gaussian", "hybrid"], default=None, help="pub2/priv2 專用指標，指定 --cand2-cache 時預設 gaussian")
     parser.add_argument("--pub2-sigma", type=float, default=None, help="pub2/priv2 專用高斯標準差")
+    parser.add_argument("--pattern-beta", type=float, default=0.0, help="全盤局部棋形殘差相似度加權係數（0 為停用）")
+    parser.add_argument("--pattern-eps", type=float, default=DEFAULT_PATTERN_EPS, help="Chi-squared 殘差分母平滑常數")
+    parser.add_argument("--pattern-min-df", type=int, default=DEFAULT_PATTERN_MIN_DF, help="局部棋形詞表最小候選人數門檻")
+    parser.add_argument("--pattern-workers", type=int, default=1, help="局部棋形平行抽取行程數")
     args = parser.parse_args()
 
     if bool(args.cand2_cache) != bool(args.query2_cache):
@@ -345,6 +404,10 @@ def main():
         pub2_delta_thresh=args.pub2_delta_thresh,
         pub2_metric=args.pub2_metric,
         pub2_sigma=args.pub2_sigma,
+        pattern_beta=args.pattern_beta,
+        pattern_eps=args.pattern_eps,
+        pattern_min_df=args.pattern_min_df,
+        pattern_workers=args.pattern_workers,
     )
 
 
