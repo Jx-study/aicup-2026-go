@@ -3,6 +3,7 @@
 前提：Drive 已掛載、repo 已 clone 且目前目錄在 repo 根目錄。
 執行方式：python -m aicup.colab_setup [--feat-dir rank-features-v180000]。可重複執行，已完成的步驟會跳過。
 --feat-dir 另外連結一個 Drive 上已存在的特徵目錄，VRAM 檢查改算這個目錄，缺省是 rank-features。
+--skip-size-check 不讀分片統計筆數，也不檢查特徵能否放進 VRAM。
 
 Drive 目錄結構（MyDrive/aicup-2026/）：
     training/             官方訓練 CSV
@@ -62,22 +63,27 @@ def setup_dirs(feat_dir='rank-features'):
         link(feat_dir, target)
 
 
-def feature_gb(feat_dir='rank-features'):
-    """依分片筆數估算打包特徵大小（GB），沒有分片時回傳 None"""
+def feature_gb(feat_dir='rank-features', workers=None):
+    """依分片筆數估算打包特徵大小（GB），沒有分片時回傳 None。
+
+    只讀各分片的 rank_idx，用 workers 個 thread 平行開檔，缺省為 CPU 核數。
+    """
     try:
-        import numpy as np
+        import numpy  # noqa: F401
     except ImportError:
         return None
     from aicup import packed
-    n = 0
-    for sub in ('train', 'val'):
-        for p in packed.list_shards(os.path.join(REPO, feat_dir, sub)):
-            with np.load(p, allow_pickle=False) as z:
-                n += len(z['rank_idx'])
+    paths = [
+        p
+        for sub in ('train', 'val')
+        for p in packed.list_shards(os.path.join(REPO, feat_dir, sub))
+    ]
+    n = sum(len(m['rank_idx']) for m in packed.load_meta(paths, fields=['rank_idx'], workers=workers))
     return n * packed.PACKED_LEN / 1024 ** 3 if n else None
 
 
-def check_gpu(feat_dir='rank-features'):
+def check_gpu(feat_dir='rank-features', skip_size_check=False):
+    """印出 GPU 規格與特徵能否放進 VRAM；skip_size_check 為真時不讀分片、只印規格。"""
     import torch
     if not torch.cuda.is_available():
         print('警告：沒有 GPU。到「執行階段 -> 變更執行階段類型」選 GPU')
@@ -87,6 +93,9 @@ def check_gpu(feat_dir='rank-features'):
     print('GPU %s，VRAM %.1f GB，CPU %d 核' % (prop.name, vram, os.cpu_count()))
     if vram < MIN_VRAM_GB:
         print('警告：VRAM 小於 %d GB，BATCH_SIZE 需調小' % MIN_VRAM_GB)
+    if skip_size_check:
+        print('已跳過 %s 特徵大小檢查' % feat_dir)
+        return
     data = feature_gb(feat_dir)
     if data is None:
         print('Drive 上的 %s 還沒有特徵分片' % feat_dir)
@@ -107,10 +116,11 @@ def summarize():
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--feat-dir', default='rank-features', help='Drive 上的特徵目錄名稱，缺省 rank-features')
+    ap.add_argument('--skip-size-check', action='store_true', help='跳過讀取分片估算特徵大小，加快啟動')
     args = ap.parse_args()
     install_packages()
     setup_dirs(args.feat_dir)
-    check_gpu(args.feat_dir)
+    check_gpu(args.feat_dir, skip_size_check=args.skip_size_check)
     summarize()
 
 
