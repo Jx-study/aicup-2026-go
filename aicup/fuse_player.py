@@ -23,6 +23,8 @@ from aicup.opening_player import (
     TOP_N,
     W_RESP,
     build_candidate_profiles_and_idf,
+    build_query_vectors,
+    compute_style_similarity,
     extract_raw_counts,
     get_canonical_moves,
 )
@@ -91,7 +93,7 @@ def compute_rank_compatibility(
 
 def predict_split_fused(
     test_csv_path: str,
-    cand_profiles: Dict[str, Dict[tuple, float]],
+    cand_profiles: Dict[str, dict],
     idf_weights: Dict[tuple, float],
     cand_ranks: Optional[Dict[str, dict]] = None,
     query_ranks: Optional[Dict[str, dict]] = None,
@@ -101,7 +103,8 @@ def predict_split_fused(
     alpha: float = 0.2,
     delta_thresh: float = 3.0,
     rank_metric: str = "hybrid",
-    sigma: float = 1.5
+    sigma: float = 1.5,
+    color_cond: bool = False
 ) -> List[List[str]]:
     """結合開局指紋特徵與棋力相容度對單一測試檔案進行雙軌融合預測。"""
     test_df = pd.read_csv(test_csv_path)
@@ -112,37 +115,34 @@ def predict_split_fused(
     query_ranks = query_ranks or {}
 
     sgf_cols = [c for c in test_df.columns if c.startswith("sgf_")]
-    color_cols = [c for c in test_df.columns if c.startswith("color_")]
 
     for _, row in test_df.iterrows():
         qid = str(row["question_id"]).strip()
         num_games = int(row.get("num_games", len(sgf_cols)))
 
-        # 1. 抽取題目開局風格
-        query_moves = []
+        # 抽取題目開局風格
+        query_games = []
         for i in range(1, num_games + 1):
             s_col = f"sgf_{i}"
             c_col = f"color_{i}"
             if s_col in row and pd.notna(row[s_col]) and str(row[s_col]).strip():
                 sgf_content = str(row[s_col])
-                color = str(row[c_col]) if c_col in row and pd.notna(row[c_col]) else "b"
+                color = str(row[c_col]).strip().lower() if c_col in row and pd.notna(row[c_col]) else "b"
+                if color not in ("b", "w"):
+                    color = "b"
                 mvs = get_canonical_moves(sgf_content, color, max_moves=max_moves)
-                query_moves.append(mvs)
+                query_games.append((color, mvs))
 
-        q_raw = extract_raw_counts(query_moves, w_resp=w_resp)
-        weighted_q = {k: val * idf_weights.get(k, 1.0) for k, val in q_raw.items()}
-        norm = math.sqrt(sum(v * v for v in weighted_q.values())) + 1e-9
-        q_vec = {k: v / norm for k, v in weighted_q.items()}
+        q_vecs = build_query_vectors(query_games, idf_weights, w_resp=w_resp, color_cond=color_cond)
 
         q_rank_info = query_ranks.get(qid)
 
-        # 2. 評估所有候選人：風格相似度 + alpha * 棋力相容度
+        # 評估所有候選人
         valid_candidates = []
         pruned_candidates = []
 
         for c_pid in cand_names:
-            c_prof = cand_profiles[c_pid]
-            style_sim = sum(val * c_prof[k] for k, val in q_vec.items() if k in c_prof)
+            style_sim = compute_style_similarity(q_vecs, cand_profiles[c_pid], color_cond=color_cond)
 
             c_rank_info = cand_ranks.get(c_pid)
             rank_score, passed_mask = compute_rank_compatibility(
@@ -194,7 +194,8 @@ def run_full_fused_pipeline(
     alpha: float = 0.2,
     delta_thresh: float = 3.0,
     rank_metric: str = "hybrid",
-    sigma: float = 1.5
+    sigma: float = 1.5,
+    color_cond: bool = False
 ) -> pd.DataFrame:
     """執行全量四份測試題雙軌融合推論並輸出提交 CSV。"""
     # 載入棋力快取（若存在）
@@ -235,7 +236,8 @@ def run_full_fused_pipeline(
         print(f"\n[{prefix}] 處理中...")
         t0 = time.time()
         cand_profiles, idf_weights = build_candidate_profiles_and_idf(
-            cand_path, max_moves=max_moves, idf_power=idf_power, w_resp=w_resp
+            cand_path, max_moves=max_moves, idf_power=idf_power, w_resp=w_resp,
+            color_cond=color_cond
         )
         print(f"  - 候選庫特徵建置完成 ({time.time() - t0:.1f}s)")
 
@@ -245,7 +247,8 @@ def run_full_fused_pipeline(
             cand_ranks=cand_ranks, query_ranks=query_ranks,
             top_n=TOP_N, max_moves=max_moves, w_resp=w_resp,
             alpha=alpha, delta_thresh=delta_thresh,
-            rank_metric=rank_metric, sigma=sigma
+            rank_metric=rank_metric, sigma=sigma,
+            color_cond=color_cond
         )
         print(f"  - 題目推論完成 ({time.time() - t0:.1f}s)")
 
@@ -289,6 +292,7 @@ def main():
     parser.add_argument("--max-moves", type=int, default=DEFAULT_MAX_MOVES)
     parser.add_argument("--idf-power", type=float, default=IDF_POWER)
     parser.add_argument("--w-resp", type=float, default=W_RESP)
+    parser.add_argument("--color-cond", action="store_true", help="啟用黑白執色分離建檔與比對")
     args = parser.parse_args()
 
     run_full_fused_pipeline(
@@ -302,7 +306,8 @@ def main():
         alpha=args.alpha,
         delta_thresh=args.delta_thresh,
         rank_metric=args.metric,
-        sigma=args.sigma
+        sigma=args.sigma,
+        color_cond=args.color_cond
     )
 
 
