@@ -13,10 +13,8 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-
 from aicup.fuse_player import compute_rank_compatibility
+from aicup.infer_player_hsl import build_target_features, combine_log_mean, fit_hsl_lr
 from aicup.opening_player import (
     DEFAULT_MAX_MOVES,
     TOP_N,
@@ -59,10 +57,7 @@ def top5_score(true_pid: str, top5: List[str]) -> float:
 
 def build_hsl_target_features(z) -> np.ndarray:
     """從快取檔組出目標側 7 欄特徵（g_hsl、執黑、HD1 與交互項）。"""
-    hsl = z["g_hsl"].astype(np.float64)
-    blk = z["d_black"].astype(np.float64)[:, None]
-    hd1 = (z["d_hd"] == 1).astype(np.float64)[:, None]
-    return np.hstack([hsl, blk, hd1, blk * hd1])
+    return build_target_features(z["g_hsl"], z["d_black"], z["d_hd"])
 
 
 def load_target_rank_weights(cand_cache_path: str) -> np.ndarray:
@@ -106,9 +101,7 @@ def load_val648_dataset(
     X_tr = build_hsl_target_features(tr)[tr_m]
     y_tr = tr["d_rank_idx"][tr_m]
     X_va = build_hsl_target_features(va)[va_m]
-    sc = StandardScaler()
-    clf = LogisticRegression(C=0.5, max_iter=1000)
-    clf.fit(sc.fit_transform(X_tr), y_tr)
+    sc, clf = fit_hsl_lr(X_tr, y_tr)
     hsl_probs_va = clf.predict_proba(sc.transform(X_va))
 
     # 對齊 CNN 逐局機率
@@ -168,11 +161,7 @@ def agg_rank_info(games: List[dict], prob_key: str) -> dict:
     """以逐局機率乘積（對數平均）合併多局機率，回傳機率分佈與期望段位。"""
     # 乘積合併會重複計入逐局先驗，比較不同棋力來源時條件相同
     probs = np.array([g[prob_key] for g in games], dtype=np.float64)
-    log_p = np.mean(np.log(np.clip(probs, 1e-6, 1.0)), axis=0)
-    log_p -= log_p.max()
-    p = np.exp(log_p)
-    p /= p.sum()
-    exp_r = float(np.dot(p, np.arange(10, dtype=np.float64)))
+    p, exp_r = combine_log_mean(probs)
     return {"probs": p.tolist(), "expected_rank": exp_r}
 
 
