@@ -26,7 +26,8 @@ from aicup.infer_player_emb import (
     _read_test_csv,
     save_npz_atomic,
 )
-from aicup.pack_move_seq import D4_POS_TABLE, MAX_MOVES, parse_sgf_batch
+from aicup.pack_move_patch import load_patch_npz
+from aicup.pack_move_seq import D4_POS_TABLE, MAX_MOVES, PAT3_VOCAB_FILE, map_state_fields, parse_sgf_batch
 from aicup.predict_rank import file_sha256
 from aicup.train_player_emb import read_player_ids_csv
 from aicup.train_rank import use_amp
@@ -69,6 +70,9 @@ def load_seq_emb_model(ckpt_path, device):
         dropout=float(cfg.get('dropout', 0.1)),
         head_dropout=float(cfg.get('head_dropout', 0.2)),
         pool_mode=str(cfg.get('pool_mode', 'target')),
+        state_feats=bool(cfg.get('state_feats', False)),
+        conv_kernel=int(cfg.get('conv_kernel', 0)),
+        patch_size=int(cfg.get('patch_size', 0)),
     )
     state = torch.load(ckpt_path, map_location='cpu', weights_only=True)
     model.load_state_dict(state)
@@ -86,8 +90,12 @@ def infer_sgf_seq_embeddings(
     batch_size=256,
     tta=1,
     nproc=1,
+    pat3_vocab=None,
 ):
-    """批次解析 SGF 落子序列並推論 L2 正規化風格向量，解析失敗的局填零向量、valid 為 False。"""
+    """批次解析 SGF 落子序列並推論 L2 正規化風格向量，解析失敗的局填零向量、valid 為 False。
+
+    state_feats 模型需傳入訓練時的 pat3_vocab。
+    """
     n = len(sgfs)
     embs = np.zeros((n, model.embed_dim), dtype=np.float32)
     valid = np.zeros(n, dtype=bool)
@@ -95,9 +103,17 @@ def infer_sgf_seq_embeddings(
         return embs, valid
 
     color_ids = [COLOR_TO_ID[str(c).strip().upper()] for c in raw_colors]
-    pos_np, role_np, _, _, ok_np = parse_sgf_batch(
-        sgfs, color_ids, max_moves=max_moves, raw_color=raw_color_flag, nproc=nproc,
+    use_state = bool(getattr(model, 'state_feats', False))
+    patch_size = int(getattr(model, 'patch_size', 0))
+    if use_state and pat3_vocab is None:
+        raise ValueError('state_feats 模型需要 pat3_vocab')
+    res = parse_sgf_batch(
+        sgfs, color_ids, max_moves=max_moves, raw_color=raw_color_flag, nproc=nproc, state_feats=use_state,
+        patch_size=patch_size,
     )
+    pos_np, role_np, ok_np = res.pos, res.is_target, res.ok
+    state_np = map_state_fields(res.st4, res.pat3, pat3_vocab) if use_state else None
+    patch_np = res.patch
     valid_idxs = np.nonzero(ok_np)[0]
     if len(valid_idxs) == 0:
         return embs, valid
@@ -109,7 +125,11 @@ def infer_sgf_seq_embeddings(
             sl = valid_idxs[i:i + batch_size]
             pb = torch.from_numpy(pos_np[sl].astype(np.int64)).to(device)
             rb = torch.from_numpy(role_np[sl].astype(np.int64)).to(device)
-            e = forward_seq_embeddings(model, pb, rb, amp, tta=tta, d4_table=d4_table).cpu().numpy()
+            sb = torch.from_numpy(state_np[sl].astype(np.int64)).to(device) if use_state else None
+            xb = torch.from_numpy(patch_np[sl]).to(device) if patch_size else None
+            e = forward_seq_embeddings(
+                model, pb, rb, amp, tta=tta, d4_table=d4_table, state=sb, patch=xb,
+            ).cpu().numpy()
             embs[sl] = e
             valid[sl] = True
     return embs, valid
@@ -118,7 +138,19 @@ def infer_sgf_seq_embeddings(
 def run_packed_mode(args, model, device, amp, ckpt_hash):
     """從打包序列 .npz 抽取 Embedding 並存成與 infer_player_emb 相容的 .npz 快取。"""
     seq_path = args.seq_npz or os.path.join(args.seq_dir, '%s.npz' % args.split)
-    pos, is_target, meta = load_seq_npz(seq_path, torch.device('cpu'))
+    pos, is_target, meta = load_seq_npz(seq_path, torch.device('cpu'), model.state_feats)
+    state = meta.pop('state', None) if model.state_feats else None
+    if model.state_feats and state is None:
+        raise SystemExit('%s 沒有狀態欄位，state_feats 模型需要 --state-feats 打包的序列' % seq_path)
+    patch = None
+    if model.patch_size:
+        if not args.patch_dir:
+            raise SystemExit('局部盤面模型需要 --patch-dir')
+        split_name = os.path.splitext(os.path.basename(seq_path))[0]
+        patch_np, ps = load_patch_npz(os.path.join(args.patch_dir, '%s_patch.npz' % split_name), meta['key'])
+        if ps != model.patch_size:
+            raise SystemExit('局部盤面大小 %d 與模型 %d 不同' % (ps, model.patch_size))
+        patch = torch.from_numpy(patch_np)
     if args.players:
         keep_pids = read_player_ids_csv(args.players)
         indices = np.array([i for i, pid in enumerate(meta['player_id']) if str(pid) in keep_pids], dtype=np.int64)
@@ -131,7 +163,7 @@ def run_packed_mode(args, model, device, amp, ckpt_hash):
     print('packed 序列推論：%s，%d 局，tta=%d' % (seq_path, len(indices), args.tta), flush=True)
     t0 = time.time()
     embs = extract_seq_embeddings(
-        model, pos, is_target, indices, args.batch_size, device, amp, tta=args.tta,
+        model, pos, is_target, indices, args.batch_size, device, amp, tta=args.tta, state=state, patch=patch,
     )
     save_npz_atomic(
         args.out,
@@ -151,6 +183,12 @@ def run_test_mode(args, model, cfg, device, amp, ckpt_hash):
     groups = ['a', 'b'] if args.groups == 'all' else [args.groups]
     max_moves = int(cfg.get('max_len', MAX_MOVES))
     raw_color_flag = bool(cfg.get('raw_color', False))
+    pat3_vocab = None
+    if model.state_feats:
+        vocab_path = os.path.join(os.path.dirname(args.ckpt), PAT3_VOCAB_FILE)
+        if not os.path.exists(vocab_path):
+            raise SystemExit('找不到 %s，state_feats 模型需要訓練時的 pat3 詞表' % vocab_path)
+        pat3_vocab = np.load(vocab_path)
     os.makedirs(args.out_dir, exist_ok=True)
     for g in groups:
         for tag, cand_file, test_file in SPLIT_GROUPS[g]:
@@ -176,6 +214,7 @@ def run_test_mode(args, model, cfg, device, amp, ckpt_hash):
                     batch_size=args.batch_size,
                     tta=args.tta,
                     nproc=args.nproc,
+                    pat3_vocab=pat3_vocab,
                 )
                 save_npz_atomic(
                     out_path,
@@ -201,6 +240,7 @@ def parse_args(argv=None):
     ap.add_argument('--split', default='newdev', choices=('train', 'newdev', 'val648'))
     ap.add_argument('--seq-npz', default='', help='直接指定單一序列 .npz 路徑，優先於 --seq-dir/--split')
     ap.add_argument('--players', default='', help='packed 模式可選之玩家 CSV 篩選清單')
+    ap.add_argument('--patch-dir', default='', help='packed 模式局部盤面模型用的 pack_move_patch 目錄')
     ap.add_argument('--out', default='', help='packed 模式輸出 .npz 路徑')
     ap.add_argument('--tests-dir', default='tests')
     ap.add_argument('--groups', choices=('a', 'b', 'all'), default='b')

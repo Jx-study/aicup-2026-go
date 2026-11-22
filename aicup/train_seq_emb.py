@@ -14,7 +14,9 @@ import copy
 import json
 import math
 import os
+import shutil
 import time
+import zipfile
 
 import numpy as np
 import pandas as pd
@@ -30,8 +32,12 @@ from aicup.pack_move_seq import (
     NUM_ROLES,
     PAD_POS,
     PASS_POS,
+    PAT3_NUM,
+    PAT3_VOCAB_FILE,
     ROLE_TARGET,
+    STATE_FIELDS,
 )
+from aicup.pack_move_patch import load_patch_npz
 from aicup.train_player_emb import (
     SubCenterArcFace,
     build_player_index,
@@ -47,6 +53,13 @@ REL_NUM = REL_CLAMP * 2 + 2  # -9..+9 共 19 格，加 1 格無效
 DIST_BUCKETS = 9  # 0..8 桶，加 1 格無效
 DIST_NUM = DIST_BUCKETS + 1
 LINE_NUM = (BOARD_SIZE + 1) // 2 + 1  # 0..9 線共 10 格，加 1 格 pass/pad
+PATCH_EMB_DIM = 64
+
+
+def amp_autocast(device_type, amp):
+    """amp 為 False、True（bf16）或 'fp16'，回傳對應的 autocast context。"""
+    dtype = torch.float16 if amp == 'fp16' else torch.bfloat16
+    return torch.autocast(device_type, dtype=dtype, enabled=bool(amp))
 
 
 def bucket_l1_distance(l1):
@@ -115,6 +128,55 @@ class PreLNTransformerBlock(nn.Module):
         return x
 
 
+class ConvModule(nn.Module):
+    """Conformer 卷積模組：依序為 pointwise GLU、depthwise conv、LayerNorm、SiLU、pointwise，外加殘差。"""
+
+    def __init__(self, d_model, kernel_size, dropout=0.1):
+        super().__init__()
+        if kernel_size % 2 != 1:
+            raise ValueError('conv kernel_size 必須為奇數，收到 %d' % kernel_size)
+        self.norm = nn.LayerNorm(d_model)
+        self.pw_in = nn.Linear(d_model, d_model * 2)
+        self.dw = nn.Conv1d(d_model, d_model, kernel_size, padding=kernel_size // 2, groups=d_model)
+        self.dw_norm = nn.LayerNorm(d_model)
+        self.pw_out = nn.Linear(d_model, d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, valid_mask):
+        """x: (B, L, D)，valid_mask: (B, L) bool；pad 位置在卷積前歸零。"""
+        y = F.glu(self.pw_in(self.norm(x)), dim=-1)
+        y = y * valid_mask.unsqueeze(-1).to(y.dtype)
+        y = self.dw(y.transpose(1, 2)).transpose(1, 2)
+        y = self.pw_out(F.silu(self.dw_norm(y)))
+        return x + self.drop(y)
+
+
+class PatchEncoder(nn.Module):
+    """每手共用的局部盤面 CNN：2 bit 打包格子解成 4 通道 one-hot，經兩層 3x3 conv 後平均池化。"""
+
+    def __init__(self, patch_size, out_dim=PATCH_EMB_DIM):
+        super().__init__()
+        self.patch_size = int(patch_size)
+        self.n_cells = self.patch_size * self.patch_size
+        self.conv = nn.Sequential(
+            nn.Conv2d(4, 32, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.GELU(),
+        )
+        self.proj = nn.Linear(64, out_dim)
+        self.register_buffer('shifts', torch.tensor([6, 4, 2, 0], dtype=torch.long), persistent=False)
+
+    def forward(self, patch):
+        """patch: (B, L, patch_nbytes) 整數張量，回傳 (B, L, out_dim)。"""
+        bsz, seq_len, nb = patch.shape
+        cells = ((patch.long().unsqueeze(-1) >> self.shifts) & 3).reshape(bsz, seq_len, nb * 4)[..., :self.n_cells]
+        x = F.one_hot(cells.reshape(-1, self.n_cells), 4).float()
+        x = x.transpose(1, 2).reshape(-1, 4, self.patch_size, self.patch_size)
+        y = self.conv(x).mean(dim=(2, 3))
+        return self.proj(y).view(bsz, seq_len, -1)
+
+
 class AttentiveStatsPool(nn.Module):
     """Attentive Statistics Pooling，輸出加權平均與加權標準差串接（2 * d_model）。"""
 
@@ -160,6 +222,9 @@ class GoMoveSeqTransformer(nn.Module):
         dropout=0.1,
         head_dropout=0.2,
         pool_mode='target',
+        state_feats=False,
+        conv_kernel=0,
+        patch_size=0,
     ):
         super().__init__()
         if pool_mode not in ('target', 'all'):
@@ -173,6 +238,9 @@ class GoMoveSeqTransformer(nn.Module):
         self.dropout_p = float(dropout)
         self.head_dropout_p = float(head_dropout)
         self.pool_mode = pool_mode
+        self.state_feats = bool(state_feats)
+        self.conv_kernel = int(conv_kernel)
+        self.patch_size = int(patch_size)
 
         self.coord_emb = nn.Embedding(NUM_POS, 128)
         self.role_emb = nn.Embedding(NUM_ROLES, 32)
@@ -184,6 +252,18 @@ class GoMoveSeqTransformer(nn.Module):
         self.step_emb = nn.Embedding(self.max_len, 16)
 
         in_dim = 128 + 32 + 16 + 24 + 24 + 16 + 16 + 16  # 272
+        if self.state_feats:
+            # 氣數、提子、叫吃、打劫、3x3 棋形，各欄最後一格為 pass/pad
+            self.libs_emb = nn.Embedding(6, 16)
+            self.cap_emb = nn.Embedding(5, 8)
+            self.atari_emb = nn.Embedding(3, 4)
+            self.ko_emb = nn.Embedding(3, 4)
+            self.pat3_emb = nn.Embedding(PAT3_NUM, 32)
+            in_dim += 16 + 8 + 4 + 4 + 32  # 336
+        self.patch_enc = None
+        if self.patch_size > 0:
+            self.patch_enc = PatchEncoder(self.patch_size)
+            in_dim += PATCH_EMB_DIM
         self.in_proj = nn.Linear(in_dim, self.d_model)
         self.in_norm = nn.LayerNorm(self.d_model)
         self.in_drop = nn.Dropout(dropout)
@@ -192,6 +272,11 @@ class GoMoveSeqTransformer(nn.Module):
             PreLNTransformerBlock(self.d_model, self.nhead, self.dim_feedforward, dropout=dropout)
             for _ in range(self.num_layers)
         ])
+        self.convs = None
+        if self.conv_kernel > 0:
+            self.convs = nn.ModuleList([
+                ConvModule(self.d_model, self.conv_kernel, dropout=dropout) for _ in range(self.num_layers)
+            ])
         self.final_norm = nn.LayerNorm(self.d_model)
 
         self.pool = AttentiveStatsPool(self.d_model)
@@ -243,8 +328,12 @@ class GoMoveSeqTransformer(nn.Module):
         steps = steps.unsqueeze(0).expand(bsz, seq_len)
         return line, dr_idx, dc_idx, dist_idx, self_dist_idx, steps
 
-    def forward(self, pos, is_target):
-        """輸入 pos (B, L) 與 is_target (B, L)，回傳 (B, embed_dim) L2 正規化向量。"""
+    def forward(self, pos, is_target, state=None, patch=None):
+        """輸入 pos (B, L) 與 is_target (B, L)，回傳 (B, embed_dim) L2 正規化向量。
+
+        state_feats 模型另需 state (B, L, 5)，欄位順序同 STATE_FIELDS；
+        patch_size 模型另需 patch (B, L, patch_nbytes)。
+        """
         pos_l = pos.long()
         role_l = is_target.long()
         valid_mask = pos_l != PAD_POS
@@ -266,10 +355,28 @@ class GoMoveSeqTransformer(nn.Module):
             self.self_dist_emb(self_dist_idx),
             self.step_emb(steps),
         ], dim=-1)
+        if self.state_feats:
+            if state is None:
+                raise ValueError('state_feats 模型需要 state 輸入')
+            st = state.long()
+            tok = torch.cat([
+                tok,
+                self.libs_emb(st[..., 0]),
+                self.cap_emb(st[..., 1]),
+                self.atari_emb(st[..., 2]),
+                self.ko_emb(st[..., 3]),
+                self.pat3_emb(st[..., 4]),
+            ], dim=-1)
+        if self.patch_enc is not None:
+            if patch is None:
+                raise ValueError('patch_size 模型需要 patch 輸入')
+            tok = torch.cat([tok, self.patch_enc(patch)], dim=-1)
         h = self.in_drop(self.in_norm(self.in_proj(tok)))
 
-        for blk in self.blocks:
+        for i, blk in enumerate(self.blocks):
             h = blk(h, attn_valid)
+            if self.convs is not None:
+                h = self.convs[i](h, valid_mask)
         h = self.final_norm(h)
 
         if self.pool_mode == 'target':
@@ -288,8 +395,11 @@ class GoMoveSeqTransformer(nn.Module):
         return emb
 
 
-def load_seq_npz(path, device):
-    """載入單檔落子序列 .npz，將 pos（int16）與 is_target（uint8）移至指定裝置。"""
+def load_seq_npz(path, device, load_state=True):
+    """載入單檔落子序列 .npz，將 pos（int16）與 is_target（uint8）移至指定裝置。
+
+    load_state 為真且檔內有狀態欄位時，狀態放在 meta['state']。
+    """
     if not os.path.exists(path):
         raise SystemExit('找不到序列特徵檔：%s' % path)
     with np.load(path, allow_pickle=False) as z:
@@ -305,12 +415,23 @@ def load_seq_npz(path, device):
         if 'hd' in z.files:
             meta['hd'] = z['hd']
         meta['raw_color'] = bool(z['raw_color']) if 'raw_color' in z.files else False
+        # 有規則引擎狀態時合成 (N, L, 5) int16 放在 meta['state']
+        if load_state and all(f in z.files for f in STATE_FIELDS):
+            st = np.empty(z['pos'].shape + (len(STATE_FIELDS),), dtype=np.int16)
+            for j, f in enumerate(STATE_FIELDS):
+                st[..., j] = z[f]
+            meta['state'] = torch.from_numpy(st).to(device)
     return pos, is_target, meta
 
 
-def forward_seq_embeddings(model, pos, is_target, amp, tta=1, d4_table=None):
-    """計算一個 batch 的序列風格向量，tta 支援 1 至 8 種 D4 對稱平均。"""
+def forward_seq_embeddings(model, pos, is_target, amp, tta=1, d4_table=None, state=None, patch=None):
+    """計算一個 batch 的序列風格向量，tta 支援 1 至 8 種 D4 對稱平均；狀態欄位 D4 不變，各視角共用。
+
+    局部盤面不隨 D4 變換，patch 模型只接受 tta=1。
+    """
     n_views = max(1, min(int(tta), 8))
+    if n_views > 1 and patch is not None:
+        raise ValueError('局部盤面模型不支援 D4 TTA')
     if n_views > 1 and d4_table is None:
         d4_table = torch.from_numpy(D4_POS_TABLE.astype(np.int64)).to(pos.device)
     total = None
@@ -318,14 +439,15 @@ def forward_seq_embeddings(model, pos, is_target, amp, tta=1, d4_table=None):
     role_l = is_target.long()
     for k in range(n_views):
         pk = apply_d4_pos(pos_l, k, d4_table) if k else pos_l
-        with torch.autocast(pos.device.type, dtype=torch.bfloat16, enabled=amp):
-            e = model(pk, role_l)
+        with amp_autocast(pos.device.type, amp):
+            e = model(pk, role_l, state, patch)
         e_f = e.float()
         total = e_f if total is None else (total + e_f)
     return F.normalize(total / n_views, p=2, dim=1)
 
 
-def recompute_seq_bn_stats(model, pos, is_target, batch_size, device, amp, n_batches=100, seed=42):
+def recompute_seq_bn_stats(model, pos, is_target, batch_size, device, amp, n_batches=100, seed=42, state=None,
+                           patch=None):
     """回傳 model 副本，以隨機訓練 batch 重算 BNNeck 累積統計量。"""
     bn = copy.deepcopy(model)
     norms = [m for m in bn.modules() if isinstance(m, nn.BatchNorm1d)]
@@ -345,8 +467,10 @@ def recompute_seq_bn_stats(model, pos, is_target, batch_size, device, amp, n_bat
                 continue
             pb = pos[sl].to(device, non_blocking=True)
             rb = is_target[sl].to(device, non_blocking=True)
-            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
-                bn(pb, rb)
+            sb = state[sl].to(device, non_blocking=True) if state is not None else None
+            xb = patch[sl].to(device, non_blocking=True) if patch is not None else None
+            with amp_autocast(device.type, amp):
+                bn(pb, rb, sb, xb)
 
     for m, mom in zip(norms, orig_mom):
         m.momentum = mom
@@ -354,7 +478,7 @@ def recompute_seq_bn_stats(model, pos, is_target, batch_size, device, amp, n_bat
     return bn
 
 
-def extract_seq_embeddings(model, pos, is_target, indices, batch_size, device, amp, tta=1):
+def extract_seq_embeddings(model, pos, is_target, indices, batch_size, device, amp, tta=1, state=None, patch=None):
     """對指定局索引批次抽取 L2 正規化風格向量，回傳 (len(indices), embed_dim) float32。"""
     was_training = model.training
     model.eval()
@@ -367,7 +491,9 @@ def extract_seq_embeddings(model, pos, is_target, indices, batch_size, device, a
                 sl = idx_t[i:i + batch_size]
                 pb = pos[sl].to(device, non_blocking=True)
                 rb = is_target[sl].to(device, non_blocking=True)
-                emb = forward_seq_embeddings(model, pb, rb, amp, tta=tta, d4_table=d4_table)
+                sb = state[sl].to(device, non_blocking=True) if state is not None else None
+                xb = patch[sl].to(device, non_blocking=True) if patch is not None else None
+                emb = forward_seq_embeddings(model, pb, rb, amp, tta=tta, d4_table=d4_table, state=sb, patch=xb)
                 out.append(emb.cpu().numpy())
     finally:
         model.train(was_training)
@@ -396,6 +522,10 @@ def parse_args(argv=None):
     ap.add_argument('--dropout', type=float, default=0.1)
     ap.add_argument('--head-dropout', type=float, default=0.2)
     ap.add_argument('--pool-mode', choices=('target', 'all'), default='target')
+    ap.add_argument('--state-feats', action='store_true', help='token 加入規則引擎狀態欄位（需 --state-feats 打包的序列）')
+    ap.add_argument('--conv-kernel', type=int, default=0, help='每層後接 Conformer 卷積模組的 kernel，0 為不加')
+    ap.add_argument('--patch-dir', default='', help='pack_move_patch 產出的局部盤面目錄，空字串為不用')
+    ap.add_argument('--fp16', action='store_true', help='GPU 用 fp16 autocast 與 GradScaler（給不支援 bf16 的 T4）')
     ap.add_argument('--sub-centers', type=int, default=2)
     ap.add_argument('--arc-scale', type=float, default=30.0)
     ap.add_argument('--arc-margin', type=float, default=0.25)
@@ -423,16 +553,33 @@ def parse_args(argv=None):
         ap.error('--p-players 要 >= 2，--k-games 與 --sub-centers 要 >= 1')
     if args.min_games < 1 or args.supcon_weight < 0 or args.bn_batches < 0:
         ap.error('--min-games 要 >= 1，--supcon-weight 與 --bn-batches 要 >= 0')
+    if args.conv_kernel < 0 or (args.conv_kernel and args.conv_kernel % 2 == 0):
+        ap.error('--conv-kernel 要是 0 或正奇數')
+    if args.patch_dir and args.augment_d4:
+        ap.error('局部盤面不隨 D4 變換，--patch-dir 不能與 --augment-d4 同時使用')
     return args
 
 
-def _seq_files_bytes(seq_dir):
-    """估算 train 與 newdev 解壓後 pos、is_target 的記憶體占用（byte）。"""
+def _npz_shape(path, name):
+    """不解壓，從 .npz 內陣列的 header 讀出形狀。"""
+    with zipfile.ZipFile(path) as zf, zf.open(name + '.npy') as f:
+        major, _ = np.lib.format.read_magic(f)
+        read = np.lib.format.read_array_header_1_0 if major == 1 else np.lib.format.read_array_header_2_0
+        return read(f)[0]
+
+
+def _seq_files_bytes(seq_dir, state_feats=False, patch_dir=''):
+    """估算 train 與 newdev 載入後 pos、is_target（與狀態欄位、局部盤面）的記憶體占用（byte）。"""
+    per_move = 2 + 1 + (2 * len(STATE_FIELDS) if state_feats else 0)  # pos int16、role uint8、狀態 int16
     total = 0
-    for name in ('train.npz', 'newdev.npz'):
-        p = os.path.join(seq_dir, name)
+    for name in ('train', 'newdev'):
+        p = os.path.join(seq_dir, name + '.npz')
         if os.path.exists(p):
-            total += os.path.getsize(p) * 3
+            n, length = _npz_shape(p, 'pos')
+            total += n * length * per_move
+        pp = os.path.join(patch_dir, name + '_patch.npz') if patch_dir else ''
+        if pp and os.path.exists(pp):
+            total += int(np.prod(_npz_shape(pp, 'patch')))
     return total
 
 
@@ -440,15 +587,33 @@ def main(argv=None):
     args = parse_args(argv)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     amp = use_amp(device, args.no_amp)
+    if args.fp16 and device.type == 'cuda' and not args.no_amp:
+        amp = 'fp16'
+    scaler = torch.amp.GradScaler('cuda', enabled=(amp == 'fp16'))
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    data_device = pick_data_device(args, device, _seq_files_bytes(args.seq_dir))
+    data_device = pick_data_device(args, device, _seq_files_bytes(args.seq_dir, args.state_feats, args.patch_dir))
     print('載入序列資料到 %s' % data_device, flush=True)
-    dev_pos, dev_role, dev_meta = load_seq_npz(os.path.join(args.seq_dir, 'newdev.npz'), data_device)
-    tr_pos, tr_role, tr_meta = load_seq_npz(os.path.join(args.seq_dir, 'train.npz'), data_device)
+    dev_pos, dev_role, dev_meta = load_seq_npz(os.path.join(args.seq_dir, 'newdev.npz'), data_device, args.state_feats)
+    tr_pos, tr_role, tr_meta = load_seq_npz(os.path.join(args.seq_dir, 'train.npz'), data_device, args.state_feats)
+    tr_state = dev_state = None
+    if args.state_feats:
+        if 'state' not in tr_meta or 'state' not in dev_meta:
+            raise SystemExit('%s 沒有狀態欄位，請用 pack_move_seq --state-feats 打包' % args.seq_dir)
+        tr_state, dev_state = tr_meta.pop('state'), dev_meta.pop('state')
+    tr_patch = dev_patch = None
+    patch_size = 0
+    if args.patch_dir:
+        tr_np, patch_size = load_patch_npz(os.path.join(args.patch_dir, 'train_patch.npz'), tr_meta['key'])
+        dev_np, dev_ps = load_patch_npz(os.path.join(args.patch_dir, 'newdev_patch.npz'), dev_meta['key'])
+        if dev_ps != patch_size:
+            raise SystemExit('train 與 newdev 局部盤面大小不同：%d vs %d' % (patch_size, dev_ps))
+        tr_patch = torch.from_numpy(tr_np).to(data_device)
+        dev_patch = torch.from_numpy(dev_np).to(data_device)
+        del tr_np, dev_np
 
     dev_pids = dev_meta['player_id']
     dev_pid_set = {str(p) for p in dev_pids.tolist()}
@@ -487,6 +652,9 @@ def main(argv=None):
         dropout=args.dropout,
         head_dropout=args.head_dropout,
         pool_mode=args.pool_mode,
+        state_feats=args.state_feats,
+        conv_kernel=args.conv_kernel,
+        patch_size=patch_size,
     ).to(device)
     arcface = SubCenterArcFace(
         embed_dim=args.embed_dim,
@@ -531,6 +699,12 @@ def main(argv=None):
         'num_classes': num_classes,
         'amp': amp,
     }
+    if args.state_feats:
+        config['state_feats'] = True
+    if args.conv_kernel:
+        config['conv_kernel'] = args.conv_kernel
+    if patch_size:
+        config['patch_size'] = patch_size
 
     start_epoch, history, best_score = 0, [], -1.0
     if os.path.exists(last_path) and not args.fresh:
@@ -543,6 +717,8 @@ def main(argv=None):
         model.load_state_dict(ckpt['model'])
         arcface.load_state_dict(ckpt['arcface'])
         optimizer.load_state_dict(ckpt['optimizer'])
+        if 'scaler' in ckpt:
+            scaler.load_state_dict(ckpt['scaler'])
         start_epoch, history, best_score = ckpt['epoch'], ckpt['history'], ckpt['best_score']
         print('從 epoch %d 接續（目前最佳 dev_top5_csls %.4f）' % (start_epoch, best_score), flush=True)
 
@@ -558,15 +734,21 @@ def main(argv=None):
         'pool_mode': args.pool_mode,
         'augment_d4': args.augment_d4,
         'raw_color': bool(tr_meta.get('raw_color', False)),
+        'state_feats': bool(args.state_feats),
+        'conv_kernel': int(args.conv_kernel),
+        'patch_size': int(patch_size),
     }
     with open(os.path.join(args.ckpt_dir, 'train_config.json'), 'w', encoding='utf-8') as f:
         json.dump(infer_cfg, f, indent=2)
+    if args.state_feats:
+        # test 模式推論從 checkpoint 目錄讀 pat3 詞表
+        shutil.copyfile(os.path.join(args.seq_dir, PAT3_VOCAB_FILE), os.path.join(args.ckpt_dir, PAT3_VOCAB_FILE))
 
     n_params = sum(p.numel() for p in model.parameters())
     print(
-        'device %s | data %s | amp %s | augment_d4 %s | pool %s | train 玩家 %d (%s 局, %d steps/ep) | dev %s 局 | 參數量 %s'
+        'device %s | data %s | amp %s | augment_d4 %s | pool %s | state %s | conv %d | patch %d | train 玩家 %d (%s 局, %d steps/ep) | dev %s 局 | 參數量 %s'
         % (
-            device, data_device, amp, args.augment_d4, args.pool_mode,
+            device, data_device, amp, args.augment_d4, args.pool_mode, args.state_feats, args.conv_kernel, patch_size,
             num_classes, format(total_train_games, ','), steps_per_epoch,
             format(len(dev_pos), ','), format(n_params, ','),
         ),
@@ -610,27 +792,31 @@ def main(argv=None):
             idx_t = torch.as_tensor(g_idx, dtype=torch.long, device=tr_pos.device)
             pb = tr_pos[idx_t].to(device, non_blocking=True).long()
             rb = tr_role[idx_t].to(device, non_blocking=True).long()
+            sb = tr_state[idx_t].to(device, non_blocking=True) if tr_state is not None else None
+            xb = tr_patch[idx_t].to(device, non_blocking=True) if tr_patch is not None else None
             if args.augment_d4:
                 ks = torch.randint(0, 8, (pb.size(0),), generator=aug_gen, device=device)
                 pb = apply_d4_pos(pb, ks, d4_table)
             yb = torch.as_tensor(y_np, dtype=torch.long, device=device)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
-                emb = model(pb, rb)
+            with amp_autocast(device.type, amp):
+                emb = model(pb, rb, sb, xb)
             l_arc, corr = arcface(emb, yb)
             l_sup = (
                 supcon_loss(emb, yb, temperature=args.supcon_temp)
                 if args.supcon_weight > 0 else l_arc.new_tensor(0.0)
             )
             loss = l_arc + args.supcon_weight * l_sup
-            loss.backward()
+            scaler.scale(loss).backward()
             if args.grad_clip > 0:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     list(model.parameters()) + list(arcface.parameters()),
                     args.grad_clip,
                 )
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             loss_sum += float(loss.item())
             arc_sum += float(l_arc.item())
@@ -653,6 +839,7 @@ def main(argv=None):
         train_min = (time.time() - t0) / 60
         raw_dev_emb = extract_seq_embeddings(
             model, dev_pos, dev_role, dev_indices, args.val_batch_size, device, amp, tta=args.val_tta,
+            state=dev_state, patch=dev_patch,
         )
         raw_dev_metrics = evaluate_b_group_embeddings(raw_dev_emb, dev_pids, seeds=args.eval_seeds)
 
@@ -661,10 +848,11 @@ def main(argv=None):
         if args.bn_batches > 0:
             eval_model = recompute_seq_bn_stats(
                 model, tr_pos, tr_role, args.val_batch_size, device, amp,
-                n_batches=args.bn_batches, seed=args.seed + epoch,
+                n_batches=args.bn_batches, seed=args.seed + epoch, state=tr_state, patch=tr_patch,
             )
             bn_dev_emb = extract_seq_embeddings(
                 eval_model, dev_pos, dev_role, dev_indices, args.val_batch_size, device, amp, tta=args.val_tta,
+                state=dev_state, patch=dev_patch,
             )
             dev_metrics = evaluate_b_group_embeddings(bn_dev_emb, dev_pids, seeds=args.eval_seeds)
 
@@ -713,6 +901,8 @@ def main(argv=None):
             'history': history,
             'config': config,
         }
+        if amp == 'fp16':
+            state['scaler'] = scaler.state_dict()
         save_atomic(state, last_path)
 
 

@@ -14,11 +14,13 @@ import glob
 import os
 import time
 from multiprocessing import Pool
+from typing import Any, NamedTuple, Optional
 
 import numpy as np
 import pandas as pd
 
 from aicup import color, packed
+from aicup.analyze_humansl import HANDICAP_STONES
 from aicup.extract_features import COLOR_TO_ID, RANK_TO_ID
 
 BOARD_SIZE = 19
@@ -32,8 +34,48 @@ ROLE_TARGET = 1
 ROLE_PAD = 2
 NUM_ROLES = 3
 
+# 規則引擎狀態欄位；pass 與 pad 使用各欄最後一格
+STATE_FIELDS = ('st_libs', 'st_cap', 'st_atari', 'st_ko', 'pat3')
+LIBS_NONE = 5  # 氣數桶 1, 2, 3, 4-5, 6+ 對應 0..4
+CAP_NONE = 4  # 提子桶 0, 1, 2-3, 4+ 對應 0..3
+FLAG_NONE = 2
+PAT3_RAW_NONE = 65535  # 8 鄰點各 2 bit 的原始編碼，盤面上不可能全為盤外
+PAT3_TOP = 4095  # 詞表大小，其後依序為 OOV 與 pass/pad
+PAT3_OOV = PAT3_TOP
+PAT3_PAD = PAT3_TOP + 1
+PAT3_NUM = PAT3_TOP + 2
+PAT3_VOCAB_FILE = 'pat3_vocab.npy'
+DEFAULT_PATCH_SIZE = 7
+
 DEFAULT_NEWDEV_CSV = os.path.join('humansl-analysis', 'val-players-newdev-v180000.csv')
 DEFAULT_VAL648_CSV = os.path.join('humansl-analysis', 'val-players.csv')
+
+
+def patch_nbytes(patch_size):
+    """局部盤面每格 2 bit，每 byte 存 4 格。"""
+    return (patch_size * patch_size + 3) // 4
+
+
+class SeqParse(NamedTuple):
+    """落子序列解析結果，單局時各欄少掉 N 維，未要求的欄位為 None。
+
+    pos         (N, L) uint16 落子座標
+    is_target   (N, L) uint8 目標方標記
+    length      (N,) uint16 有效手數
+    hd          (N,) int8 讓子數
+    ok          (N,) bool 解析成功且至少一手
+    st4         (N, L, 4) uint8 規則引擎狀態，state_feats 才有
+    pat3        (N, L) uint16 pat3 原始編碼，state_feats 才有
+    patch       (N, L, patch_nbytes) uint8 局部盤面，patch_size > 0 才有
+    """
+    pos: np.ndarray
+    is_target: np.ndarray
+    length: Any
+    hd: Any
+    ok: Any
+    st4: Optional[np.ndarray] = None
+    pat3: Optional[np.ndarray] = None
+    patch: Optional[np.ndarray] = None
 
 
 def build_d4_pos_table():
@@ -60,16 +102,197 @@ def build_d4_pos_table():
 D4_POS_TABLE = build_d4_pos_table()
 
 
-def parse_sgf_move_seq(sgf_content, actual_color_id, max_moves=MAX_MOVES, raw_color=False):
-    """解析單局 SGF 為定長落子序列，回傳 (pos, is_target, length, hd, ok)。
+def _build_neighbors4():
+    """每個盤面點的上下左右鄰點索引。"""
+    nbs = []
+    for r in range(BOARD_SIZE):
+        for c in range(BOARD_SIZE):
+            nbs.append(tuple(
+                rr * BOARD_SIZE + cc
+                for rr, cc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1))
+                if 0 <= rr < BOARD_SIZE and 0 <= cc < BOARD_SIZE
+            ))
+    return tuple(nbs)
+
+
+_NEIGHBORS4 = _build_neighbors4()
+_NB8 = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
+
+
+def _build_pat3_perms():
+    """D4 8 種變換下 8 鄰點的讀取順序，用於取最小編碼作為正規化棋形。"""
+    perms = []
+    for k in range(8):
+        perm = []
+        for dr, dc in _NB8:
+            tr, tc = dr, dc
+            for _ in range(k % 4):
+                tr, tc = tc, -tr
+            if k >= 4:
+                tc = -tc
+            perm.append(_NB8.index((tr, tc)))
+        perms.append(tuple(perm))
+    return tuple(perms)
+
+
+_PAT3_PERMS = _build_pat3_perms()
+
+
+def _pat3_code(board, r, c, color):
+    """落子前 3x3 鄰域（空 0、己 1、敵 2、盤外 3）的 D4 正規化編碼。"""
+    vals = []
+    for dr, dc in _NB8:
+        rr, cc = r + dr, c + dc
+        if 0 <= rr < BOARD_SIZE and 0 <= cc < BOARD_SIZE:
+            v = board[rr * BOARD_SIZE + cc]
+            vals.append(0 if v == 0 else (1 if v == color else 2))
+        else:
+            vals.append(3)
+    best = PAT3_RAW_NONE
+    for perm in _PAT3_PERMS:
+        code = 0
+        for i in perm:
+            code = (code << 2) | vals[i]
+        if code < best:
+            best = code
+    return best
+
+
+def _group_libs(board, start):
+    """回傳 start 所在棋塊的點集合與氣集合。"""
+    color_v = board[start]
+    stack, group, libs = [start], {start}, set()
+    while stack:
+        u = stack.pop()
+        for w in _NEIGHBORS4[u]:
+            b = board[w]
+            if b == 0:
+                libs.add(w)
+            elif b == color_v and w not in group:
+                group.add(w)
+                stack.append(w)
+    return group, libs
+
+
+def _bucket_libs(n):
+    return 0 if n <= 1 else (1 if n == 2 else (2 if n == 3 else (3 if n <= 5 else 4)))
+
+
+def _bucket_cap(n):
+    return 0 if n == 0 else (1 if n == 1 else (2 if n <= 3 else 3))
+
+
+def _patch_bytes(board, r, c, color, patch_size):
+    """落子前以 (r, c) 為中心的局部盤面（空 0、己 1、敵 2、盤外 3），每格 2 bit 依列優先打包。"""
+    half = patch_size // 2
+    out = bytearray(patch_nbytes(patch_size))
+    i = 0
+    for rr in range(r - half, r + half + 1):
+        for cc in range(c - half, c + half + 1):
+            if 0 <= rr < BOARD_SIZE and 0 <= cc < BOARD_SIZE:
+                v = board[rr * BOARD_SIZE + cc]
+                code = 0 if v == 0 else (1 if v == color else 2)
+            else:
+                code = 3
+            out[i >> 2] |= code << (2 * (3 - (i & 3)))
+            i += 1
+    return bytes(out)
+
+
+def replay_move_states(moves, hd, patch_size=0):
+    """依序重放 (SGF 標記色 1 黑 2 白, pos) 落子，回傳每手 (libs, cap, atari, ko, pat3 原始編碼)。
+
+    HD >= 2 讓子局的讓子屬於 SGF 標記為白的一方（資料集讓子局 B/W 標記與實際相反）。
+    落在已有子的點視為覆蓋，自殺手保留在盤上且氣數記為 0。
+    patch_size > 0 時另外回傳每手落子前局部盤面的打包 bytes，pass 為全 0。
+    """
+    board = [0] * (BOARD_SIZE * BOARD_SIZE)
+    for st in HANDICAP_STONES.get(int(hd), '').split():
+        board[(BOARD_SIZE - 1 - (ord(st[1]) - 97)) * BOARD_SIZE + ord(st[0]) - 97] = 2
+    out, patches = [], []
+    empty_patch = bytes(patch_nbytes(patch_size)) if patch_size else b''
+    for col_v, p in moves:
+        if p >= PASS_POS:
+            out.append((LIBS_NONE, CAP_NONE, FLAG_NONE, FLAG_NONE, PAT3_RAW_NONE))
+            if patch_size:
+                patches.append(empty_patch)
+            continue
+        opp = 3 - col_v
+        r, c = divmod(p, BOARD_SIZE)
+        pat = _pat3_code(board, r, c, col_v)
+        if patch_size:
+            patches.append(_patch_bytes(board, r, c, col_v, patch_size))
+        board[p] = col_v
+        captured, seen = 0, set()
+        for w in _NEIGHBORS4[p]:
+            if board[w] == opp and w not in seen:
+                grp, libs = _group_libs(board, w)
+                seen |= grp
+                if not libs:
+                    for u in grp:
+                        board[u] = 0
+                    captured += len(grp)
+        atari, seen = 0, set()
+        for w in _NEIGHBORS4[p]:
+            if board[w] == opp and w not in seen:
+                grp, libs = _group_libs(board, w)
+                seen |= grp
+                if len(libs) == 1:
+                    atari = 1
+        own, own_libs = _group_libs(board, p)
+        ko = int(captured == 1 and len(own) == 1 and len(own_libs) == 1)
+        out.append((_bucket_libs(len(own_libs)), _bucket_cap(captured), atari, ko, pat))
+    return (out, patches) if patch_size else out
+
+
+def build_pat3_vocab(pat3_raw):
+    """由 train 的 pat3 原始編碼依頻率取前 PAT3_TOP 個，同頻依編碼排序。"""
+    codes = np.asarray(pat3_raw, dtype=np.uint16).ravel()
+    codes = codes[codes != PAT3_RAW_NONE]
+    if codes.size == 0:
+        return np.zeros(0, dtype=np.uint16)
+    uniq, cnt = np.unique(codes, return_counts=True)
+    order = np.lexsort((uniq, -cnt))[:PAT3_TOP]
+    return uniq[order].astype(np.uint16)
+
+
+def map_state_fields(st4, pat3_raw, vocab):
+    """把 (N, L, 4) 狀態與 (N, L) pat3 原始編碼合成 (N, L, 5) int16，pat3 換成詞表索引。"""
+    lut = np.full(PAT3_RAW_NONE + 1, PAT3_OOV, dtype=np.int16)
+    lut[np.asarray(vocab, dtype=np.int64)] = np.arange(len(vocab), dtype=np.int16)
+    lut[PAT3_RAW_NONE] = PAT3_PAD
+    out = np.empty(st4.shape[:2] + (5,), dtype=np.int16)
+    out[..., :4] = st4
+    # 分塊查表，避免全量 intp 索引暫存
+    step = max(1, (1 << 24) // max(1, pat3_raw.shape[1]))
+    for i in range(0, len(pat3_raw), step):
+        out[i:i + step, :, 4] = lut[pat3_raw[i:i + step]]
+    return out
+
+
+def _empty_state(max_moves):
+    st4 = np.empty((max_moves, 4), dtype=np.uint8)
+    st4[:] = (LIBS_NONE, CAP_NONE, FLAG_NONE, FLAG_NONE)
+    return st4, np.full(max_moves, PAT3_RAW_NONE, dtype=np.uint16)
+
+
+def parse_sgf_move_seq(sgf_content, actual_color_id, max_moves=MAX_MOVES, raw_color=False, state_feats=False,
+                       patch_size=0):
+    """解析單局 SGF 為定長落子序列，回傳單局 SeqParse。
 
     actual_color_id 為目標方實際執色（0 黑 1 白）；HD >= 2 時依 color.feature_color
     反轉 SGF 內 B/W 標記。解析失敗或無任何落子時 ok 為 False。
     """
     pos = np.full(max_moves, PAD_POS, dtype=np.uint16)
     is_target = np.full(max_moves, ROLE_PAD, dtype=np.uint8)
+    st4, pat3 = _empty_state(max_moves) if state_feats else (None, None)
+    patch = np.zeros((max_moves, patch_nbytes(patch_size)), dtype=np.uint8) if patch_size else None
+
+    def result(length, hd, ok):
+        return SeqParse(pos, is_target, length, hd, ok, st4, pat3, patch)
+
     if not isinstance(sgf_content, str) or not sgf_content.strip():
-        return pos, is_target, 0, 0, False
+        return result(0, 0, False)
 
     hd_val = color.parse_hd(sgf_content)
     hd = 0 if hd_val is None else int(hd_val)
@@ -80,9 +303,10 @@ def parse_sgf_move_seq(sgf_content, actual_color_id, max_moves=MAX_MOVES, raw_co
         game = sgf.Sgf_game.from_string(sgf_content)
         nodes = game.get_main_sequence()
     except Exception:
-        return pos, is_target, 0, hd, False
+        return result(0, hd, False)
 
     idx = 0
+    sgf_moves = []
     for node in nodes[1:]:
         col, mv = node.get_move()
         if col is None:
@@ -106,54 +330,79 @@ def parse_sgf_move_seq(sgf_content, actual_color_id, max_moves=MAX_MOVES, raw_co
 
         pos[idx] = p
         is_target[idx] = ROLE_TARGET if move_col_id == target_sgf_col else ROLE_OPP
+        sgf_moves.append((move_col_id + 1, p))
         idx += 1
         if idx >= max_moves:
             break
 
-    return pos, is_target, idx, hd, idx > 0
+    if state_feats or patch_size:
+        res = replay_move_states(sgf_moves, hd, patch_size=patch_size)
+        states, patches = res if patch_size else (res, None)
+        if state_feats:
+            for i, st in enumerate(states):
+                st4[i] = st[:4]
+                pat3[i] = st[4]
+        if patch_size:
+            for i, b in enumerate(patches):
+                patch[i] = np.frombuffer(b, dtype=np.uint8)
+    return result(idx, hd, idx > 0)
+
+
+def _empty_batch(n, max_moves, state_feats, patch_size):
+    """建立 n 局的批次 SeqParse，各欄填 pad 值。"""
+    return SeqParse(
+        pos=np.full((n, max_moves), PAD_POS, dtype=np.uint16),
+        is_target=np.full((n, max_moves), ROLE_PAD, dtype=np.uint8),
+        length=np.zeros(n, dtype=np.uint16),
+        hd=np.zeros(n, dtype=np.int8),
+        ok=np.zeros(n, dtype=bool),
+        st4=np.empty((n, max_moves, 4), dtype=np.uint8) if state_feats else None,
+        pat3=np.empty((n, max_moves), dtype=np.uint16) if state_feats else None,
+        patch=np.zeros((n, max_moves, patch_nbytes(patch_size)), dtype=np.uint8) if patch_size else None,
+    )
 
 
 def _parse_chunk_worker(args):
     """子進程批次解析落子序列，頂層函式供 multiprocessing 使用。"""
-    rows, max_moves, raw_color = args
-    n = len(rows)
-    pos_arr = np.full((n, max_moves), PAD_POS, dtype=np.uint16)
-    role_arr = np.full((n, max_moves), ROLE_PAD, dtype=np.uint8)
-    len_arr = np.zeros(n, dtype=np.uint16)
-    hd_arr = np.zeros(n, dtype=np.int8)
-    ok_arr = np.zeros(n, dtype=bool)
-
+    rows, max_moves, raw_color, state_feats, patch_size = args
+    out = _empty_batch(len(rows), max_moves, state_feats, patch_size)
     for i, (sgf_content, col_id) in enumerate(rows):
-        p, r, length, hd, ok = parse_sgf_move_seq(sgf_content, col_id, max_moves=max_moves, raw_color=raw_color)
-        pos_arr[i] = p
-        role_arr[i] = r
-        len_arr[i] = length
-        hd_arr[i] = min(max(hd, -128), 127)
-        ok_arr[i] = ok
-    return pos_arr, role_arr, len_arr, hd_arr, ok_arr
+        r = parse_sgf_move_seq(
+            sgf_content, col_id, max_moves=max_moves, raw_color=raw_color, state_feats=state_feats,
+            patch_size=patch_size,
+        )
+        out.pos[i] = r.pos
+        out.is_target[i] = r.is_target
+        out.length[i] = r.length
+        out.hd[i] = min(max(r.hd, -128), 127)
+        out.ok[i] = r.ok
+        for name in ('st4', 'pat3', 'patch'):
+            arr = getattr(out, name)
+            if arr is not None:
+                arr[i] = getattr(r, name)
+    return out
 
 
-def parse_sgf_batch(sgfs, color_ids, max_moves=MAX_MOVES, raw_color=False, nproc=1):
-    """批次解析多局 SGF，回傳 (pos, is_target, length, hd, valid)。"""
+def parse_sgf_batch(sgfs, color_ids, max_moves=MAX_MOVES, raw_color=False, nproc=1, state_feats=False,
+                    patch_size=0):
+    """批次解析多局 SGF，回傳批次 SeqParse。"""
     n = len(sgfs)
     if n == 0:
-        return (
-            np.zeros((0, max_moves), dtype=np.uint16),
-            np.zeros((0, max_moves), dtype=np.uint8),
-            np.zeros(0, dtype=np.uint16),
-            np.zeros(0, dtype=np.int8),
-            np.zeros(0, dtype=bool),
-        )
+        return _empty_batch(0, max_moves, state_feats, patch_size)
     pairs = list(zip(sgfs, color_ids))
     eff_proc = max(1, min(int(nproc), n))
     if eff_proc == 1:
-        return _parse_chunk_worker((pairs, max_moves, raw_color))
+        return _parse_chunk_worker((pairs, max_moves, raw_color, state_feats, patch_size))
 
     chunk_size = (n + eff_proc * 4 - 1) // (eff_proc * 4)
-    chunks = [(pairs[i:i + chunk_size], max_moves, raw_color) for i in range(0, n, chunk_size)]
+    chunks = [(pairs[i:i + chunk_size], max_moves, raw_color, state_feats, patch_size)
+              for i in range(0, n, chunk_size)]
     with Pool(eff_proc) as pool:
         parts = pool.map(_parse_chunk_worker, chunks)
-    return tuple(np.concatenate([p[k] for p in parts], axis=0) for k in range(5))
+    return SeqParse(*(
+        None if parts[0][k] is None else np.concatenate([p[k] for p in parts], axis=0)
+        for k in range(len(SeqParse._fields))
+    ))
 
 
 def read_player_ids_csv(path):
@@ -182,10 +431,14 @@ def load_split_keys(split_dir):
     return keys
 
 
-def save_seq_npz(path, pos, is_target, length, key, player_id, rank_idx, col, hd, raw_color=False):
-    """以暫存檔原子寫出單一落子序列 .npz。"""
+def save_seq_npz(path, pos, is_target, length, key, player_id, rank_idx, col, hd, raw_color=False, state=None):
+    """以暫存檔原子寫出單一落子序列 .npz；state 為 (N, L, 5) 時另存 STATE_FIELDS 各欄。"""
     os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
     tmp = path + '.tmp'
+    extra = {}
+    if state is not None:
+        for j, name in enumerate(STATE_FIELDS):
+            extra[name] = state[..., j].astype(np.uint16 if name == 'pat3' else np.uint8)
     with open(tmp, 'wb') as f:
         np.savez_compressed(
             f,
@@ -198,6 +451,7 @@ def save_seq_npz(path, pos, is_target, length, key, player_id, rank_idx, col, hd
             color=np.asarray(col, dtype=np.uint8),
             hd=np.asarray(hd, dtype=np.int8),
             raw_color=np.bool_(raw_color),
+            **extra,
         )
     os.replace(tmp, path)
 
@@ -211,8 +465,12 @@ def pack_splits(
     max_moves=MAX_MOVES,
     nproc=1,
     raw_color=False,
+    state_feats=False,
 ):
-    """依 feat_dir 的 train/val 切分與玩家清單，打包 train、newdev、val648 三份序列檔。"""
+    """依 feat_dir 的 train/val 切分與玩家清單，打包 train、newdev、val648 三份序列檔。
+
+    state_feats 為 True 時另存規則引擎狀態欄位，pat3 詞表只由 train 建立並寫出 PAT3_VOCAB_FILE。
+    """
     t0 = time.time()
     train_keys = load_split_keys(os.path.join(feat_dir, 'train'))
     val_keys = load_split_keys(os.path.join(feat_dir, 'val'))
@@ -224,7 +482,8 @@ def pack_splits(
 
     # 逐檔解析並立即釋放原始 SGF 字串，降低記憶體峰值
     parts = {
-        s: {'pos': [], 'role': [], 'len': [], 'hd': [], 'key': [], 'pid': [], 'rk': [], 'col': [], 'drop': 0}
+        s: {'pos': [], 'role': [], 'len': [], 'hd': [], 'key': [], 'pid': [], 'rk': [], 'col': [],
+            'st4': [], 'pat3': [], 'drop': 0}
         for s in ('train', 'newdev', 'val648')
     }
     train_pid_set = set()
@@ -274,10 +533,11 @@ def pack_splits(
             b = file_buckets[split_name]
             if not b['key']:
                 continue
-            pos, is_target, length, hd, valid = parse_sgf_batch(
+            res = parse_sgf_batch(
                 b['sgf'], b['col'], max_moves=max_moves, raw_color=raw_color, nproc=nproc,
+                state_feats=state_feats,
             )
-            keep = valid
+            pos, is_target, length, hd, keep = res.pos, res.is_target, res.length, res.hd, res.ok
             p_acc = parts[split_name]
             p_acc['drop'] += int((~keep).sum())
             if keep.any():
@@ -289,6 +549,9 @@ def pack_splits(
                 p_acc['pid'].append(np.asarray(b['pid'], dtype=str)[keep])
                 p_acc['rk'].append(np.asarray(b['rk'], dtype=np.int8)[keep])
                 p_acc['col'].append(np.asarray(b['col'], dtype=np.uint8)[keep])
+                if state_feats:
+                    p_acc['st4'].append(res.st4[keep])
+                    p_acc['pat3'].append(res.pat3[keep])
 
     # 嚴格驗證訓練集與驗證集玩家互斥
     overlap_nd = train_pid_set & newdev_pids
@@ -300,6 +563,11 @@ def pack_splits(
 
     os.makedirs(out_dir, exist_ok=True)
     summary = {}
+    vocab = None
+    if state_feats:
+        vocab = build_pat3_vocab(np.concatenate(parts['train']['pat3'], axis=0) if parts['train']['pat3'] else [])
+        np.save(os.path.join(out_dir, PAT3_VOCAB_FILE), vocab)
+        print('pat3 詞表 %d 個（只由 train 建立）' % len(vocab), flush=True)
     for split_name in ('train', 'newdev', 'val648'):
         t_s = time.time()
         p_acc = parts[split_name]
@@ -312,6 +580,11 @@ def pack_splits(
             pid_all = np.concatenate(p_acc['pid'], axis=0)
             rk_all = np.concatenate(p_acc['rk'], axis=0)
             col_all = np.concatenate(p_acc['col'], axis=0)
+            state_all = (
+                map_state_fields(np.concatenate(p_acc['st4'], axis=0), np.concatenate(p_acc['pat3'], axis=0), vocab)
+                if state_feats else None
+            )
+            p_acc['st4'], p_acc['pat3'] = [], []
         else:
             pos_all = np.zeros((0, max_moves), dtype=np.uint16)
             role_all = np.zeros((0, max_moves), dtype=np.uint8)
@@ -321,6 +594,7 @@ def pack_splits(
             pid_all = np.zeros(0, dtype=str)
             rk_all = np.zeros(0, dtype=np.int8)
             col_all = np.zeros(0, dtype=np.uint8)
+            state_all = np.zeros((0, max_moves, 5), dtype=np.int16) if state_feats else None
 
         out_path = os.path.join(out_dir, '%s.npz' % split_name)
         save_seq_npz(
@@ -334,6 +608,7 @@ def pack_splits(
             col=col_all,
             hd=hd_all,
             raw_color=raw_color,
+            state=state_all,
         )
         n_valid = len(key_all)
         n_drop = p_acc['drop']
@@ -360,6 +635,7 @@ def parse_args(argv=None):
     ap.add_argument('--max-moves', type=int, default=MAX_MOVES)
     ap.add_argument('--nproc', type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument('--raw-color', action='store_true', help='不依 HD >= 2 反轉執色')
+    ap.add_argument('--state-feats', action='store_true', help='另存規則引擎狀態欄位與 pat3 詞表')
     args = ap.parse_args(argv)
     if args.max_moves < 1:
         ap.error('--max-moves 要 >= 1')
@@ -377,6 +653,7 @@ def main(argv=None):
         max_moves=args.max_moves,
         nproc=args.nproc,
         raw_color=args.raw_color,
+        state_feats=args.state_feats,
     )
 
 
