@@ -10,6 +10,8 @@ rank-features-*/
 permove-features/
 player-features/
 move-seq-features*/
+move-seq-state*/
+move-seq-patch*/
 rank-trained-models/
 player-trained-models/
 humansl-analysis/
