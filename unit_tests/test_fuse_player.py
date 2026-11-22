@@ -241,3 +241,36 @@ def test_predict_split_fused_csls_matches_matrix_ranking():
     finally:
         if os.path.exists(temp_test_csv):
             os.remove(temp_test_csv)
+
+
+def test_predict_split_fused_seq_track():
+    # 序列軌關閉時結果不變，開啟時依序列相似度排序
+    cand_names = [f"pub2_p_{i:04d}" for i in range(1, 7)]
+    cand_profiles = {pid: {} for pid in cand_names}
+    rng = np.random.default_rng(0)
+    basis = np.linalg.qr(rng.normal(size=(8, 8)))[0][:6]
+    cand_seq = {pid: np.vstack([basis[i]] * 3) for i, pid in enumerate(cand_names)}
+    query_seq = {"pub2_q_0001": basis[4][None, :], "pub2_q_0002": basis[1][None, :]}
+
+    with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as f:
+        temp_test_csv = f.name
+        f.write("question_id,num_games,sgf_1,color_1\n")
+        f.write(f'pub2_q_0001,1,"{SAMPLE_SGF}",B\n')
+        f.write(f'pub2_q_0002,1,"{SAMPLE_SGF}",B\n')
+
+    try:
+        base = predict_split_fused(temp_test_csv, cand_profiles, {}, csls_k=5)
+        off = predict_split_fused(
+            temp_test_csv, cand_profiles, {}, csls_k=5,
+            seq_tracks=[(cand_seq, query_seq, 1.0)], seq_gamma=0.0,
+        )
+        on = predict_split_fused(
+            temp_test_csv, cand_profiles, {}, csls_k=5, emb_top2_weight=0.5,
+            seq_tracks=[(cand_seq, query_seq, 1.0)], seq_gamma=1.0,
+        )
+        assert off == base
+        assert on[0][1] == "pub2_p_0005"
+        assert on[1][1] == "pub2_p_0002"
+    finally:
+        if os.path.exists(temp_test_csv):
+            os.remove(temp_test_csv)

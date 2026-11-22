@@ -236,6 +236,33 @@ def aggregate_and_center_similarity(
     return compute_emb_similarity(cand_embs_by_id, query_embs_by_id, cand_ids, query_ids, topk_weight=0.0)
 
 
+def _weighted_track_similarity(
+    tracks: Sequence[Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], float]],
+    cand_names: Sequence[str],
+    query_ids: Sequence[str],
+    top2_weight: float,
+) -> np.ndarray:
+    """依權重平均多組 Embedding 軌的相似度矩陣 (Q, C)，缺向量的候選補 0。"""
+    w_total = sum(w for _, _, w in tracks)
+    if w_total <= 0.0:
+        raise ValueError("Embedding 軌權重總和必須 > 0")
+    acc = np.zeros((len(query_ids), len(cand_names)), dtype=np.float64)
+    for c_e, q_e, w in tracks:
+        m = compute_emb_similarity(c_e, q_e, cand_names, query_ids, topk_weight=top2_weight, topk=2)
+        # 若少數候選完全缺有效向量，改補 0.0 以保留其餘特徵的兜底排序
+        acc += (w / w_total) * np.where(np.isfinite(m), m, 0.0)
+    return acc
+
+
+def _as_dir_list(dirs: Union[None, str, Sequence[str]]) -> List[str]:
+    """把單一路徑、路徑序列或 None 統一成路徑 list。"""
+    if dirs is None:
+        return []
+    if isinstance(dirs, str):
+        return [dirs]
+    return list(dirs)
+
+
 def _load_emb_cache_npz(path: str, head_path: Optional[str] = None) -> Dict[str, np.ndarray]:
     """載入 infer_player_emb 產出之 .npz 快取，可選合併前段視角 head 快取。"""
     if not os.path.exists(path):
@@ -295,6 +322,8 @@ def predict_split_fused(
     emb_top2_weight: float = 0.0,
     emb_tracks: Optional[Sequence[Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], float]]] = None,
     raw_open: bool = False,
+    seq_tracks: Optional[Sequence[Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], float]]] = None,
+    seq_gamma: float = 0.0,
 ) -> List[List[str]]:
     """結合開局指紋、局部棋形殘差與棋力相容度對單一測試檔案進行融合預測。"""
     test_df = pd.read_csv(test_csv_path)
@@ -347,21 +376,12 @@ def predict_split_fused(
         elif cand_embs is not None and query_embs is not None:
             tracks = [(cand_embs, query_embs, 1.0)]
 
-    emb_sim_mat = None
-    if tracks:
-        qids_order = [qid for qid, _ in parsed_rows]
-        w_total = sum(w for _, _, w in tracks)
-        if w_total <= 0.0:
-            raise ValueError("emb_tracks 權重總和必須 > 0")
-        acc_mat = np.zeros((n_q, n_c), dtype=np.float64)
-        for c_e, q_e, w in tracks:
-            m = compute_emb_similarity(
-                c_e, q_e, cand_names, qids_order, topk_weight=emb_top2_weight, topk=2
-            )
-            # 若少數候選完全缺有效向量，改補 0.0 以保留其餘特徵的兜底排序
-            m = np.where(np.isfinite(m), m, 0.0)
-            acc_mat += (w / w_total) * m
-        emb_sim_mat = acc_mat
+    qids_order = [qid for qid, _ in parsed_rows]
+    emb_sim_mat = _weighted_track_similarity(tracks, cand_names, qids_order, emb_top2_weight) if tracks else None
+    # 落子序列軌與棋盤 Embedding 軌分開加權後相加
+    seq_sim_mat = None
+    if seq_tracks and seq_gamma > 0.0:
+        seq_sim_mat = seq_gamma * _weighted_track_similarity(seq_tracks, cand_names, qids_order, emb_top2_weight)
 
     score_mat = np.full((n_q, n_c), float("-inf"), dtype=np.float64) if csls_k > 0 else None
     base_mat = np.zeros((n_q, n_c), dtype=np.float64) if csls_k > 0 else None
@@ -387,6 +407,8 @@ def predict_split_fused(
             base_sim = style_sim + pattern_beta * pat_scores.get(c_pid, 0.0) if pat_scores is not None else style_sim
             if emb_sim_mat is not None:
                 base_sim += emb_gamma * float(emb_sim_mat[row_idx, ci])
+            if seq_sim_mat is not None:
+                base_sim += float(seq_sim_mat[row_idx, ci])
 
             c_rank_info = cand_ranks.get(c_pid)
             rank_score, passed_mask = compute_rank_compatibility(
@@ -510,6 +532,9 @@ def run_full_fused_pipeline(
     emb_weights: Optional[Sequence[float]] = None,
     head_emb_dirs: Optional[Sequence[str]] = None,
     raw_open: bool = False,
+    seq_cache_dir: Union[None, str, Sequence[str]] = None,
+    seq_gamma: float = 0.0,
+    seq_groups: str = "b",
 ) -> pd.DataFrame:
     """執行全量四份測試題融合推論並輸出提交 CSV。"""
     cand_ranks = _load_rank_cache(cand_cache_path, "候選人棋力快取")
@@ -520,12 +545,13 @@ def run_full_fused_pipeline(
         raise ValueError("emb_gamma 與 pub2_emb_gamma 必須 >= 0")
     if emb_top2_weight < 0.0:
         raise ValueError("emb_top2_weight 必須 >= 0")
+    seq_dirs = _as_dir_list(seq_cache_dir)
+    if seq_gamma < 0.0:
+        raise ValueError("seq_gamma 必須 >= 0")
+    if seq_gamma > 0.0 and not seq_dirs:
+        raise ValueError("seq_gamma > 0 時必須指定 seq_cache_dir")
 
-    emb_dirs: List[str] = []
-    if isinstance(emb_cache_dir, str):
-        emb_dirs = [emb_cache_dir]
-    elif emb_cache_dir is not None:
-        emb_dirs = list(emb_cache_dir)
+    emb_dirs = _as_dir_list(emb_cache_dir)
 
     if (emb_gamma > 0.0 or (pub2_emb_gamma is not None and pub2_emb_gamma > 0.0)) and not emb_dirs:
         raise ValueError("emb_gamma 或 pub2_emb_gamma > 0 時必須指定 emb_cache_dir")
@@ -613,6 +639,17 @@ def run_full_fused_pipeline(
                 emb_tracks.append((c_e, q_e, w_val))
             print(f"  - 深度風格 Embedding 快取載入完成（{len(emb_tracks)} 組模型，首組候選 {len(emb_tracks[0][0])} 人、題目 {len(emb_tracks[0][1])} 題）")
 
+        seq_tracks = None
+        cur_seq_gamma = seq_gamma if (is_v2 or seq_groups == "all") else 0.0
+        if seq_dirs and cur_seq_gamma > 0.0:
+            tag = prefix.rstrip("_")
+            seq_tracks = [
+                (_load_emb_cache_npz(os.path.join(d, f"{tag}_cand_emb.npz")),
+                 _load_emb_cache_npz(os.path.join(d, f"{tag}_query_emb.npz")), 1.0)
+                for d in seq_dirs
+            ]
+            print(f"  - 落子序列 Embedding 快取載入完成（{len(seq_tracks)} 組模型，seq_gamma={cur_seq_gamma}）")
+
         t0 = time.time()
         sub_rows = predict_split_fused(
             test_path, cand_profiles, idf_weights,
@@ -629,6 +666,8 @@ def run_full_fused_pipeline(
             emb_top2_weight=emb_top2_weight,
             emb_tracks=emb_tracks,
             raw_open=raw_open,
+            seq_tracks=seq_tracks,
+            seq_gamma=cur_seq_gamma,
         )
         print(f"  - 題目推論完成 ({time.time() - t0:.1f}s)")
 
@@ -692,6 +731,9 @@ def main():
     parser.add_argument("--emb-weights", type=float, nargs="+", default=None, help="多組 Embedding 模型的集成權重，預設等權平均")
     parser.add_argument("--head-emb-dirs", nargs="+", default=None, help="需要合併 *_head_emb.npz 的快取目錄子集，預設空")
     parser.add_argument("--raw-open", action="store_true", help="開局指紋改用不正規化絕對座標（含 HD>=2 換色）")
+    parser.add_argument("--seq-cache-dir", nargs="+", default=None, help="落子序列 Embedding 快取目錄，多個時分數等權平均")
+    parser.add_argument("--seq-gamma", type=float, default=0.0, help="落子序列相似度加權係數（0 為停用）")
+    parser.add_argument("--seq-groups", choices=["b", "all"], default="b", help="落子序列軌套用範圍：b 只用 pub2/priv2，all 四組都用")
     args = parser.parse_args()
 
     if bool(args.cand2_cache) != bool(args.query2_cache):
@@ -751,6 +793,9 @@ def main():
         emb_weights=args.emb_weights,
         head_emb_dirs=args.head_emb_dirs,
         raw_open=args.raw_open,
+        seq_cache_dir=args.seq_cache_dir,
+        seq_gamma=args.seq_gamma,
+        seq_groups=args.seq_groups,
     )
 
 
