@@ -152,29 +152,49 @@ class ConvModule(nn.Module):
 
 
 class PatchEncoder(nn.Module):
-    """每手共用的局部盤面 CNN：2 bit 打包格子解成 4 通道 one-hot，經兩層 3x3 conv 後平均池化。"""
+    """每手共用的局部盤面 CNN：以無 padding 的 3x3 valid conv 收斂至中心 1x1 保留幾何位置。"""
 
     def __init__(self, patch_size, out_dim=PATCH_EMB_DIM):
         super().__init__()
         self.patch_size = int(patch_size)
+        if self.patch_size < 3 or self.patch_size % 2 == 0:
+            raise ValueError('patch_size 必須為 >= 3 的奇數，收到 %d' % self.patch_size)
+        self.out_dim = int(out_dim)
         self.n_cells = self.patch_size * self.patch_size
-        self.conv = nn.Sequential(
-            nn.Conv2d(4, 32, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.GELU(),
-        )
-        self.proj = nn.Linear(64, out_dim)
+        n_layers = (self.patch_size - 1) // 2
+        # 逐層 valid conv 縮至 1x1，保留相對落子點的位置
+        if n_layers == 1:
+            ch_pairs = [(4, 64)]
+        else:
+            ch_pairs = [(4, 32), (32, 64)] + [(64, 64)] * (n_layers - 2)
+        layers = []
+        for cin, cout in ch_pairs:
+            layers.append(nn.Conv2d(cin, cout, 3, padding=0))
+            layers.append(nn.GELU())
+        self.conv = nn.Sequential(*layers)
+        self.proj = nn.Linear(64, self.out_dim)
         self.register_buffer('shifts', torch.tensor([6, 4, 2, 0], dtype=torch.long), persistent=False)
 
-    def forward(self, patch):
-        """patch: (B, L, patch_nbytes) 整數張量，回傳 (B, L, out_dim)。"""
+    def forward(self, patch, valid_mask=None):
+        """patch: (B, L, patch_nbytes) 整數張量，valid_mask 為 (B, L) bool，回傳 (B, L, out_dim)。"""
         bsz, seq_len, nb = patch.shape
-        cells = ((patch.long().unsqueeze(-1) >> self.shifts) & 3).reshape(bsz, seq_len, nb * 4)[..., :self.n_cells]
-        x = F.one_hot(cells.reshape(-1, self.n_cells), 4).float()
+        if valid_mask is not None:
+            flat_mask = valid_mask.reshape(-1)
+            if not flat_mask.any():
+                return patch.new_zeros((bsz, seq_len, self.out_dim), dtype=self.proj.weight.dtype)
+            p_valid = patch.reshape(-1, nb)[flat_mask]
+        else:
+            p_valid = patch.reshape(-1, nb)
+
+        cells = ((p_valid.long().unsqueeze(-1) >> self.shifts) & 3).reshape(-1, nb * 4)[:, :self.n_cells]
+        x = F.one_hot(cells, 4).float()
         x = x.transpose(1, 2).reshape(-1, 4, self.patch_size, self.patch_size)
-        y = self.conv(x).mean(dim=(2, 3))
-        return self.proj(y).view(bsz, seq_len, -1)
+        y = self.proj(self.conv(x).flatten(1))
+        if valid_mask is not None:
+            out = y.new_zeros((bsz * seq_len, self.out_dim))
+            out[flat_mask] = y
+            return out.view(bsz, seq_len, self.out_dim)
+        return y.view(bsz, seq_len, self.out_dim)
 
 
 class AttentiveStatsPool(nn.Module):
@@ -370,7 +390,7 @@ class GoMoveSeqTransformer(nn.Module):
         if self.patch_enc is not None:
             if patch is None:
                 raise ValueError('patch_size 模型需要 patch 輸入')
-            tok = torch.cat([tok, self.patch_enc(patch)], dim=-1)
+            tok = torch.cat([tok, self.patch_enc(patch, valid_mask)], dim=-1)
         h = self.in_drop(self.in_norm(self.in_proj(tok)))
 
         for i, blk in enumerate(self.blocks):
