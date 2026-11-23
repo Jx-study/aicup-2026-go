@@ -324,6 +324,7 @@ def predict_split_fused(
     raw_open: bool = False,
     seq_tracks: Optional[Sequence[Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], float]]] = None,
     seq_gamma: float = 0.0,
+    open_weight: float = 1.0,
 ) -> List[List[str]]:
     """結合開局指紋、局部棋形殘差與棋力相容度對單一測試檔案進行融合預測。"""
     test_df = pd.read_csv(test_csv_path)
@@ -403,7 +404,9 @@ def predict_split_fused(
         pruned_candidates = []
 
         for ci, c_pid in enumerate(cand_names):
-            style_sim = compute_style_similarity(q_vecs, cand_profiles[c_pid], color_cond=color_cond)
+            # 權重 0 時不計算，避免多餘運算與 0 * inf
+            style_sim = (open_weight * compute_style_similarity(q_vecs, cand_profiles[c_pid], color_cond=color_cond)
+                         if open_weight != 0.0 else 0.0)
             base_sim = style_sim + pattern_beta * pat_scores.get(c_pid, 0.0) if pat_scores is not None else style_sim
             if emb_sim_mat is not None:
                 base_sim += emb_gamma * float(emb_sim_mat[row_idx, ci])
@@ -535,6 +538,8 @@ def run_full_fused_pipeline(
     seq_cache_dir: Union[None, str, Sequence[str]] = None,
     seq_gamma: float = 0.0,
     seq_groups: str = "b",
+    pub2_open_weight: Optional[float] = None,
+    pub2_seq_weights: Optional[Sequence[float]] = None,
 ) -> pd.DataFrame:
     """執行全量四份測試題融合推論並輸出提交 CSV。"""
     cand_ranks = _load_rank_cache(cand_cache_path, "候選人棋力快取")
@@ -550,6 +555,13 @@ def run_full_fused_pipeline(
         raise ValueError("seq_gamma 必須 >= 0")
     if seq_gamma > 0.0 and not seq_dirs:
         raise ValueError("seq_gamma > 0 時必須指定 seq_cache_dir")
+    if pub2_seq_weights is not None:
+        if len(pub2_seq_weights) != len(seq_dirs):
+            raise ValueError("pub2_seq_weights 長度必須與 seq_cache_dir 目錄數相同")
+        if any(w < 0.0 for w in pub2_seq_weights) or sum(pub2_seq_weights) <= 0.0:
+            raise ValueError("pub2_seq_weights 必須皆 >= 0 且總和 > 0")
+    if pub2_open_weight is not None and pub2_open_weight < 0.0:
+        raise ValueError("pub2_open_weight 必須 >= 0")
 
     emb_dirs = _as_dir_list(emb_cache_dir)
 
@@ -604,6 +616,7 @@ def run_full_fused_pipeline(
         cur_sigma = pub2_sigma if (is_v2 and pub2_sigma is not None) else sigma
         cur_csls_k = pub2_csls_k if (is_v2 and pub2_csls_k is not None) else csls_k
         cur_emb_gamma = pub2_emb_gamma if (is_v2 and pub2_emb_gamma is not None) else emb_gamma
+        cur_open_weight = pub2_open_weight if (is_v2 and pub2_open_weight is not None) else 1.0
 
         print(
             f"\n[{prefix}] 處理中 (alpha={cur_alpha}, delta={cur_delta}, metric={cur_metric}, "
@@ -641,14 +654,21 @@ def run_full_fused_pipeline(
 
         seq_tracks = None
         cur_seq_gamma = seq_gamma if (is_v2 or seq_groups == "all") else 0.0
+        seq_w = [1.0] * len(seq_dirs)
+        if is_v2 and pub2_seq_weights is not None:
+            # 各軌絕對權重：正規化平均後乘回總和
+            seq_w = list(pub2_seq_weights)
+            cur_seq_gamma = float(sum(seq_w))
         if seq_dirs and cur_seq_gamma > 0.0:
             tag = prefix.rstrip("_")
             seq_tracks = [
                 (_load_emb_cache_npz(os.path.join(d, f"{tag}_cand_emb.npz")),
-                 _load_emb_cache_npz(os.path.join(d, f"{tag}_query_emb.npz")), 1.0)
-                for d in seq_dirs
+                 _load_emb_cache_npz(os.path.join(d, f"{tag}_query_emb.npz")), w)
+                for d, w in zip(seq_dirs, seq_w)
             ]
-            print(f"  - 落子序列 Embedding 快取載入完成（{len(seq_tracks)} 組模型，seq_gamma={cur_seq_gamma}）")
+            eff = [cur_seq_gamma * w / sum(seq_w) for w in seq_w]
+            print(f"  - 落子序列 Embedding 快取載入完成（{len(seq_tracks)} 組模型，seq_gamma={cur_seq_gamma}，"
+                  f"各軌有效權重 {[round(x, 4) for x in eff]}，開局權重 {cur_open_weight}）")
 
         t0 = time.time()
         sub_rows = predict_split_fused(
@@ -668,6 +688,7 @@ def run_full_fused_pipeline(
             raw_open=raw_open,
             seq_tracks=seq_tracks,
             seq_gamma=cur_seq_gamma,
+            open_weight=cur_open_weight,
         )
         print(f"  - 題目推論完成 ({time.time() - t0:.1f}s)")
 
@@ -731,9 +752,12 @@ def main():
     parser.add_argument("--emb-weights", type=float, nargs="+", default=None, help="多組 Embedding 模型的集成權重，預設等權平均")
     parser.add_argument("--head-emb-dirs", nargs="+", default=None, help="需要合併 *_head_emb.npz 的快取目錄子集，預設空")
     parser.add_argument("--raw-open", action="store_true", help="開局指紋改用不正規化絕對座標（含 HD>=2 換色）")
-    parser.add_argument("--seq-cache-dir", nargs="+", default=None, help="落子序列 Embedding 快取目錄，多個時分數等權平均")
+    parser.add_argument("--seq-cache-dir", nargs="+", default=None, help="落子序列 Embedding 快取目錄，多個時預設等權平均，pub2/priv2 可用 --pub2-seq-weights 指定權重")
     parser.add_argument("--seq-gamma", type=float, default=0.0, help="落子序列相似度加權係數（0 為停用）")
     parser.add_argument("--seq-groups", choices=["b", "all"], default="b", help="落子序列軌套用範圍：b 只用 pub2/priv2，all 四組都用")
+    parser.add_argument("--pub2-seq-weights", type=float, nargs="+", default=None,
+                        help="pub2/priv2 各落子序列軌的絕對權重，取代 --seq-gamma 的等權平均")
+    parser.add_argument("--pub2-open-weight", type=float, default=None, help="pub2/priv2 開局指紋相似度權重，預設 1.0")
     args = parser.parse_args()
 
     if bool(args.cand2_cache) != bool(args.query2_cache):
@@ -749,6 +773,13 @@ def main():
             parser.error("--emb-weights 長度必須與 --emb-cache-dir 相同")
         if any(w < 0.0 for w in args.emb_weights) or sum(args.emb_weights) <= 0.0:
             parser.error("--emb-weights 必須皆 >= 0 且總和 > 0")
+    if args.pub2_seq_weights is not None:
+        if not args.seq_cache_dir or len(args.pub2_seq_weights) != len(args.seq_cache_dir):
+            parser.error("--pub2-seq-weights 長度必須與 --seq-cache-dir 相同")
+        if any(w < 0.0 for w in args.pub2_seq_weights) or sum(args.pub2_seq_weights) <= 0.0:
+            parser.error("--pub2-seq-weights 必須皆 >= 0 且總和 > 0")
+    if args.pub2_open_weight is not None and args.pub2_open_weight < 0.0:
+        parser.error("--pub2-open-weight 必須 >= 0")
     if args.head_emb_dirs:
         emb_set = {os.path.normpath(d) for d in (args.emb_cache_dir or ())}
         bad = {os.path.normpath(d) for d in args.head_emb_dirs} - emb_set
@@ -796,6 +827,8 @@ def main():
         seq_cache_dir=args.seq_cache_dir,
         seq_gamma=args.seq_gamma,
         seq_groups=args.seq_groups,
+        pub2_open_weight=args.pub2_open_weight,
+        pub2_seq_weights=args.pub2_seq_weights,
     )
 
 

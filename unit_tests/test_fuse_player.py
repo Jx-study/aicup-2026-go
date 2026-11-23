@@ -274,3 +274,43 @@ def test_predict_split_fused_seq_track():
     finally:
         if os.path.exists(temp_test_csv):
             os.remove(temp_test_csv)
+
+
+def test_predict_split_fused_open_weight(monkeypatch):
+    # 開局權重 1.0 與預設相同；權重 0 時只依序列軌排序
+    from aicup import fuse_player
+    cand_names = [f"pub2_p_{i:04d}" for i in range(1, 7)]
+    cand_profiles = {pid: {"style": 6 - i} for i, pid in enumerate(cand_names)}
+    monkeypatch.setattr(fuse_player, "compute_style_similarity",
+                        lambda q, prof, color_cond=False: 10.0 * prof["style"])
+    rng = np.random.default_rng(0)
+    basis = np.linalg.qr(rng.normal(size=(8, 8)))[0][:6]
+    cand_seq = {pid: np.vstack([basis[i]] * 3) for i, pid in enumerate(cand_names)}
+    query_seq = {"pub2_q_0001": basis[4][None, :]}
+
+    with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as f:
+        temp_test_csv = f.name
+        f.write("question_id,num_games,sgf_1,color_1\n")
+        f.write(f'pub2_q_0001,1,"{SAMPLE_SGF}",B\n')
+
+    try:
+        kw = dict(csls_k=0, alpha=0.0, seq_tracks=[(cand_seq, query_seq, 1.0)], seq_gamma=1.0)
+        default = predict_split_fused(temp_test_csv, cand_profiles, {}, **kw)
+        one = predict_split_fused(temp_test_csv, cand_profiles, {}, open_weight=1.0, **kw)
+        zero = predict_split_fused(temp_test_csv, cand_profiles, {}, open_weight=0.0, **kw)
+        assert one == default
+        assert default[0][1] == "pub2_p_0001"
+        assert zero[0][1] == "pub2_p_0005"
+    finally:
+        if os.path.exists(temp_test_csv):
+            os.remove(temp_test_csv)
+
+
+def test_run_full_fused_pipeline_rejects_bad_pub2_weights():
+    from aicup.fuse_player import run_full_fused_pipeline
+    with pytest.raises(ValueError, match="pub2_seq_weights"):
+        run_full_fused_pipeline(seq_cache_dir=["a", "b"], seq_gamma=1.0, pub2_seq_weights=[1.0])
+    with pytest.raises(ValueError, match="pub2_seq_weights"):
+        run_full_fused_pipeline(seq_cache_dir=["a"], seq_gamma=1.0, pub2_seq_weights=[-1.0])
+    with pytest.raises(ValueError, match="pub2_open_weight"):
+        run_full_fused_pipeline(pub2_open_weight=-0.5)
