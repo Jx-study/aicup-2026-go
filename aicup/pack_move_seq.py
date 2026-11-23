@@ -2,11 +2,14 @@
 
 沿用既有 bit-packed 特徵目錄的 train/val 玩家切分，從 v1.1 訓練 CSV 解析每局前 L 手
 落子座標與目標方標記（含 HD >= 2 讓子局執色反轉與 pass 處理），輸出 train、newdev、
-val648 三份單檔 .npz，並驗證訓練集與驗證集玩家嚴格互斥。
+val648 三份單檔 .npz，並驗證訓練集與驗證集玩家嚴格互斥。--extra-split 可從 val 切分另外
+打包指定玩家，--splits 只寫出指定切分。
 
 用法（在 repo 根目錄）：
     python -m aicup.pack_move_seq --train-dir training-v1.1/training \\
         --feat-dir rank-features-v180000 --out-dir move-seq-features-v180000
+    python -m aicup.pack_move_seq --state-feats --extra-split hold=humansl-analysis/holdout-v180000.csv \\
+        --splits hold --pat3-vocab move-seq-state-v180000/pat3_vocab.npy --out-dir move-seq-state-v180000
 """
 import argparse
 import csv
@@ -466,25 +469,51 @@ def pack_splits(
     nproc=1,
     raw_color=False,
     state_feats=False,
+    extra_splits=None,
+    splits=None,
+    pat3_vocab_path=None,
 ):
-    """依 feat_dir 的 train/val 切分與玩家清單，打包 train、newdev、val648 三份序列檔。
+    """依 feat_dir 的 train/val 切分與玩家清單，打包 train、newdev、val648 與額外切分的序列檔。
 
-    state_feats 為 True 時另存規則引擎狀態欄位，pat3 詞表只由 train 建立並寫出 PAT3_VOCAB_FILE。
+    extra_splits 為 {切分名: 玩家 CSV}，從 val 切分取出這些玩家，玩家須與其他切分互斥。
+    splits 指定要寫出的切分，None 表示全部。
+    state_feats 為 True 時另存規則引擎狀態欄位；pat3_vocab_path 有值時沿用該詞表，
+    否則只由 train 建立並寫出 PAT3_VOCAB_FILE。
     """
     t0 = time.time()
     train_keys = load_split_keys(os.path.join(feat_dir, 'train'))
     val_keys = load_split_keys(os.path.join(feat_dir, 'val'))
-    newdev_pids = read_player_ids_csv(newdev_csv)
-    val648_pids = read_player_ids_csv(val648_csv)
+    val_pids = {'newdev': read_player_ids_csv(newdev_csv), 'val648': read_player_ids_csv(val648_csv)}
+    for name, path in (extra_splits or {}).items():
+        if not name or name in ('train', 'newdev', 'val648'):
+            raise ValueError('額外切分名稱無效：%r' % name)
+        val_pids[name] = read_player_ids_csv(path)
+    names = list(val_pids)
+    all_splits = ('train',) + tuple(names)
+    out_splits = tuple(splits) if splits else all_splits
+    if set(out_splits) - set(all_splits):
+        raise ValueError('未知的切分：%s' % sorted(set(out_splits) - set(all_splits)))
 
-    if newdev_pids & val648_pids:
-        raise ValueError('newdev 與 val648 玩家有交集：%d 位' % len(newdev_pids & val648_pids))
+    for i, a in enumerate(names):
+        for b_name in names[i + 1:]:
+            inter = val_pids[a] & val_pids[b_name]
+            if inter:
+                raise ValueError('%s 與 %s 玩家有交集：%d 位' % (a, b_name, len(inter)))
+
+    vocab = None
+    if state_feats and pat3_vocab_path:
+        vocab = np.load(pat3_vocab_path).astype(np.uint16)
+        dst = os.path.join(out_dir, PAT3_VOCAB_FILE)
+        if os.path.exists(dst) and not np.array_equal(np.load(dst), vocab):
+            raise ValueError('%s 與 %s 的 pat3 詞表不同' % (pat3_vocab_path, dst))
+    elif state_feats and 'train' not in out_splits:
+        raise ValueError('不寫出 train 時要用 pat3_vocab_path 指定詞表')
 
     # 逐檔解析並立即釋放原始 SGF 字串，降低記憶體峰值
     parts = {
         s: {'pos': [], 'role': [], 'len': [], 'hd': [], 'key': [], 'pid': [], 'rk': [], 'col': [],
             'st4': [], 'pat3': [], 'drop': 0}
-        for s in ('train', 'newdev', 'val648')
+        for s in out_splits
     }
     train_pid_set = set()
 
@@ -495,7 +524,7 @@ def pack_splits(
     for path in csv_paths:
         file_buckets = {
             s: {'sgf': [], 'col': [], 'key': [], 'pid': [], 'rk': []}
-            for s in ('train', 'newdev', 'val648')
+            for s in out_splits
         }
         for chunk in pd.read_csv(path, usecols=['rank', 'game_id', 'player_id', 'color', 'sgf_content'], chunksize=50000):
             for rk, gid, pid, col_s, sgf_s in zip(
@@ -510,13 +539,12 @@ def pack_splits(
                     target_split = 'train'
                     train_pid_set.add(pid)
                 elif key in val_keys:
-                    if pid in newdev_pids:
-                        target_split = 'newdev'
-                    elif pid in val648_pids:
-                        target_split = 'val648'
-                    else:
+                    target_split = next((s for s in names if pid in val_pids[s]), None)
+                    if target_split is None:
                         continue
                 else:
+                    continue
+                if target_split not in file_buckets:
                     continue
 
                 col_u = col_s.strip().upper()
@@ -529,7 +557,7 @@ def pack_splits(
                 b['pid'].append(pid)
                 b['rk'].append(RANK_TO_ID[rk])
 
-        for split_name in ('train', 'newdev', 'val648'):
+        for split_name in out_splits:
             b = file_buckets[split_name]
             if not b['key']:
                 continue
@@ -554,21 +582,20 @@ def pack_splits(
                     p_acc['pat3'].append(res.pat3[keep])
 
     # 嚴格驗證訓練集與驗證集玩家互斥
-    overlap_nd = train_pid_set & newdev_pids
-    overlap_v6 = train_pid_set & val648_pids
-    if overlap_nd or overlap_v6:
-        raise ValueError(
-            '訓練集與驗證集玩家重疊：newdev %d 位、val648 %d 位' % (len(overlap_nd), len(overlap_v6))
-        )
+    overlap = {s: len(train_pid_set & val_pids[s]) for s in names}
+    if any(overlap.values()):
+        raise ValueError('訓練集與驗證集玩家重疊：' + '、'.join('%s %d 位' % kv for kv in overlap.items()))
 
     os.makedirs(out_dir, exist_ok=True)
     summary = {}
-    vocab = None
-    if state_feats:
+    vocab_dst = os.path.join(out_dir, PAT3_VOCAB_FILE)
+    if state_feats and vocab is None:
         vocab = build_pat3_vocab(np.concatenate(parts['train']['pat3'], axis=0) if parts['train']['pat3'] else [])
-        np.save(os.path.join(out_dir, PAT3_VOCAB_FILE), vocab)
+        np.save(vocab_dst, vocab)
         print('pat3 詞表 %d 個（只由 train 建立）' % len(vocab), flush=True)
-    for split_name in ('train', 'newdev', 'val648'):
+    elif state_feats and not os.path.exists(vocab_dst):
+        np.save(vocab_dst, vocab)
+    for split_name in out_splits:
         t_s = time.time()
         p_acc = parts[split_name]
         if p_acc['pos']:
@@ -636,9 +663,20 @@ def parse_args(argv=None):
     ap.add_argument('--nproc', type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument('--raw-color', action='store_true', help='不依 HD >= 2 反轉執色')
     ap.add_argument('--state-feats', action='store_true', help='另存規則引擎狀態欄位與 pat3 詞表')
+    ap.add_argument('--extra-split', action='append', default=[], metavar='NAME=CSV',
+                    help='從 val 切分另外打包 CSV 內的玩家，可重複')
+    ap.add_argument('--splits', nargs='+', default=None, help='只寫出這些切分，預設全部')
+    ap.add_argument('--pat3-vocab', default='', help='沿用既有 pat3 詞表，不由 train 重建')
     args = ap.parse_args(argv)
     if args.max_moves < 1:
         ap.error('--max-moves 要 >= 1')
+    extra = {}
+    for item in args.extra_split:
+        name, sep, path = item.partition('=')
+        if not sep or not name or not path:
+            ap.error('--extra-split 格式為 NAME=CSV：%r' % item)
+        extra[name] = path
+    args.extra_split = extra
     return args
 
 
@@ -654,6 +692,9 @@ def main(argv=None):
         nproc=args.nproc,
         raw_color=args.raw_color,
         state_feats=args.state_feats,
+        extra_splits=args.extra_split,
+        splits=args.splits,
+        pat3_vocab_path=args.pat3_vocab or None,
     )
 
 

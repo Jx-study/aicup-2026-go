@@ -380,6 +380,45 @@ def test_pack_splits_state_feats(tmp_path):
             assert int(zs['pat3'].max()) <= pack_move_seq.PAT3_PAD
 
 
+def test_pack_splits_extra_split_reuses_vocab(tmp_path):
+    train_dir, feat_dir, newdev_csv, val648_csv = _make_synthetic_dataset(tmp_path)
+    kw = dict(train_dir=str(train_dir), feat_dir=str(feat_dir), newdev_csv=str(newdev_csv),
+              max_moves=24, nproc=1, state_feats=True)
+    full_dir = tmp_path / 'full'
+    pack_move_seq.pack_splits(out_dir=str(full_dir), val648_csv=str(val648_csv), **kw)
+
+    # v6_1 移到 hold，只寫出 hold 並沿用 full 的詞表
+    v6_only0 = tmp_path / 'v6_0.csv'
+    hold_csv = tmp_path / 'hold.csv'
+    pd.DataFrame({'player_id': ['v6_0'], 'rank': ['D']}).to_csv(v6_only0, index=False)
+    pd.DataFrame({'player_id': ['v6_1'], 'rank': ['C']}).to_csv(hold_csv, index=False)
+    hold_dir = tmp_path / 'hold'
+    summary = pack_move_seq.pack_splits(
+        out_dir=str(hold_dir), val648_csv=str(v6_only0), extra_splits={'hold': str(hold_csv)},
+        splits=['hold'], pat3_vocab_path=str(full_dir / pack_move_seq.PAT3_VOCAB_FILE), **kw)
+    assert list(summary) == ['hold'] and summary['hold']['games'] == 4
+    assert sorted(p.name for p in hold_dir.iterdir()) == ['hold.npz', pack_move_seq.PAT3_VOCAB_FILE]
+    with np.load(full_dir / 'val648.npz') as zf, np.load(hold_dir / 'hold.npz') as zh:
+        sel = zf['player_id'] == 'v6_1'
+        assert set(zf.files) == set(zh.files)
+        for f in zf.files:
+            if zf[f].ndim:
+                np.testing.assert_array_equal(zf[f][sel], zh[f])
+
+    # hold 與 newdev 有交集、或不寫 train 又沒給詞表時拒絕執行
+    bad_hold = tmp_path / 'bad_hold.csv'
+    pd.DataFrame({'player_id': ['nd_0'], 'rank': ['D']}).to_csv(bad_hold, index=False)
+    with pytest.raises(ValueError, match='交集'):
+        pack_move_seq.pack_splits(out_dir=str(tmp_path / 'bad'), val648_csv=str(v6_only0),
+                                  extra_splits={'hold': str(bad_hold)}, splits=['hold'],
+                                  pat3_vocab_path=str(full_dir / pack_move_seq.PAT3_VOCAB_FILE), **kw)
+    with pytest.raises(ValueError, match='詞表'):
+        pack_move_seq.pack_splits(out_dir=str(tmp_path / 'bad2'), val648_csv=str(v6_only0),
+                                  extra_splits={'hold': str(hold_csv)}, splits=['hold'], **kw)
+    args = pack_move_seq.parse_args(['--extra-split', 'hold=a.csv', '--splits', 'hold'])
+    assert args.extra_split == {'hold': 'a.csv'} and args.splits == ['hold']
+
+
 def _state_inputs(n_moves, total_len, seed=0):
     g = torch.Generator().manual_seed(seed)
     pos = torch.full((1, total_len), pack_move_seq.PAD_POS, dtype=torch.long)
