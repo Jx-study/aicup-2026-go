@@ -54,6 +54,8 @@ DIST_BUCKETS = 9  # 0..8 桶，加 1 格無效
 DIST_NUM = DIST_BUCKETS + 1
 LINE_NUM = (BOARD_SIZE + 1) // 2 + 1  # 0..9 線共 10 格，加 1 格 pass/pad
 PATCH_EMB_DIM = 64
+SPATIAL_NUM = 9  # 距離桶 0..7，加 1 格 pass/pad
+STAGE_BOUNDS = (50, 150)  # 開局、中盤、官子的分段手數
 
 
 def amp_autocast(device_type, amp):
@@ -71,6 +73,22 @@ def bucket_l1_distance(l1):
     b = torch.where(l1 >= 10, torch.full_like(b, 7), b)
     b = torch.where(l1 >= 15, torch.full_like(b, 8), b)
     return b
+
+
+def spatial_pair_buckets(pos):
+    """回傳 (B, L, L) int32 兩手落子點曼哈頓距離桶，任一手為 pass/pad 時為 SPATIAL_NUM - 1。"""
+    is_board = pos < PASS_POS
+    # (B, L, L) 暫存用 int16 降低 VRAM
+    r = torch.where(is_board, pos // BOARD_SIZE, torch.zeros_like(pos)).to(torch.int16)
+    c = torch.where(is_board, pos % BOARD_SIZE, torch.zeros_like(pos)).to(torch.int16)
+    l1 = (r[:, :, None] - r[:, None, :]).abs() + (c[:, :, None] - c[:, None, :]).abs()
+    # 0..4 各一桶，5-6、7-10、>=11 各一桶
+    b = torch.clamp(l1, max=4)
+    b = torch.where(l1 >= 5, torch.full_like(b, 5), b)
+    b = torch.where(l1 >= 7, torch.full_like(b, 6), b)
+    b = torch.where(l1 >= 11, torch.full_like(b, 7), b)
+    both = is_board[:, :, None] & is_board[:, None, :]
+    return torch.where(both, b, torch.full_like(b, SPATIAL_NUM - 1)).to(torch.int32)
 
 
 def apply_d4_pos(pos, k, table):
@@ -108,8 +126,11 @@ class PreLNTransformerBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
-    def forward(self, x, key_valid_mask):
-        """x: (B, L, D)，key_valid_mask: (B, L) bool，True 表示可被注意。"""
+    def forward(self, x, key_valid_mask, attn_bias=None):
+        """x: (B, L, D)，key_valid_mask: (B, L) bool，True 表示可被注意。
+
+        attn_bias 為 (B, H, L, L) 浮點 bias，已含 pad 遮罩；給定時取代 key_valid_mask。
+        """
         bsz, seq_len, _ = x.shape
         h = self.norm1(x)
         qkv = self.qkv(h).view(bsz, seq_len, 3, self.nhead, self.head_dim)
@@ -119,7 +140,7 @@ class PreLNTransformerBlock(nn.Module):
         v = v.transpose(1, 2)
 
         # bool attn_mask：True 表示允許注意，形狀 (B, 1, 1, L)
-        attn_mask = key_valid_mask[:, None, None, :]
+        attn_mask = key_valid_mask[:, None, None, :] if attn_bias is None else attn_bias.to(q.dtype)
         drop_p = self.dropout_p if self.training else 0.0
         attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop_p)
         attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, seq_len, self.d_model)
@@ -245,6 +266,8 @@ class GoMoveSeqTransformer(nn.Module):
         state_feats=False,
         conv_kernel=0,
         patch_size=0,
+        spatial_bias=False,
+        stage_pool=False,
     ):
         super().__init__()
         if pool_mode not in ('target', 'all'):
@@ -261,6 +284,8 @@ class GoMoveSeqTransformer(nn.Module):
         self.state_feats = bool(state_feats)
         self.conv_kernel = int(conv_kernel)
         self.patch_size = int(patch_size)
+        self.spatial_bias = bool(spatial_bias)
+        self.stage_pool = bool(stage_pool)
 
         self.coord_emb = nn.Embedding(NUM_POS, 128)
         self.role_emb = nn.Embedding(NUM_ROLES, 32)
@@ -297,10 +322,21 @@ class GoMoveSeqTransformer(nn.Module):
             self.convs = nn.ModuleList([
                 ConvModule(self.d_model, self.conv_kernel, dropout=dropout) for _ in range(self.num_layers)
             ])
+        self.spatial_table = None
+        if self.spatial_bias:
+            # 各層共用，初始為 0，訓練起點與無 bias 相同
+            self.spatial_table = nn.Parameter(torch.zeros(SPATIAL_NUM, self.nhead))
         self.final_norm = nn.LayerNorm(self.d_model)
 
         self.pool = AttentiveStatsPool(self.d_model)
         feat_dim = self.d_model * 2
+        self.stage_pools = None
+        if self.stage_pool:
+            # 全局池化外另接各分段池化，短局缺的分段輸出 0
+            self.stage_pools = nn.ModuleList([
+                AttentiveStatsPool(self.d_model) for _ in range(len(STAGE_BOUNDS) + 1)
+            ])
+            feat_dim += self.d_model * 2 * len(self.stage_pools)
         self.bn_pool = nn.BatchNorm1d(feat_dim)
         self.head_drop = nn.Dropout(head_dropout)
         self.fc_emb = nn.Linear(feat_dim, self.embed_dim, bias=False)
@@ -393,8 +429,16 @@ class GoMoveSeqTransformer(nn.Module):
             tok = torch.cat([tok, self.patch_enc(patch, valid_mask)], dim=-1)
         h = self.in_drop(self.in_norm(self.in_proj(tok)))
 
+        attn_bias = None
+        if self.spatial_table is not None:
+            # 轉成 attention 實際的計算 dtype 並連續化一次，各層共用同一份張量
+            dev = h.device.type
+            attn_dtype = torch.get_autocast_dtype(dev) if torch.is_autocast_enabled(dev) else h.dtype
+            table = self.spatial_table.to(attn_dtype)
+            attn_bias = F.embedding(spatial_pair_buckets(pos_l), table).permute(0, 3, 1, 2)
+            attn_bias = attn_bias.masked_fill(~attn_valid[:, None, None, :], float('-inf')).contiguous()
         for i, blk in enumerate(self.blocks):
-            h = blk(h, attn_valid)
+            h = blk(h, attn_valid, attn_bias)
             if self.convs is not None:
                 h = self.convs[i](h, valid_mask)
         h = self.final_norm(h)
@@ -407,6 +451,14 @@ class GoMoveSeqTransformer(nn.Module):
             pool_mask = valid_mask
 
         pooled = self.pool(h, pool_mask)
+        if self.stage_pools is not None:
+            step = torch.arange(h.shape[1], device=h.device)
+            edges = (0,) + STAGE_BOUNDS + (h.shape[1],)
+            parts = [pooled]
+            for j, sp in enumerate(self.stage_pools):
+                in_stage = (step >= edges[j]) & (step < edges[j + 1])
+                parts.append(sp(h, pool_mask & in_stage.unsqueeze(0)))
+            pooled = torch.cat(parts, dim=1)
         pooled = self.head_drop(self.bn_pool(pooled))
         emb = self.bn_emb(self.fc_emb(pooled))
         emb = F.normalize(emb.float(), p=2, dim=1)
@@ -545,6 +597,8 @@ def parse_args(argv=None):
     ap.add_argument('--state-feats', action='store_true', help='token 加入規則引擎狀態欄位（需 --state-feats 打包的序列）')
     ap.add_argument('--conv-kernel', type=int, default=0, help='每層後接 Conformer 卷積模組的 kernel，0 為不加')
     ap.add_argument('--patch-dir', default='', help='pack_move_patch 產出的局部盤面目錄，空字串為不用')
+    ap.add_argument('--spatial-bias', action='store_true', help='attention 加兩手落子點距離桶的 per-head bias')
+    ap.add_argument('--stage-pool', action='store_true', help='全局池化外另接開局、中盤、官子分段池化')
     ap.add_argument('--fp16', action='store_true', help='GPU 用 fp16 autocast 與 GradScaler（給不支援 bf16 的 T4）')
     ap.add_argument('--sub-centers', type=int, default=2)
     ap.add_argument('--arc-scale', type=float, default=30.0)
@@ -675,6 +729,8 @@ def main(argv=None):
         state_feats=args.state_feats,
         conv_kernel=args.conv_kernel,
         patch_size=patch_size,
+        spatial_bias=args.spatial_bias,
+        stage_pool=args.stage_pool,
     ).to(device)
     arcface = SubCenterArcFace(
         embed_dim=args.embed_dim,
@@ -725,6 +781,10 @@ def main(argv=None):
         config['conv_kernel'] = args.conv_kernel
     if patch_size:
         config['patch_size'] = patch_size
+    if args.spatial_bias:
+        config['spatial_bias'] = True
+    if args.stage_pool:
+        config['stage_pool'] = True
 
     start_epoch, history, best_score = 0, [], -1.0
     if os.path.exists(last_path) and not args.fresh:
@@ -757,6 +817,8 @@ def main(argv=None):
         'state_feats': bool(args.state_feats),
         'conv_kernel': int(args.conv_kernel),
         'patch_size': int(patch_size),
+        'spatial_bias': bool(args.spatial_bias),
+        'stage_pool': bool(args.stage_pool),
     }
     with open(os.path.join(args.ckpt_dir, 'train_config.json'), 'w', encoding='utf-8') as f:
         json.dump(infer_cfg, f, indent=2)
@@ -766,9 +828,10 @@ def main(argv=None):
 
     n_params = sum(p.numel() for p in model.parameters())
     print(
-        'device %s | data %s | amp %s | augment_d4 %s | pool %s | state %s | conv %d | patch %d | train 玩家 %d (%s 局, %d steps/ep) | dev %s 局 | 參數量 %s'
+        'device %s | data %s | amp %s | augment_d4 %s | pool %s | state %s | conv %d | patch %d | spatial %s | stage %s | train 玩家 %d (%s 局, %d steps/ep) | dev %s 局 | 參數量 %s'
         % (
             device, data_device, amp, args.augment_d4, args.pool_mode, args.state_feats, args.conv_kernel, patch_size,
+            args.spatial_bias, args.stage_pool,
             num_classes, format(total_train_games, ','), steps_per_epoch,
             format(len(dev_pos), ','), format(n_params, ','),
         ),
@@ -902,6 +965,8 @@ def main(argv=None):
             ),
             flush=True,
         )
+        if device.type == 'cuda':
+            print('  峰值 VRAM %.2f GB' % (torch.cuda.max_memory_allocated(device) / 1024 ** 3), flush=True)
 
         torch.save(eval_model.state_dict(), os.path.join(args.ckpt_dir, 'epoch_%d.pth' % (epoch + 1)))
         if row['dev_top5_csls'] > best_score:

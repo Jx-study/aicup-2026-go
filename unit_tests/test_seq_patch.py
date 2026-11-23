@@ -96,3 +96,111 @@ def test_seq_transformer_patch_size_zero_state_dict_unchanged():
         assert not any(k.startswith('patch_enc.') for k in model.state_dict())
     assert m_plain.in_proj.in_features == 272
     assert m_state_conv.in_proj.in_features == 336
+
+
+def _tiny_model(**kw):
+    return train_seq_emb.GoMoveSeqTransformer(
+        d_model=32, nhead=4, num_layers=2, dim_feedforward=64, embed_dim=16, max_len=200,
+        pool_mode='all', **kw,
+    )
+
+
+def _random_games(bsz, seq_len, n_valid, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    pos = torch.randint(0, pack_move_seq.PASS_POS, (bsz, seq_len), generator=g)
+    pos[:, 3] = pack_move_seq.PASS_POS
+    pos[:, n_valid:] = pack_move_seq.PAD_POS
+    is_target = (torch.arange(seq_len) % 2).expand(bsz, seq_len).clone()
+    is_target[:, n_valid:] = 2
+    return pos, is_target
+
+
+def test_new_flags_off_keep_state_dict_keys():
+    base = set(_tiny_model().state_dict())
+    off = set(_tiny_model(spatial_bias=False, stage_pool=False).state_dict())
+    assert base == off
+    assert not any(k.startswith(('spatial_table', 'stage_pools')) for k in base)
+
+
+def test_spatial_pair_buckets_values():
+    p = pack_move_seq.PASS_POS
+    pos = torch.tensor([[0, 1, 20, 4 * 19 + 4, 6 * 19, 10 * 19, 18 * 19 + 18, p, pack_move_seq.PAD_POS]])
+    b = train_seq_emb.spatial_pair_buckets(pos)[0]
+    assert b.shape == (9, 9)
+    # 與第 0 手 (0,0) 的距離：0、1、2、8、6、10、36
+    assert b[0, :7].tolist() == [0, 1, 2, 6, 5, 6, 7]
+    assert b[3, 3] == 0 and torch.equal(b, b.T)
+    last = train_seq_emb.SPATIAL_NUM - 1
+    assert (b[7] == last).all() and (b[:, 8] == last).all()
+
+
+def test_spatial_bias_zero_table_matches_plain_model():
+    torch.manual_seed(0)
+    plain = _tiny_model().eval()
+    biased = _tiny_model(spatial_bias=True).eval()
+    biased.load_state_dict(plain.state_dict(), strict=False)
+    pos, is_target = _random_games(3, 40, 30)
+    with torch.no_grad():
+        torch.testing.assert_close(plain(pos, is_target), biased(pos, is_target), atol=1e-5, rtol=1e-5)
+        biased.spatial_table.data[0] = 3.0
+        assert not torch.allclose(plain(pos, is_target), biased(pos, is_target), atol=1e-4)
+
+
+@pytest.mark.parametrize('kw', [{'spatial_bias': True}, {'stage_pool': True}])
+def test_new_flags_ignore_pad_tail(kw):
+    # 尾端補 pad 的結果須與只含有效手數的序列相同
+    torch.manual_seed(0)
+    model = _tiny_model(**kw).eval()
+    if model.spatial_table is not None:
+        model.spatial_table.data.uniform_(-2.0, 2.0)
+    pos, is_target = _random_games(2, 180, 160)
+    with torch.no_grad():
+        torch.testing.assert_close(model(pos, is_target), model(pos[:, :160], is_target[:, :160]),
+                                   atol=1e-5, rtol=1e-5)
+
+
+def test_stage_pool_masks_split_at_bounds():
+    model = _tiny_model(stage_pool=True).eval()
+    pos, is_target = _random_games(1, 200, 170)
+    masks = {}
+    for j, sp in enumerate(model.stage_pools):
+        sp.register_forward_hook(lambda m, inp, out, j=j: masks.__setitem__(j, inp[1][0].nonzero().flatten().tolist()))
+    with torch.no_grad():
+        model(pos, is_target)
+    assert masks[0] == list(range(0, 50))
+    assert masks[1] == list(range(50, 150))
+    assert masks[2] == list(range(150, 170))
+
+
+def test_stage_pool_short_game_zero_later_stages():
+    torch.manual_seed(0)
+    model = _tiny_model(stage_pool=True).eval()
+    pos, is_target = _random_games(2, 180, 40)
+    seen = {}
+    model.stage_pools[1].register_forward_hook(lambda m, i, o: seen.__setitem__(1, o))
+    model.stage_pools[2].register_forward_hook(lambda m, i, o: seen.__setitem__(2, o))
+    with torch.no_grad():
+        emb = model(pos, is_target)
+    assert torch.isfinite(emb).all()
+    assert torch.count_nonzero(seen[1]) == 0 and torch.count_nonzero(seen[2]) == 0
+    assert model.bn_pool.num_features == 32 * 2 * 4
+
+
+def test_new_flags_backward_reaches_table():
+    torch.manual_seed(0)
+    model = _tiny_model(spatial_bias=True, stage_pool=True).train()
+    pos, is_target = _random_games(4, 60, 55)
+    model(pos, is_target).sum().backward()
+    assert model.spatial_table.grad is not None and model.spatial_table.grad.abs().sum() > 0
+
+
+def test_spatial_bias_shared_contiguous_across_blocks():
+    model = _tiny_model(spatial_bias=True).eval()
+    seen = []
+    for blk in model.blocks:
+        blk.register_forward_pre_hook(lambda m, args: seen.append(args[2]))
+    pos, is_target = _random_games(2, 30, 25)
+    with torch.no_grad():
+        model(pos, is_target)
+    assert len(seen) == len(model.blocks)
+    assert all(b is seen[0] for b in seen) and seen[0].is_contiguous()

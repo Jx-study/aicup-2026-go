@@ -73,6 +73,8 @@ def load_seq_emb_model(ckpt_path, device):
         state_feats=bool(cfg.get('state_feats', False)),
         conv_kernel=int(cfg.get('conv_kernel', 0)),
         patch_size=int(cfg.get('patch_size', 0)),
+        spatial_bias=bool(cfg.get('spatial_bias', False)),
+        stage_pool=bool(cfg.get('stage_pool', False)),
     )
     state = torch.load(ckpt_path, map_location='cpu', weights_only=True)
     model.load_state_dict(state)

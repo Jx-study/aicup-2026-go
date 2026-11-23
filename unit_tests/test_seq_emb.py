@@ -564,7 +564,8 @@ def test_replay_move_patches_relative_colors_and_edges():
     assert (p3 == 0).all()
 
 
-def test_pack_patches_aligns_keys_and_train_infer_patch(tmp_path):
+@pytest.mark.parametrize('conv_kernel, new_flags', [(0, False), (3, True)])
+def test_pack_patches_aligns_keys_and_train_infer_patch(tmp_path, conv_kernel, new_flags):
     from aicup import pack_move_patch
     train_dir, feat_dir, newdev_csv, val648_csv = _make_synthetic_dataset(tmp_path)
     seq_dir = tmp_path / 'seq_state'
@@ -590,10 +591,13 @@ def test_pack_patches_aligns_keys_and_train_infer_patch(tmp_path):
         '--p-players', '3', '--k-games', '2', '--min-games', '5',
         '--epochs', '1', '--max-steps', '2', '--bn-batches', '2',
         '--warmup-steps', '1', '--eval-seeds', '42',
-        '--no-amp', '--log-every', '0', '--state-feats', '--fp16',
-    ])
+        '--no-amp', '--log-every', '0', '--state-feats', '--fp16', '--conv-kernel', str(conv_kernel),
+    ] + (['--spatial-bias', '--stage-pool'] if new_flags else []))
     cfg = json.loads((ckpt_dir / 'train_config.json').read_text(encoding='utf-8'))
-    assert cfg['patch_size'] == 5 and cfg['state_feats'] is True
+    assert cfg['patch_size'] == 5 and cfg['state_feats'] is True and cfg['conv_kernel'] == conv_kernel
+    assert cfg['spatial_bias'] is new_flags and cfg['stage_pool'] is new_flags
+    model, _ = infer_seq_emb.load_seq_emb_model(str(ckpt_dir / 'best_model.pth'), torch.device('cpu'))
+    assert (model.spatial_table is not None) is new_flags and (model.stage_pools is not None) is new_flags
     with pytest.raises(SystemExit):
         train_seq_emb.parse_args(['--ckpt-dir', 'x', '--patch-dir', 'p', '--augment-d4'])
 
