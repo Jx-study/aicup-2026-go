@@ -593,7 +593,7 @@ def test_pack_patches_aligns_keys_and_train_infer_patch(tmp_path, conv_kernel, n
         '--warmup-steps', '1', '--eval-seeds', '42',
         '--no-amp', '--log-every', '0', '--state-feats', '--fp16', '--conv-kernel', str(conv_kernel),
     ] + (['--spatial-bias', '--stage-pool', '--prefix-crop-prob', '0.5', '--prefix-crop-range', '5', '10',
-           '--color-balance'] if new_flags else []))
+           '--color-balance', '--augment-d4'] if new_flags else []))
     last_cfg = torch.load(ckpt_dir / 'last.pt', map_location='cpu', weights_only=False)['config']
     assert ('prefix_crop' in last_cfg) is new_flags and ('color_balance' in last_cfg) is new_flags
     cfg = json.loads((ckpt_dir / 'train_config.json').read_text(encoding='utf-8'))
@@ -601,8 +601,6 @@ def test_pack_patches_aligns_keys_and_train_infer_patch(tmp_path, conv_kernel, n
     assert cfg['spatial_bias'] is new_flags and cfg['stage_pool'] is new_flags
     model, _ = infer_seq_emb.load_seq_emb_model(str(ckpt_dir / 'best_model.pth'), torch.device('cpu'))
     assert (model.spatial_table is not None) is new_flags and (model.stage_pools is not None) is new_flags
-    with pytest.raises(SystemExit):
-        train_seq_emb.parse_args(['--ckpt-dir', 'x', '--patch-dir', 'p', '--augment-d4'])
 
     # packed（局部盤面檔）與 test（從 SGF 重算）推論一致
     with np.load(seq_dir / 'newdev.npz') as zs:
@@ -620,21 +618,17 @@ def test_pack_patches_aligns_keys_and_train_infer_patch(tmp_path, conv_kernel, n
     ]).to_csv(tests_dir / 'player_identification_candidates2_public.csv', index=False)
     ckpt = str(ckpt_dir / 'best_model.pth')
     packed_out = tmp_path / 'packed.npz'
+    tta = ['--tta', '8'] if new_flags else []
     infer_seq_emb.main(['--mode', 'packed', '--ckpt', ckpt, '--seq-dir', str(seq_dir), '--split', 'newdev',
-                        '--patch-dir', str(patch_dir), '--batch-size', '8', '--no-amp', '--out', str(packed_out)])
+                        '--patch-dir', str(patch_dir), '--batch-size', '8', '--no-amp', '--out', str(packed_out)] + tta)
     infer_seq_emb.main(['--mode', 'test', '--ckpt', ckpt, '--tests-dir', str(tests_dir), '--groups', 'b',
-                        '--batch-size', '8', '--nproc', '1', '--no-amp', '--out-dir', str(tmp_path / 'cache')])
+                        '--batch-size', '8', '--nproc', '1', '--no-amp', '--out-dir', str(tmp_path / 'cache')] + tta)
     with np.load(packed_out) as zp, np.load(tmp_path / 'cache' / 'pub2_cand_emb.npz') as zt:
         assert bool(zt['valid'].all())
         np.testing.assert_allclose(zp['emb'].astype(np.float32), zt['emb'].astype(np.float32), atol=1e-3)
     with pytest.raises(SystemExit):
         infer_seq_emb.main(['--mode', 'packed', '--ckpt', ckpt, '--seq-dir', str(seq_dir), '--split', 'newdev',
                             '--no-amp', '--out', str(tmp_path / 'bad.npz')])
-    model, _ = infer_seq_emb.load_seq_emb_model(ckpt, torch.device('cpu'))
-    pos = torch.full((1, 24), pack_move_seq.PAD_POS, dtype=torch.long)
-    with pytest.raises(ValueError):
-        train_seq_emb.forward_seq_embeddings(model, pos, pos.clone(), False, tta=8,
-                                             patch=torch.zeros((1, 24, 7), dtype=torch.uint8))
 
 
 def test_replay_multi_capture_and_suicide_buckets():

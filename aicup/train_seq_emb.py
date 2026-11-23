@@ -183,6 +183,24 @@ class ConvModule(nn.Module):
         return x + self.drop(y)
 
 
+def build_d4_patch_perm(patch_size):
+    """回傳 (8, patch_size**2) 置換表：D4 第 k 種變換後局部盤面第 j 格取原第 perm[k, j] 格。
+
+    由 D4_POS_TABLE 推導，以盤面中心放置局部盤面，與落子座標變換一致。
+    """
+    half = patch_size // 2
+    center = BOARD_SIZE // 2
+    n = patch_size * patch_size
+    perm = np.empty((8, n), dtype=np.int64)
+    for k in range(8):
+        for i in range(n):
+            dr, dc = i // patch_size - half, i % patch_size - half
+            p2 = int(D4_POS_TABLE[k, (center + dr) * BOARD_SIZE + (center + dc)])
+            j = (p2 // BOARD_SIZE - center + half) * patch_size + (p2 % BOARD_SIZE - center + half)
+            perm[k, j] = i
+    return perm
+
+
 class PatchEncoder(nn.Module):
     """每手共用的局部盤面 CNN：以無 padding 的 3x3 valid conv 收斂至中心 1x1 保留幾何位置。"""
 
@@ -206,9 +224,13 @@ class PatchEncoder(nn.Module):
         self.conv = nn.Sequential(*layers)
         self.proj = nn.Linear(64, self.out_dim)
         self.register_buffer('shifts', torch.tensor([6, 4, 2, 0], dtype=torch.long), persistent=False)
+        self.register_buffer('d4_perm', torch.from_numpy(build_d4_patch_perm(self.patch_size)), persistent=False)
 
-    def forward(self, patch, valid_mask=None):
-        """patch: (B, L, patch_nbytes) 整數張量，valid_mask 為 (B, L) bool，回傳 (B, L, out_dim)。"""
+    def forward(self, patch, valid_mask=None, d4_k=None):
+        """patch: (B, L, patch_nbytes) 整數張量，valid_mask 為 (B, L) bool，回傳 (B, L, out_dim)。
+
+        d4_k 為 int 或 (B,) 張量時，先把局部盤面做對應的 D4 變換。
+        """
         bsz, seq_len, nb = patch.shape
         if valid_mask is not None:
             flat_mask = valid_mask.reshape(-1)
@@ -219,6 +241,15 @@ class PatchEncoder(nn.Module):
             p_valid = patch.reshape(-1, nb)
 
         cells = ((p_valid.long().unsqueeze(-1) >> self.shifts) & 3).reshape(-1, nb * 4)[:, :self.n_cells]
+        if d4_k is not None:
+            if isinstance(d4_k, int):
+                if d4_k:
+                    cells = cells[:, self.d4_perm[d4_k]]
+            else:
+                k_cell = d4_k.long().unsqueeze(1).expand(bsz, seq_len).reshape(-1)
+                if valid_mask is not None:
+                    k_cell = k_cell[flat_mask]
+                cells = cells.gather(1, self.d4_perm[k_cell])
         x = F.one_hot(cells, 4).float()
         x = x.transpose(1, 2).reshape(-1, 4, self.patch_size, self.patch_size)
         y = self.proj(self.conv(x).flatten(1))
@@ -395,11 +426,11 @@ class GoMoveSeqTransformer(nn.Module):
         steps = steps.unsqueeze(0).expand(bsz, seq_len)
         return line, dr_idx, dc_idx, dist_idx, self_dist_idx, steps
 
-    def forward(self, pos, is_target, state=None, patch=None):
+    def forward(self, pos, is_target, state=None, patch=None, d4_k=None):
         """輸入 pos (B, L) 與 is_target (B, L)，回傳 (B, embed_dim) L2 正規化向量。
 
         state_feats 模型另需 state (B, L, 5)，欄位順序同 STATE_FIELDS；
-        patch_size 模型另需 patch (B, L, patch_nbytes)。
+        patch_size 模型另需 patch (B, L, patch_nbytes)；pos 已做 D4 變換時以 d4_k 同步變換局部盤面。
         """
         pos_l = pos.long()
         role_l = is_target.long()
@@ -437,7 +468,7 @@ class GoMoveSeqTransformer(nn.Module):
         if self.patch_enc is not None:
             if patch is None:
                 raise ValueError('patch_size 模型需要 patch 輸入')
-            tok = torch.cat([tok, self.patch_enc(patch, valid_mask)], dim=-1)
+            tok = torch.cat([tok, self.patch_enc(patch, valid_mask, d4_k)], dim=-1)
         h = self.in_drop(self.in_norm(self.in_proj(tok)))
 
         attn_bias = None
@@ -510,11 +541,9 @@ def load_seq_npz(path, device, load_state=True):
 def forward_seq_embeddings(model, pos, is_target, amp, tta=1, d4_table=None, state=None, patch=None):
     """計算一個 batch 的序列風格向量，tta 支援 1 至 8 種 D4 對稱平均；狀態欄位 D4 不變，各視角共用。
 
-    局部盤面不隨 D4 變換，patch 模型只接受 tta=1。
+    局部盤面隨各視角同步做 D4 變換。
     """
     n_views = max(1, min(int(tta), 8))
-    if n_views > 1 and patch is not None:
-        raise ValueError('局部盤面模型不支援 D4 TTA')
     if n_views > 1 and d4_table is None:
         d4_table = torch.from_numpy(D4_POS_TABLE.astype(np.int64)).to(pos.device)
     total = None
@@ -523,7 +552,7 @@ def forward_seq_embeddings(model, pos, is_target, amp, tta=1, d4_table=None, sta
     for k in range(n_views):
         pk = apply_d4_pos(pos_l, k, d4_table) if k else pos_l
         with amp_autocast(pos.device.type, amp):
-            e = model(pk, role_l, state, patch)
+            e = model(pk, role_l, state, patch, k if patch is not None else None)
         e_f = e.float()
         total = e_f if total is None else (total + e_f)
     return F.normalize(total / n_views, p=2, dim=1)
@@ -650,8 +679,6 @@ def parse_args(argv=None):
         ap.error('--prefix-crop-range 要 1 <= MIN <= MAX')
     if args.color_balance and args.k_games < 2:
         ap.error('--color-balance 需要 --k-games >= 2')
-    if args.patch_dir and args.augment_d4:
-        ap.error('局部盤面不隨 D4 變換，--patch-dir 不能與 --augment-d4 同時使用')
     return args
 
 
@@ -907,6 +934,7 @@ def main(argv=None):
             if args.prefix_crop_prob > 0:
                 pb, rb = apply_prefix_crop(pb, rb, args.prefix_crop_prob, args.prefix_crop_range[0],
                                            args.prefix_crop_range[1], aug_gen)
+            ks = None
             if args.augment_d4:
                 ks = torch.randint(0, 8, (pb.size(0),), generator=aug_gen, device=device)
                 pb = apply_d4_pos(pb, ks, d4_table)
@@ -914,7 +942,7 @@ def main(argv=None):
 
             optimizer.zero_grad(set_to_none=True)
             with amp_autocast(device.type, amp):
-                emb = model(pb, rb, sb, xb)
+                emb = model(pb, rb, sb, xb, ks if xb is not None else None)
             l_arc, corr = arcface(emb, yb)
             l_sup = (
                 supcon_loss(emb, yb, temperature=args.supcon_temp)

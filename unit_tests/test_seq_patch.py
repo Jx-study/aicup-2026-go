@@ -242,3 +242,48 @@ def test_sampler_color_balance():
                 assert (cols == 0).sum() == 2 and (cols == 1).sum() == 2
             else:
                 assert (cols == 0).all()
+
+
+def _decode_patch(raw, patch_size):
+    bits = np.unpackbits(np.frombuffer(raw, dtype=np.uint8)).reshape(-1, 2)
+    return (bits[:, 0] * 2 + bits[:, 1])[:patch_size * patch_size]
+
+
+@pytest.mark.parametrize('patch_size', [5, 7])
+def test_d4_patch_perm_matches_rotated_board(patch_size):
+    # 先轉盤面再取局部盤面，等於先取局部盤面再套置換表
+    rng = np.random.default_rng(0)
+    table = pack_move_seq.D4_POS_TABLE
+    perm = train_seq_emb.build_d4_patch_perm(patch_size)
+    n_pts = pack_move_seq.BOARD_SIZE ** 2
+    for _ in range(20):
+        board = rng.integers(0, 3, n_pts).tolist()
+        p = int(rng.integers(0, n_pts))
+        r, c = divmod(p, pack_move_seq.BOARD_SIZE)
+        orig = _decode_patch(pack_move_seq._patch_bytes(board, r, c, 1, patch_size), patch_size)
+        for k in range(8):
+            rot = [0] * n_pts
+            for q in range(n_pts):
+                rot[int(table[k, q])] = board[q]
+            r2, c2 = divmod(int(table[k, p]), pack_move_seq.BOARD_SIZE)
+            got = _decode_patch(pack_move_seq._patch_bytes(rot, r2, c2, 1, patch_size), patch_size)
+            assert np.array_equal(got, orig[perm[k]])
+
+
+def test_patch_encoder_d4_k_int_and_tensor_agree():
+    torch.manual_seed(0)
+    enc = train_seq_emb.PatchEncoder(patch_size=7, out_dim=16).eval()
+    patch = torch.randint(0, 256, (3, 5, pack_move_seq.patch_nbytes(7)), dtype=torch.uint8)
+    mask = torch.ones(3, 5, dtype=torch.bool)
+    mask[1, 3:] = False
+    with torch.no_grad():
+        base = enc(patch, mask)
+        torch.testing.assert_close(enc(patch, mask, 0), base)
+        for k in range(8):
+            a = enc(patch, mask, k)
+            b = enc(patch, mask, torch.full((3,), k))
+            torch.testing.assert_close(a, b)
+        mixed = enc(patch, mask, torch.tensor([0, 3, 5]))
+        torch.testing.assert_close(mixed[0], base[0])
+        torch.testing.assert_close(mixed[1], enc(patch, mask, 3)[1])
+    assert 'd4_perm' not in enc.state_dict()

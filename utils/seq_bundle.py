@@ -28,6 +28,8 @@ ARMS = {
     'pv63': ['--state-feats', '--patch-dir', 'data/patch', '--conv-kernel', '9', '--spatial-bias'],
     'pv64': ['--state-feats', '--patch-dir', 'data/patch', '--conv-kernel', '9', '--spatial-bias',
              '--prefix-crop-prob', '0.2', '--prefix-crop-range', '80', '150', '--color-balance'],
+    'pv65': ['--state-feats', '--patch-dir', 'data/patch', '--conv-kernel', '9', '--spatial-bias', '--augment-d4',
+             '--val-tta', '8'],
     'state': ['--state-feats'],
     'stateconf': ['--state-feats', '--conv-kernel', '9'],
 }
@@ -109,7 +111,8 @@ def cells(folder):
                  "         '--ckpt-dir', RUN, '--epochs', str(1 if MAX_STEPS else EPOCHS), '--fp16', *extra,\n"
                  "         *(['--max-steps', str(MAX_STEPS), '--log-every', '100'] if MAX_STEPS else [])], RUN + '/train.log')\n"
                  "else:\n"
-                 "    pd_args = ['--patch-dir', 'data/patch'] if '--patch-dir' in extra else []\n"
+                 "    tta = ['--tta', '8'] if '--augment-d4' in extra else []\n"
+                 "    pd_args = (['--patch-dir', 'data/patch'] if '--patch-dir' in extra else []) + tta\n"
                  "    for split in ('newdev', 'val648'):\n"
                  "        run([sys.executable, '-u', '-m', 'aicup.infer_seq_emb', '--mode', 'packed', '--ckpt', ckpt,\n"
                  "             '--seq-dir', 'data/seq', '--split', split, *pd_args,\n"
@@ -118,7 +121,7 @@ def cells(folder):
                  "         '--seq-npz', 'data/seq/hold.npz', *pd_args,\n"
                  "         '--out', os.path.join(RUN, 'emb-cache', 'hold_emb.npz')], RUN + '/infer.log')\n"
                  "    run([sys.executable, '-u', '-m', 'aicup.infer_seq_emb', '--mode', 'test', '--ckpt', ckpt,\n"
-                 "         '--groups', 'all', '--tests-dir', 'tests', '--out-dir', os.path.join(RUN, 'emb-cache')],\n"
+                 "         '--groups', 'all', '--tests-dir', 'tests', '--out-dir', os.path.join(RUN, 'emb-cache'), *tta],\n"
                  "        RUN + '/infer.log')"),
         ('code', "from google.colab import runtime\n\ndrive.flush_and_unmount()\nruntime.unassign()"),
     ]
