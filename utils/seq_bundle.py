@@ -25,8 +25,9 @@ PATCH_FILES = ('train_patch.npz', 'newdev_patch.npz', 'val648_patch.npz', 'hold_
 # 各組訓練參數，pooling 在 notebook 的 POOL 填寫
 ARMS = {
     'pv6': ['--state-feats', '--patch-dir', 'data/patch'],
-    'pv62': ['--state-feats', '--patch-dir', 'data/patch', '--conv-kernel', '9',
-             '--spatial-bias', '--stage-pool', '--embed-dim', '512'],
+    'pv63': ['--state-feats', '--patch-dir', 'data/patch', '--conv-kernel', '9', '--spatial-bias'],
+    'pv64': ['--state-feats', '--patch-dir', 'data/patch', '--conv-kernel', '9', '--spatial-bias',
+             '--prefix-crop-prob', '0.2', '--prefix-crop-range', '80', '150', '--color-balance'],
     'state': ['--state-feats'],
     'stateconf': ['--state-feats', '--conv-kernel', '9'],
 }
@@ -48,7 +49,7 @@ def cells(folder):
                      '3. 執行階段選 L4 或更高的 GPU（T4 跑不動），改第一格的 `ARM`、`COMMIT`、`POOL`、`STAGE`，再執行全部 cell。\n'
                      '4. 輸出寫在 `MyDrive/%s/runs/<ARM>/`。中斷或換帳號時，把 `runs/` 複製到新帳號的同一路徑，重跑即可接續。\n'
                      '5. 推論完成後下載 `runs/<ARM>/` 的 `history.csv` 與 `emb-cache/`。' % (folder, folder)),
-        ('code', "ARM = 'pv62'  # %s\n"
+        ('code', "ARM = 'pv64'  # %s\n"
                  "COMMIT = 'main'  # 填 push 後的 commit hash，接續訓練時保持相同\n"
                  "POOL = 'all'  # 'target' 或 'all'，依 newdev 結果選擇\n"
                  "STAGE = 'train'  # 'train' 或 'infer'\n"
