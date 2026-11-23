@@ -592,7 +592,10 @@ def test_pack_patches_aligns_keys_and_train_infer_patch(tmp_path, conv_kernel, n
         '--epochs', '1', '--max-steps', '2', '--bn-batches', '2',
         '--warmup-steps', '1', '--eval-seeds', '42',
         '--no-amp', '--log-every', '0', '--state-feats', '--fp16', '--conv-kernel', str(conv_kernel),
-    ] + (['--spatial-bias', '--stage-pool'] if new_flags else []))
+    ] + (['--spatial-bias', '--stage-pool', '--prefix-crop-prob', '0.5', '--prefix-crop-range', '5', '10',
+           '--color-balance'] if new_flags else []))
+    last_cfg = torch.load(ckpt_dir / 'last.pt', map_location='cpu', weights_only=False)['config']
+    assert ('prefix_crop' in last_cfg) is new_flags and ('color_balance' in last_cfg) is new_flags
     cfg = json.loads((ckpt_dir / 'train_config.json').read_text(encoding='utf-8'))
     assert cfg['patch_size'] == 5 and cfg['state_feats'] is True and cfg['conv_kernel'] == conv_kernel
     assert cfg['spatial_bias'] is new_flags and cfg['stage_pool'] is new_flags

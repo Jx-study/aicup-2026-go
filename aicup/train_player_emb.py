@@ -247,10 +247,13 @@ def sample_within_rank_pk_batches(
     k_games,
     rng,
     adjacent_prob=0.5,
+    game_color=None,
 ):
     """產生同段位或相鄰段位集中之 PK 採樣批次。
 
     每個批次回傳 (game_indices, class_labels)，長度皆為 p_players * k_games。
+    game_color 為各局目標方顏色（0/1）時，同一玩家的 k 局盡量黑白各半；
+    只有單一顏色的玩家照常抽樣。
     """
     avail_ranks = sorted(rank_players.keys())
     rank_weights = np.array([len(rank_players[r]) for r in avail_ranks], dtype=np.float64)
@@ -284,8 +287,20 @@ def sample_within_rank_pk_batches(
         label_list = []
         for cid in picked_cids.tolist():
             g_arr = player_games[cid]
-            replace = len(g_arr) < k_games
-            chosen_g = rng.choice(g_arr, size=k_games, replace=replace)
+            chosen_g = None
+            if game_color is not None and k_games >= 2:
+                g_np = np.asarray(g_arr)
+                col = game_color[g_np]
+                g0, g1 = g_np[col == 0], g_np[col == 1]
+                if len(g0) and len(g1):
+                    n0 = k_games // 2 + (k_games % 2) * int(rng.random() < 0.5)
+                    chosen_g = np.concatenate([
+                        rng.choice(g0, size=n0, replace=len(g0) < n0),
+                        rng.choice(g1, size=k_games - n0, replace=len(g1) < k_games - n0),
+                    ])
+            if chosen_g is None:
+                replace = len(g_arr) < k_games
+                chosen_g = rng.choice(g_arr, size=k_games, replace=replace)
             game_idx_list.append(chosen_g)
             label_list.append(np.full(k_games, cid, dtype=np.int64))
         batches_out.append((np.concatenate(game_idx_list), np.concatenate(label_list)))

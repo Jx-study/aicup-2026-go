@@ -204,3 +204,41 @@ def test_spatial_bias_shared_contiguous_across_blocks():
         model(pos, is_target)
     assert len(seen) == len(model.blocks)
     assert all(b is seen[0] for b in seen) and seen[0].is_contiguous()
+
+
+def test_apply_prefix_crop_keeps_prefix_and_pads_tail():
+    pos = torch.randint(0, pack_move_seq.PASS_POS, (64, 40))
+    role = (torch.arange(40) % 2).expand(64, 40).clone()
+    g = torch.Generator().manual_seed(0)
+    p0, r0 = train_seq_emb.apply_prefix_crop(pos, role, 0.0, 10, 20, g)
+    assert torch.equal(p0, pos) and torch.equal(r0, role)
+    p1, r1 = train_seq_emb.apply_prefix_crop(pos, role, 1.0, 10, 20, g)
+    n_valid = (p1 != pack_move_seq.PAD_POS).sum(dim=1)
+    assert ((n_valid >= 10) & (n_valid <= 20)).all()
+    for i in range(64):
+        k = int(n_valid[i])
+        assert torch.equal(p1[i, :k], pos[i, :k]) and torch.equal(r1[i, :k], role[i, :k])
+        assert (p1[i, k:] == pack_move_seq.PAD_POS).all() and (r1[i, k:] == pack_move_seq.ROLE_PAD).all()
+
+
+def test_sampler_color_balance():
+    from aicup.train_player_emb import sample_within_rank_pk_batches
+    # 玩家 0、1 黑白都有，玩家 2 只有黑
+    player_games = {0: np.arange(0, 10), 1: np.arange(10, 20), 2: np.arange(20, 26)}
+    game_color = np.array([0, 1] * 10 + [0] * 6)
+    rank_players = {0: np.array([0, 1, 2])}
+    kw = dict(n_batches=20, p_players=3, k_games=4)
+    plain_a = sample_within_rank_pk_batches(player_games, rank_players, rng=np.random.default_rng(1), **kw)
+    plain_b = sample_within_rank_pk_batches(player_games, rank_players, rng=np.random.default_rng(1),
+                                            game_color=None, **kw)
+    assert all(np.array_equal(a[0], b[0]) for a, b in zip(plain_a, plain_b))
+    bal = sample_within_rank_pk_batches(player_games, rank_players, rng=np.random.default_rng(1),
+                                        game_color=game_color, **kw)
+    for g_idx, y in bal:
+        for cid in (0, 1, 2):
+            cols = game_color[g_idx[y == cid]]
+            assert len(cols) == 4
+            if cid in (0, 1):
+                assert (cols == 0).sum() == 2 and (cols == 1).sum() == 2
+            else:
+                assert (cols == 0).all()

@@ -34,6 +34,7 @@ from aicup.pack_move_seq import (
     PASS_POS,
     PAT3_NUM,
     PAT3_VOCAB_FILE,
+    ROLE_PAD,
     ROLE_TARGET,
     STATE_FIELDS,
 )
@@ -89,6 +90,16 @@ def spatial_pair_buckets(pos):
     b = torch.where(l1 >= 11, torch.full_like(b, 7), b)
     both = is_board[:, :, None] & is_board[:, None, :]
     return torch.where(both, b, torch.full_like(b, SPATIAL_NUM - 1)).to(torch.int32)
+
+
+def apply_prefix_crop(pos, role, prob, min_keep, max_keep, gen):
+    """以機率 prob 把每局截成只剩前 U[min_keep, max_keep] 手，其餘改為 pad；回傳新的 (pos, role)。"""
+    bsz, seq_len = pos.shape
+    hit = torch.rand(bsz, generator=gen, device=pos.device) < prob
+    keep = torch.randint(min_keep, max_keep + 1, (bsz,), generator=gen, device=pos.device)
+    keep = torch.where(hit, keep, torch.full_like(keep, seq_len))
+    cut = torch.arange(seq_len, device=pos.device).unsqueeze(0) >= keep.unsqueeze(1)
+    return pos.masked_fill(cut, PAD_POS), role.masked_fill(cut, ROLE_PAD)
 
 
 def apply_d4_pos(pos, k, table):
@@ -599,6 +610,10 @@ def parse_args(argv=None):
     ap.add_argument('--patch-dir', default='', help='pack_move_patch 產出的局部盤面目錄，空字串為不用')
     ap.add_argument('--spatial-bias', action='store_true', help='attention 加兩手落子點距離桶的 per-head bias')
     ap.add_argument('--stage-pool', action='store_true', help='全局池化外另接開局、中盤、官子分段池化')
+    ap.add_argument('--prefix-crop-prob', type=float, default=0.0, help='訓練時每局截成只剩前段手數的機率，0 為不截')
+    ap.add_argument('--prefix-crop-range', type=int, nargs=2, default=[80, 150], metavar=('MIN', 'MAX'),
+                    help='截斷後保留的手數範圍')
+    ap.add_argument('--color-balance', action='store_true', help='同一玩家的 K 局盡量黑白各半')
     ap.add_argument('--fp16', action='store_true', help='GPU 用 fp16 autocast 與 GradScaler（給不支援 bf16 的 T4）')
     ap.add_argument('--sub-centers', type=int, default=2)
     ap.add_argument('--arc-scale', type=float, default=30.0)
@@ -629,6 +644,12 @@ def parse_args(argv=None):
         ap.error('--min-games 要 >= 1，--supcon-weight 與 --bn-batches 要 >= 0')
     if args.conv_kernel < 0 or (args.conv_kernel and args.conv_kernel % 2 == 0):
         ap.error('--conv-kernel 要是 0 或正奇數')
+    if not 0.0 <= args.prefix_crop_prob <= 1.0:
+        ap.error('--prefix-crop-prob 要在 0 到 1 之間')
+    if not 1 <= args.prefix_crop_range[0] <= args.prefix_crop_range[1]:
+        ap.error('--prefix-crop-range 要 1 <= MIN <= MAX')
+    if args.color_balance and args.k_games < 2:
+        ap.error('--color-balance 需要 --k-games >= 2')
     if args.patch_dir and args.augment_d4:
         ap.error('局部盤面不隨 D4 變換，--patch-dir 不能與 --augment-d4 同時使用')
     return args
@@ -785,6 +806,10 @@ def main(argv=None):
         config['spatial_bias'] = True
     if args.stage_pool:
         config['stage_pool'] = True
+    if args.prefix_crop_prob > 0:
+        config['prefix_crop'] = [args.prefix_crop_prob] + list(args.prefix_crop_range)
+    if args.color_balance:
+        config['color_balance'] = True
 
     start_epoch, history, best_score = 0, [], -1.0
     if os.path.exists(last_path) and not args.fresh:
@@ -828,10 +853,11 @@ def main(argv=None):
 
     n_params = sum(p.numel() for p in model.parameters())
     print(
-        'device %s | data %s | amp %s | augment_d4 %s | pool %s | state %s | conv %d | patch %d | spatial %s | stage %s | train 玩家 %d (%s 局, %d steps/ep) | dev %s 局 | 參數量 %s'
+        'device %s | data %s | amp %s | augment_d4 %s | pool %s | state %s | conv %d | patch %d | spatial %s | stage %s | crop %s | color_bal %s | train 玩家 %d (%s 局, %d steps/ep) | dev %s 局 | 參數量 %s'
         % (
             device, data_device, amp, args.augment_d4, args.pool_mode, args.state_feats, args.conv_kernel, patch_size,
             args.spatial_bias, args.stage_pool,
+            (args.prefix_crop_prob, *args.prefix_crop_range) if args.prefix_crop_prob > 0 else 'off', args.color_balance,
             num_classes, format(total_train_games, ','), steps_per_epoch,
             format(len(dev_pos), ','), format(n_params, ','),
         ),
@@ -859,6 +885,7 @@ def main(argv=None):
             k_games=args.k_games,
             rng=pk_rng,
             adjacent_prob=args.adjacent_prob,
+            game_color=np.asarray(tr_meta['color']) if args.color_balance else None,
         )
 
         model.train()
@@ -877,6 +904,9 @@ def main(argv=None):
             rb = tr_role[idx_t].to(device, non_blocking=True).long()
             sb = tr_state[idx_t].to(device, non_blocking=True) if tr_state is not None else None
             xb = tr_patch[idx_t].to(device, non_blocking=True) if tr_patch is not None else None
+            if args.prefix_crop_prob > 0:
+                pb, rb = apply_prefix_crop(pb, rb, args.prefix_crop_prob, args.prefix_crop_range[0],
+                                           args.prefix_crop_range[1], aug_gen)
             if args.augment_d4:
                 ks = torch.randint(0, 8, (pb.size(0),), generator=aug_gen, device=device)
                 pb = apply_d4_pos(pb, ks, d4_table)
