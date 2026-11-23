@@ -540,6 +540,7 @@ def run_full_fused_pipeline(
     seq_groups: str = "b",
     pub2_open_weight: Optional[float] = None,
     pub2_seq_weights: Optional[Sequence[float]] = None,
+    seq_weights: Optional[Sequence[float]] = None,
 ) -> pd.DataFrame:
     """執行全量四份測試題融合推論並輸出提交 CSV。"""
     cand_ranks = _load_rank_cache(cand_cache_path, "候選人棋力快取")
@@ -555,11 +556,13 @@ def run_full_fused_pipeline(
         raise ValueError("seq_gamma 必須 >= 0")
     if seq_gamma > 0.0 and not seq_dirs:
         raise ValueError("seq_gamma > 0 時必須指定 seq_cache_dir")
-    if pub2_seq_weights is not None:
-        if len(pub2_seq_weights) != len(seq_dirs):
-            raise ValueError("pub2_seq_weights 長度必須與 seq_cache_dir 目錄數相同")
-        if any(w < 0.0 for w in pub2_seq_weights) or sum(pub2_seq_weights) <= 0.0:
-            raise ValueError("pub2_seq_weights 必須皆 >= 0 且總和 > 0")
+    for name, ws in (("seq_weights", seq_weights), ("pub2_seq_weights", pub2_seq_weights)):
+        if ws is None:
+            continue
+        if len(ws) != len(seq_dirs):
+            raise ValueError(f"{name} 長度必須與 seq_cache_dir 目錄數相同")
+        if any(w < 0.0 for w in ws) or sum(ws) <= 0.0:
+            raise ValueError(f"{name} 必須皆 >= 0 且總和 > 0")
     if pub2_open_weight is not None and pub2_open_weight < 0.0:
         raise ValueError("pub2_open_weight 必須 >= 0")
 
@@ -655,6 +658,9 @@ def run_full_fused_pipeline(
         seq_tracks = None
         cur_seq_gamma = seq_gamma if (is_v2 or seq_groups == "all") else 0.0
         seq_w = [1.0] * len(seq_dirs)
+        if seq_weights is not None and (is_v2 or seq_groups == "all"):
+            seq_w = list(seq_weights)
+            cur_seq_gamma = float(sum(seq_w))
         if is_v2 and pub2_seq_weights is not None:
             # 各軌絕對權重：正規化平均後乘回總和
             seq_w = list(pub2_seq_weights)
@@ -755,8 +761,10 @@ def main():
     parser.add_argument("--seq-cache-dir", nargs="+", default=None, help="落子序列 Embedding 快取目錄，多個時預設等權平均，pub2/priv2 可用 --pub2-seq-weights 指定權重")
     parser.add_argument("--seq-gamma", type=float, default=0.0, help="落子序列相似度加權係數（0 為停用）")
     parser.add_argument("--seq-groups", choices=["b", "all"], default="b", help="落子序列軌套用範圍：b 只用 pub2/priv2，all 四組都用")
+    parser.add_argument("--seq-weights", type=float, nargs="+", default=None,
+                        help="各落子序列軌的絕對權重（套用 --seq-groups 範圍），單獨即可啟用，取代 --seq-gamma")
     parser.add_argument("--pub2-seq-weights", type=float, nargs="+", default=None,
-                        help="pub2/priv2 各落子序列軌的絕對權重，取代 --seq-gamma 的等權平均")
+                        help="pub2/priv2 各落子序列軌的絕對權重，單獨即可啟用，取代 --seq-gamma")
     parser.add_argument("--pub2-open-weight", type=float, default=None, help="pub2/priv2 開局指紋相似度權重，預設 1.0")
     args = parser.parse_args()
 
@@ -773,11 +781,13 @@ def main():
             parser.error("--emb-weights 長度必須與 --emb-cache-dir 相同")
         if any(w < 0.0 for w in args.emb_weights) or sum(args.emb_weights) <= 0.0:
             parser.error("--emb-weights 必須皆 >= 0 且總和 > 0")
-    if args.pub2_seq_weights is not None:
-        if not args.seq_cache_dir or len(args.pub2_seq_weights) != len(args.seq_cache_dir):
-            parser.error("--pub2-seq-weights 長度必須與 --seq-cache-dir 相同")
-        if any(w < 0.0 for w in args.pub2_seq_weights) or sum(args.pub2_seq_weights) <= 0.0:
-            parser.error("--pub2-seq-weights 必須皆 >= 0 且總和 > 0")
+    for flag, ws in (("--seq-weights", args.seq_weights), ("--pub2-seq-weights", args.pub2_seq_weights)):
+        if ws is None:
+            continue
+        if not args.seq_cache_dir or len(ws) != len(args.seq_cache_dir):
+            parser.error(f"{flag} 長度必須與 --seq-cache-dir 相同")
+        if any(w < 0.0 for w in ws) or sum(ws) <= 0.0:
+            parser.error(f"{flag} 必須皆 >= 0 且總和 > 0")
     if args.pub2_open_weight is not None and args.pub2_open_weight < 0.0:
         parser.error("--pub2-open-weight 必須 >= 0")
     if args.head_emb_dirs:
@@ -829,6 +839,7 @@ def main():
         seq_groups=args.seq_groups,
         pub2_open_weight=args.pub2_open_weight,
         pub2_seq_weights=args.pub2_seq_weights,
+        seq_weights=args.seq_weights,
     )
 
 

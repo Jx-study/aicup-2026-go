@@ -314,3 +314,11 @@ def test_run_full_fused_pipeline_rejects_bad_pub2_weights():
         run_full_fused_pipeline(seq_cache_dir=["a"], seq_gamma=1.0, pub2_seq_weights=[-1.0])
     with pytest.raises(ValueError, match="pub2_open_weight"):
         run_full_fused_pipeline(pub2_open_weight=-0.5)
+
+
+def test_run_full_fused_pipeline_rejects_bad_seq_weights():
+    from aicup.fuse_player import run_full_fused_pipeline
+    with pytest.raises(ValueError, match="seq_weights"):
+        run_full_fused_pipeline(seq_cache_dir=["a", "b"], seq_gamma=1.0, seq_weights=[1.0])
+    with pytest.raises(ValueError, match="seq_weights"):
+        run_full_fused_pipeline(seq_cache_dir=["a"], seq_gamma=1.0, seq_weights=[0.0])
