@@ -1,6 +1,6 @@
 """產生免費 Colab T4 帳號用的序列模型 bundle：seq_bundle.zip 與 seq_t4.ipynb。
 
-zip 內含 aicup/、network.py、utils.py、狀態序列檔、局部盤面檔與 B 組題目 CSV，
+zip 內含 aicup/、network.py、utils.py、狀態序列檔、局部盤面檔與 A、B 組題目 CSV，
 免費帳號不需專案 Drive 與 GitHub token。訓練的 checkpoint 寫在該帳號的
 MyDrive/<folder>/runs/<ARM>/，中斷或換帳號後重跑同一個 cell 會從 last.pt 接續。
 用法：python utils/seq_bundle.py
@@ -15,11 +15,13 @@ import zipfile
 
 ROOT_FILES = ('network.py', 'utils.py')
 TEST_FILES = (
+    'player_identification_candidates_public.csv', 'player_identification_test_public.csv',
+    'player_identification_candidates_private.csv', 'player_identification_test_private.csv',
     'player_identification_candidates2_public.csv', 'player_identification_test2_public.csv',
     'player_identification_candidates2_private.csv', 'player_identification_test2_private.csv',
 )
-SEQ_FILES = ('train.npz', 'newdev.npz', 'val648.npz', 'pat3_vocab.npy')
-PATCH_FILES = ('train_patch.npz', 'newdev_patch.npz', 'val648_patch.npz')
+SEQ_FILES = ('train.npz', 'newdev.npz', 'val648.npz', 'hold.npz', 'pat3_vocab.npy')
+PATCH_FILES = ('train_patch.npz', 'newdev_patch.npz', 'val648_patch.npz', 'hold_patch.npz')
 
 # 各組訓練參數，pooling 在 notebook 的 POOL 填寫
 ARMS = {
@@ -45,7 +47,7 @@ def cells(folder):
                      '3. 輸出寫在 `MyDrive/%s/runs/<ARM>/`。中斷或換帳號時，把 `runs/` 複製到新帳號的同一路徑，重跑即可接續。\n'
                      '4. 推論完成後下載 `runs/<ARM>/` 的 `history.csv` 與 `emb-cache/`。' % (folder, folder)),
         ('code', "ARM = 'pv6'  # %s\n"
-                 "POOL = 'target'  # 'target' 或 'all'，依 newdev 結果選擇\n"
+                 "POOL = 'all'  # 'target' 或 'all'，依 newdev 結果選擇\n"
                  "STAGE = 'train'  # 'train' 或 'infer'\n"
                  "EPOCHS = 12\n"
                  "ARMS = %s" % (arms, json.dumps(ARMS))),
@@ -82,8 +84,11 @@ def cells(folder):
                  "        run([sys.executable, '-u', '-m', 'aicup.infer_seq_emb', '--mode', 'packed', '--ckpt', ckpt,\n"
                  "             '--seq-dir', 'data/seq', '--split', split, *pd_args,\n"
                  "             '--out', os.path.join(RUN, 'emb-cache', split + '_emb.npz')], RUN + '/infer.log')\n"
+                 "    run([sys.executable, '-u', '-m', 'aicup.infer_seq_emb', '--mode', 'packed', '--ckpt', ckpt,\n"
+                 "         '--seq-npz', 'data/seq/hold.npz', *pd_args,\n"
+                 "         '--out', os.path.join(RUN, 'emb-cache', 'hold_emb.npz')], RUN + '/infer.log')\n"
                  "    run([sys.executable, '-u', '-m', 'aicup.infer_seq_emb', '--mode', 'test', '--ckpt', ckpt,\n"
-                 "         '--groups', 'b', '--tests-dir', 'tests', '--out-dir', os.path.join(RUN, 'emb-cache')],\n"
+                 "         '--groups', 'all', '--tests-dir', 'tests', '--out-dir', os.path.join(RUN, 'emb-cache')],\n"
                  "        RUN + '/infer.log')"),
         ('code', "from google.colab import runtime\n\ndrive.flush_and_unmount()\nruntime.unassign()"),
     ]
