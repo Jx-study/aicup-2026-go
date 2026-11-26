@@ -1,258 +1,89 @@
-# AICup 2026 - 圍棋 AI Tutorial
+# AI CUP 2026 圍棋棋力與風格預測競賽：TEAM_12242
 
 > [English](README.en.md) | **繁體中文**
 
-## 簡介
+本 repository 是 TEAM_12242 參加 AI CUP 2026 圍棋競賽的程式碼，從官方教學 repository [AILAB-NDHU/AICup-2026-Tutorial](https://github.com/AILAB-NDHU/AICup-2026-Tutorial) 延伸而來。
 
-本 repository 提供 AICup 2026 競賽的 tutorial 教材，主題是以 AI 分析圍棋棋譜。競賽分為兩個子題：
+## 競賽題目
 
-### 1. 棋力預測（Rank Prediction）
+| 競賽 | 題目 | 輸出 |
+|---|---|---|
+| 競賽一：玩家辨識 | 給一位玩家的若干局棋譜，從該題所屬的候選庫找出這位玩家 | 每題 Top-5 候選 |
+| 競賽二：棋力預測 | 給一位玩家的若干局棋譜，預測他的棋力等級 | 每題 1 個等級（10 級，D 最弱、6D 最強） |
 
-依據玩家的棋譜預測其棋力等級，共 10 個等級，範圍從 **12 級（12k）** 到 **6 段（6d）**。
-
-### 2. 玩家辨識（Player Identification）
-
-依據棋譜找出下這些棋的是誰。這個任務要透過 metric learning 學出每位玩家獨特的下棋風格。
-
-兩份 tutorial 都示範了完整的 PyTorch 深度學習流程：
-
-- 從 SGF 棋譜抽取特徵
-- 以 ResNet 設計模型架構
-- 訓練與驗證
-- 對測試資料推論
-- 產生提交檔
-
-**注意：** 這些 tutorial 僅供參考。歡迎自行修改與改進程式碼、嘗試不同架構，也可以使用任何你偏好的函式庫或框架。
-
----
+- 玩家辨識 A 組（`pub_`、`priv_`）：每位候選 100 局，每題 5～20 局，全部執黑。
+- 玩家辨識 B 組（`pub2_`、`priv2_`）：每位候選 10 局，每題 1～5 局，黑白混合。
+- 計分方式以官方說明為準。
 
 ## 檔案結構
 
-請把官方發佈的資料集放到 repository 根目錄，`training/` 與 `tests/` 兩個目錄保持發佈時的結構：
-
 ```
-AICup-2026-Tutorial/
-│
-├── training/                                       # 訓練集（官方發佈）
-│   └── train_D.csv ... train_6D.csv                # 每個等級一個 CSV（10 檔，兩個子題共用）
-│
-├── tests/                                          # 測試集（官方發佈）
-│   ├── rank_prediction_test_public.csv             # 棋力預測 public
-│   ├── rank_prediction_test_private.csv            # 棋力預測 private
-│   ├── player_identification_test_public.csv       # 玩家辨識題目 public
-│   ├── player_identification_test_private.csv      # 玩家辨識題目 private
-│   ├── player_identification_candidates_public.csv # 候選庫 public
-│   └── player_identification_candidates_private.csv# 候選庫 private
-│
-├── network.py                                      # 網路架構
-│   ├── GoRankResNet                                # 棋力預測用的 ResNet
-│   └── GoPlayerResNet                              # 玩家辨識用的 ResNet
-│
-├── utils.py                                        # SGF 解析工具
-│   ├── SGFParseRankPrediction                      # 棋力預測的特徵抽取器
-│   └── SGFParsePlayerIdentification                # 玩家辨識的特徵抽取器
-│
-├── rank-prediction.ipynb                           # 棋力預測 tutorial notebook
-├── player-identification.ipynb                     # 玩家辨識 tutorial notebook
-│
-├── README.md                                       # 本文件
-└── README.en.md                                    # English version
+aicup-2026-go/
+├── aicup/                     # 本隊的程式，從根目錄以 python -m aicup.<module> 執行
+├── unit_tests/                # aicup/ 的單元測試
+├── colab_*.ipynb              # 在 Google Colab GPU 上執行訓練、推論與 KataGo 分析
+├── network.py                 # 官方：GoRankResNet、GoPlayerResNet
+├── utils.py                   # 官方：SGF 解析與特徵抽取
+├── rank-prediction.ipynb      # 官方棋力預測教學 notebook，未修改
+├── player-identification.ipynb  # 官方玩家辨識教學 notebook，未修改
+└── pytest.ini
 ```
 
-特徵目錄、checkpoint 與提交檔會在執行 notebook 的過程中產生。
-
-## 資料集說明
-
-資料與提交格式的正式定義以官方發佈為準。本文件是摘要，兩者有出入時以官方發佈為準。
-
-- **訓練集（兩個子題共用）**：100 萬局（10 個等級、每級 10 萬局），分成 10 個 `train_<LEVEL>.csv`，每個等級一檔
-
-單一份訓練集同時服務兩個子題。每一列是一局棋：
-
-| 欄位          | 說明                                                                                          |
-| ------------- | --------------------------------------------------------------------------------------------- |
-| `player_id`   | 玩家的雜湊代號（在整份訓練集中一致）                                                          |
-| `game_id`     | 棋譜代號（例如 `g_0000001`），只在**單一等級檔案內**唯一                                       |
-| `rank`        | 玩家的等級標籤。10 級為 D (10~12k), C (7~9k), B (4~6k), A (1~3k), 1D, 2D, 3D, 4D, 5D, 6D      |
-| `color`       | 該玩家在這局的執色（"B" 或 "W"）                                                              |
-| `sgf_content` | 已匿名化的 SGF 棋譜字串                                                                       |
-
-各子題的用法（詳見 notebook）：
-
-- 棋力預測：以 `rank` 為標籤，用不到 `player_id`。
-- 玩家辨識：依 `player_id` 分組，同一位玩家的任兩局即構成正例配對。
-
-- **測試集**：兩個子題各有 **public** 與 **private** 兩份，每份 400 題（每題 5 到 20 局棋譜）
-
-兩份同時發佈。Public 分數在競賽期間即時公布於排行榜；Private 分數於競賽結束後公布，並作為最終排名依據。
-
-| 欄位                     | 說明                                                              |
-| ------------------------ | ----------------------------------------------------------------- |
-| `question_id`            | 題號，帶 `pub_` 或 `priv_` 前綴（例如 `pub_q_0001`）              |
-| `num_games`              | 該題實際提供的棋譜數                                              |
-| `sgf_1` ... `sgf_20`     | 棋譜內容；只有前 `num_games` 個欄位有值                           |
-| `color_1` ... `color_20` | 對應棋譜的執色（"B" 或 "W"）                                      |
-
-- **玩家辨識候選庫**：每池 400 位玩家（每人 100 局），每池共 40,000 局
-
-這是已知玩家的資料庫。Public 與 private 兩池互斥，不可混用。
-
-| 欄位          | 說明                                                     |
-| ------------- | -------------------------------------------------------- |
-| `game_id`     | 棋譜代號，帶 `pub_` 或 `priv_` 前綴                      |
-| `player_id`   | 候選玩家的雜湊代號，帶 `pub_p_` 或 `priv_p_` 前綴        |
-| `sgf_content` | 已匿名化的 SGF 棋譜字串                                  |
-| `color`       | 該候選玩家的執色                                         |
-
----
+- 官方的 `network.py`、`utils.py` 與兩份教學 notebook 保持原樣，本隊的做法都放在 `aicup/`。
+- 資料、特徵、checkpoint 與輸出檔不放在 repository，執行時產生在根目錄下的資料夾，例如 `training-v1.1/`、`tests/`、`humansl-analysis/`、`player-trained-models/`。
+- 在 Colab 上執行時，這些資料夾放在 Google Drive 的 `MyDrive/aicup-2026/`，子目錄名稱與 repository 根目錄相同。
 
 ## 執行環境
 
-### 系統需求
-
-兩份 tutorial 曾在以下環境完整執行：
-
-- **作業系統：** Ubuntu 22.04.5 LTS
-- **Python：** 3.10.12
-- **深度學習框架：** PyTorch 2.6.0+cu124、CUDA 12.4
-
-Notebook 依賴 Linux 的 `fork` 啟動方式，因為多進程的 worker 函式定義在 notebook 內。在 macOS 或 Windows 上執行時，請把 `NPROC` 設為 1，或把那些函式移到獨立的 `.py` 檔。
-
-### 硬體需求
-
-- **GPU：**
-  - 棋力預測：至少 9 GB VRAM（訓練約 8.6 GB、推論約 0.6 GB）
-  - 玩家辨識：至少 4 GB VRAM（訓練約 2 GB、推論約 4 GB）
-  - VRAM 不足時調小 `BATCH_SIZE`（推論則是 `GPU_BATCH`），只影響速度，不影響正確性。
-- **磁碟空間：**
-  - 棋力預測特徵：約 1.7 GB（存成 gzip 壓縮的 WebDataset 分片）
-  - 玩家辨識特徵：約 15 GB，散在約 100 萬個小檔案 —— 抽取前請同時確認剩餘空間與剩餘 inode 數量。
-
-### 相依套件
-
-安裝所需的 Python 套件：
+- 本機：資料準備、特徵打包、融合推論與本地評估，只用 CPU。
+- Google Colab：模型訓練、嵌入推論與 KataGo 分析，使用 GPU。
 
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu124
-pip install pandas numpy matplotlib
-pip install webdataset sgfmill
+pip install torch numpy pandas scipy scikit-learn matplotlib sgfmill pytest
+pytest
 ```
 
----
+- `unit_tests/conftest.py` 設定 `KMP_DUPLICATE_LIB_OK`，避免 PyTorch 與其他套件重複載入 OpenMP 時中止。
 
-## 開始使用
+## 取得資料
 
-### 1. 棋力預測 Tutorial
+| 資料 | 取得方式 | 放置位置 |
+|---|---|---|
+| 訓練集 v1.1 | 官方資料集 repository [AILAB-NDHU/aicup2026-go-dataset](https://github.com/AILAB-NDHU/aicup2026-go-dataset) 的 Releases，下載 `aicup2026_go_training_v1.1.tar.xz`，核對該 README 上的 SHA-256 | 在 `training-v1.1/` 內執行 `tar xf aicup2026_go_training_v1.1.tar.xz`，得到 `training-v1.1/training/train_*.csv` |
+| 測試題與候選庫 | AI CUP 競賽平台，需報名參賽 | `tests/` |
 
-跟著 [rank-prediction.ipynb](rank-prediction.ipynb) 完成：
+| 題目 | `tests/` 內的檔案（public 與 private 各一份） |
+|---|---|
+| 棋力預測 | `rank_prediction_test_{public,private}.csv` |
+| 玩家辨識 A 組 | `player_identification_test_{public,private}.csv`、`player_identification_candidates_{public,private}.csv` |
+| 玩家辨識 B 組 | `player_identification_test2_{public,private}.csv`、`player_identification_candidates2_{public,private}.csv` |
 
-- 以 WebDataset 從 SGF 棋譜抽取特徵
-- 訓練 ResNet 模型分類 10 個等級
-- 對 public 與 private 兩份測試集產生預測
-- Baseline 分數：Public 測試集 **0.4631**
+- 訓練集 v1.1 在 `sgf_content` 加上讓子資訊 `HD[n]`，本隊的程式一律讀 v1.1。
 
-### 2. 玩家辨識 Tutorial
+## 玩家切分清單
 
-跟著 [player-identification.ipynb](player-identification.ipynb) 完成：
-
-- 從 SGF 棋譜逐手抽取特徵
-- 以 Triplet Loss 訓練 ResNet embedding 模型
-- 用 embedding 距離把題目比對到候選庫
-- 對 public 與 private 兩份測試集產生 Top-5 預測
-- Baseline 分數：Public 測試集 **0.2845**
-
-兩個 baseline 都是照 notebook 原樣跑出來的，沒有使用預訓練權重。
-
----
-
-## 使用提示
-
-1. **特徵抽取：** 兩份 notebook 開頭都有一次性的特徵抽取。特徵產出後，之後重跑可以直接從訓練那節開始。
-
-2. **GPU 加速：** 請在具備 GPU 的機器上訓練，並依 GPU 記憶體調整 `BATCH_SIZE`。
-
-3. **自行修改：** 以下都可以改：
-   - [network.py](network.py) 的模型架構
-   - [utils.py](utils.py) 的特徵抽取邏輯
-   - Notebook 內的訓練超參數
-   - 損失函數與最佳化策略
-
-4. **Checkpoint：** 每個 epoch 都會存檔，最佳的那個另外保留 —— 棋力預測依驗證集 accuracy，玩家辨識依訓練 loss。
-
----
-
-## 競賽提交
-
-每個子題只上傳**一份**提交檔，內容涵蓋兩份測試集。Public 與 private 的題目都要預測，結果串接起來：
-
-```
-rank_prediction_test_public.csv   （400 題）  ─┐
-                                               ├─→  submission_rank.csv   （800 列）
-rank_prediction_test_private.csv  （400 題）  ─┘
+```bash
+python -m aicup.val_players --val-size 180000 --out-dir humansl-analysis
 ```
 
-玩家辨識同理，產生 800 列的 `submission_player.csv`。**缺任何一份的題目即為缺題，該次提交無效、不予計分。**
+- 切分以玩家為單位，用 `(rank, player_id)` 識別玩家，亂數種子固定，重跑得到相同的清單。
+- 輸出目錄已有同名檔案時不覆寫，直接停止。
+- 每份清單的欄位都是 `player_id`、`rank`。
 
-| 檔案                    | 欄位                                      |
-| ----------------------- | ----------------------------------------- |
-| `submission_rank.csv`   | `question_id`、`pred_rank`                |
-| `submission_player.csv` | `question_id`、`top_1` ... `top_5`        |
+| 檔案 | 內容 | 用途 |
+|---|---|---|
+| `val-players.csv` | `--base-size`（預設 100,000 局）切出的 val 中，局數至少 20 的玩家 | val648 評估集 |
+| `val-players-v180000.csv` | `--val-size` 切出的 val 中，局數至少 20 的玩家 | 上下兩份的聯集 |
+| `val-players-new-v180000.csv` | 上一份扣掉 `val-players.csv` | 封存組與 newdev 的來源 |
+| `holdout-v180000.csv` | 從新增玩家依等級比例抽出的封存組 | 最後的否決檢定 |
+| `val-players-newdev-v180000.csv` | 新增玩家扣掉封存組 | 開發集：選 checkpoint 與融合權重 |
+| `val-players-dev-v180000.csv` | `val-players.csv` 加上 newdev | 競賽二的開發集 |
+| `train-pool-v180000.csv` | `--val-size` 切出的 train 中，局數至少 20 的玩家，每級固定人數 | Human SL 段位模型的擬合資料 |
 
-`pub_` / `priv_` 前綴請原樣照抄。玩家辨識的五個人選必須相異，且只能填該題所屬測試集候選庫裡的玩家 —— `pub_` 開頭的題目填了 `priv_p_` 開頭的玩家，會被判為無效提交。
+- 訓練集由 `--val-size` 切出的 train 部分構成，所以上表的 val 玩家都不會出現在訓練資料中。
 
----
+## 致謝與授權
 
-## 計分方式
-
-### 棋力預測
-
-測試集中每一列 $i$ 依預測的等級計分：
-
-$$
-score_i =
-\begin{cases}
-1, & \text{完全正確} \\
-e^{-1}, & \text{相鄰一級（不含完全正確）} \\
-0, & \text{其餘}
-\end{cases}
-$$
-
-最終分數為所有題目的平均：
-
-$$
-\text{Final Score} = \frac{1}{N} \sum_{i=1}^{N} score_i
-$$
-
-### 玩家辨識
-
-測試集中每一列 $i$ 依正解是否落在 Top-5 計分：
-
-$$
-score_i(r) = e^{- (r - 1)}, \quad r \in \{1,2,3,4,5\}
-$$
-
-其中 $r$ 是正解在 Top-5 名單中的名次。若正解不在 Top-5，該題得 0 分。
-
-最終分數為所有題目的平均：
-
-$$
-\text{Final Score} = \frac{1}{N} \sum_{i=1}^{N} score_i(r)
-$$
-
-Public 與 private 分數各自獨立計算，各取自己那 400 題的平均。
-
----
-
-## 致謝
-
-本 tutorial 由 **NDHU AI Lab 的 Serkan Kavak** 製作，作為 AICup 2026 競賽的參考教材。
-
-若發現錯誤或有任何問題，請在本專案的 GitHub repository 開 issue。
-
----
-
-## 授權
-
-本專案供教學與競賽用途。參賽者可自由使用、修改與散布本程式碼。
-
-祝你的模型一切順利！
+- 官方教學 repository 由 NDHU AI Lab 的 Serkan Kavak 製作，`network.py`、`utils.py` 與兩份教學 notebook 來自該 repository。
+- 官方教學 repository 允許參賽者自由使用、修改與散布其程式碼。
+- 訓練集僅供 2026 AI CUP 競賽使用，不得用於識別真實使用者。
