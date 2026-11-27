@@ -33,7 +33,7 @@ aicup-2026-go/
 
 - 官方的 `network.py`、`utils.py` 與兩份教學 notebook 保持原樣，本隊的做法都放在 `aicup/`。
 - 資料、特徵、checkpoint 與輸出檔不放在 repository，執行時產生在根目錄下的資料夾，例如 `training-v1.1/`、`tests/`、`humansl-analysis/`、`player-trained-models/`。
-- 在 Colab 上執行時，這些資料夾放在 Google Drive 的 `MyDrive/aicup-2026/`，子目錄名稱與 repository 根目錄相同。
+- 在 Colab 上執行時，這些資料夾放在 Google Drive 的 `MyDrive/aicup-2026/`，子目錄名稱與 repository 根目錄相同；各步驟寫明它之後要上傳或之前要下載的資料夾。
 
 ## 執行環境
 
@@ -106,7 +106,7 @@ just splits
 just task1-prep
 ```
 
-- 把 `training-v1.1/`、`tests/`、`humansl-analysis/`、`rank-features/`、`rank-features-v180000/`、`move-seq-state-v180000/`、`move-seq-patch-v180000/`、`player-trained-models/hsl-cache/` 上傳到 Google Drive 的 `MyDrive/aicup-2026/`。
+- 完成後把 `training-v1.1/`、`tests/`、`humansl-analysis/`、`rank-features/`、`rank-features-v180000/`、`move-seq-state-v180000/`、`move-seq-patch-v180000/`、`player-trained-models/hsl-cache/` 上傳到 Drive 的 `MyDrive/aicup-2026/`，路徑和 repository 根目錄相同，例如 `rank-features/` 放在 `MyDrive/aicup-2026/rank-features/`。
 
 ### 2. Colab
 
@@ -129,7 +129,7 @@ just task1-prep
 just task1-submit
 ```
 
-- 執行前從 Drive 下載 `rank-trained-models/rank-cnn/`、`humansl-analysis/hist6d-*/`、`player-trained-models/` 到 repository 根目錄的同名路徑。
+- 執行前從 `MyDrive/aicup-2026/` 下載 `rank-trained-models/rank-cnn/`、`humansl-analysis/hist6d-*/`、`player-trained-models/` 到 repository 根目錄的同名路徑。
 - 其中的 CNN 段位推論（`infer_player_rank`）只用 CPU 時較慢，可改在有 GPU 的環境執行。
 - KataGo 重跑有小雜訊，GPU 訓練也不是逐位元可重現，所以重跑的提交檔和本隊上傳的版本可能有少數題目不同。
 
@@ -144,7 +144,7 @@ just task2-games
 ```
 
 - 2d 的局寫到 `humansl-analysis/hist2d-<run>/games.csv`；測試題分析時直接讀 `tests/`。
-- 上傳 `training-v1.1/`、`humansl-analysis/`、`tests/` 到 Drive 的 `MyDrive/aicup-2026/`。
+- 上傳 `training-v1.1/`、`humansl-analysis/`、`tests/` 到 `MyDrive/aicup-2026/` 的同名路徑。
 
 ### 2. Colab：Human SL 分析
 
@@ -163,7 +163,7 @@ just task2-games
 just task2-pack
 ```
 
-- 先從 Drive 下載 `humansl-analysis/hist6d-*/`、`hist2d-*/` 的 jsonl，打包結果 `packed-moves/`、`packed-moves-2d/` 再上傳。
+- 先從 `MyDrive/aicup-2026/` 下載 `humansl-analysis/hist6d-*/`、`hist2d-*/` 的 jsonl，打包結果 `humansl-analysis/packed-moves/`、`packed-moves-2d/` 再上傳到同名路徑。
 
 ### 4. 本機：A、B 模型
 
@@ -185,6 +185,8 @@ just task2-ab
 ```bash
 just task2-submit
 ```
+
+- 執行前從 `MyDrive/aicup-2026/` 下載 `humansl-analysis/tf-final-j30-p4all/out/` 到同名路徑。
 
 ## 實驗性 notebook 與模組
 

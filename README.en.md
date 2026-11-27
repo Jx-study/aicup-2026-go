@@ -33,7 +33,7 @@ aicup-2026-go/
 
 - The official `network.py`, `utils.py` and the two tutorial notebooks are unchanged. All team methods live in `aicup/`.
 - Data, features, checkpoints and outputs are not in the repository. They are created in folders under the root, such as `training-v1.1/`, `tests/`, `humansl-analysis/` and `player-trained-models/`.
-- On Colab these folders live in Google Drive under `MyDrive/aicup-2026/`, with the same subfolder names as the repository root.
+- On Colab these folders live in Google Drive under `MyDrive/aicup-2026/`, with the same subfolder names as the repository root. Each step states the folders to upload after it or download before it.
 
 ## Environment
 
@@ -106,7 +106,7 @@ just splits
 just task1-prep
 ```
 
-- Upload `training-v1.1/`, `tests/`, `humansl-analysis/`, `rank-features/`, `rank-features-v180000/`, `move-seq-state-v180000/`, `move-seq-patch-v180000/` and `player-trained-models/hsl-cache/` to `MyDrive/aicup-2026/` in Google Drive.
+- Then upload `training-v1.1/`, `tests/`, `humansl-analysis/`, `rank-features/`, `rank-features-v180000/`, `move-seq-state-v180000/`, `move-seq-patch-v180000/` and `player-trained-models/hsl-cache/` to `MyDrive/aicup-2026/` on Google Drive, with the same paths as the repository root. For example, `rank-features/` goes to `MyDrive/aicup-2026/rank-features/`.
 
 ### 2. Colab
 
@@ -129,7 +129,7 @@ just task1-prep
 just task1-submit
 ```
 
-- Before running, download `rank-trained-models/rank-cnn/`, `humansl-analysis/hist6d-*/` and `player-trained-models/` from Drive to the same paths under the repository root.
+- Before running, download `rank-trained-models/rank-cnn/`, `humansl-analysis/hist6d-*/` and `player-trained-models/` from `MyDrive/aicup-2026/` to the same paths under the repository root.
 - The CNN rank inference step (`infer_player_rank`) is slow on CPU only; a machine with a GPU is faster.
 - A KataGo rerun has small noise and GPU training is not bit-for-bit reproducible, so a rerun submission can differ from the team's upload on a few questions.
 
@@ -144,7 +144,7 @@ just task2-games
 ```
 
 - 2d runs are written to `humansl-analysis/hist2d-<run>/games.csv`; test questions are read directly from `tests/` during analysis.
-- Upload `training-v1.1/`, `humansl-analysis/` and `tests/` to `MyDrive/aicup-2026/` on Google Drive.
+- Upload `training-v1.1/`, `humansl-analysis/` and `tests/` to the same paths under `MyDrive/aicup-2026/`.
 
 ### 2. Colab: Human SL analysis
 
@@ -163,7 +163,7 @@ just task2-games
 just task2-pack
 ```
 
-- Download the jsonl files under `humansl-analysis/hist6d-*/` and `hist2d-*/` from Drive first, then upload the packed `packed-moves/` and `packed-moves-2d/`.
+- Download the jsonl files under `humansl-analysis/hist6d-*/` and `hist2d-*/` from `MyDrive/aicup-2026/` first, then upload the packed `humansl-analysis/packed-moves/` and `packed-moves-2d/` to the same paths.
 
 ### 4. Locally: models A and B
 
@@ -185,6 +185,8 @@ just task2-ab
 ```bash
 just task2-submit
 ```
+
+- Before running, download `humansl-analysis/tf-final-j30-p4all/out/` from `MyDrive/aicup-2026/` to the same path.
 
 ## Experimental notebooks and modules
 
