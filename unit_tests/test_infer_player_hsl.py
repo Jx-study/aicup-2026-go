@@ -15,6 +15,7 @@ from aicup.infer_player_hsl import (
     combine_log_mean,
     fit_target_hsl_model,
     infer_from_jsonl,
+    load_train_arrays,
 )
 
 
@@ -123,6 +124,50 @@ def test_fit_target_hsl_model_filters_hd(tmp_path):
     scaler, clf, n_players = fit_target_hsl_model([str(path)])
     assert n_players == len({i % 50 for i in range(n) if hd[i] < 2})
     assert clf.coef_.shape == (10, 7)
+
+
+def _train_rows(n=40):
+    return [
+        {
+            "key": "A_g_%d" % i,
+            "rank_idx": i % 10,
+            "player_id": "p%d" % (i % 8),
+            "color": "BW"[i % 2],
+            "hd": i % 3,
+            "profiles": list(EXPECTED_PROFILES),
+            "turns": [0, 2, 4],
+            "probs": [[0.1 + 0.01 * (i % 7), 0.3, 0.4], [0.3, 0.4, 0.05 + 0.01 * i], [0.1, 0.2, 0.3]],
+        }
+        for i in range(n)
+    ]
+
+
+def test_load_train_arrays_jsonl_matches_npz(tmp_path):
+    """目標側 jsonl 與同內容 npz 快取應給出相同的擬合資料。"""
+    p = tmp_path / "t.jsonl"
+    p.write_text("".join(json.dumps(r) + "\n" for r in _train_rows()), encoding="utf-8")
+    a = load_train_arrays(str(p))
+    npz = tmp_path / "t.npz"
+    np.savez(npz, g_hsl=a["hsl"], d_black=a["black"], d_hd=a["hd"], d_rank_idx=a["rank_idx"],
+             d_player_id=a["player_id"])
+    b = load_train_arrays(str(npz))
+    for k in ("hsl", "black", "hd", "rank_idx", "player_id"):
+        assert np.array_equal(a[k], b[k])
+    assert a["hsl"].shape == (40, 4)
+    _, clf_a, n_a = fit_target_hsl_model([str(p)])
+    _, clf_b, n_b = fit_target_hsl_model([str(npz)])
+    assert n_a == n_b and np.array_equal(clf_a.coef_, clf_b.coef_)
+
+
+def test_load_train_arrays_rejects_other_profiles(tmp_path):
+    """擬合用 jsonl 的 profiles 不是 6d 組合時應丟出 ValueError。"""
+    rows = _train_rows()
+    for r in rows:
+        r["profiles"] = ["rank_11k", "rank_1d", "rank_2d"]
+    p = tmp_path / "t2.jsonl"
+    p.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_train_arrays(str(p))
 
 
 def test_combine_log_mean_matches_single_game():
