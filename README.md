@@ -1,8 +1,8 @@
-# AI CUP 2026 圍棋棋力與風格預測競賽：TEAM_12242
+# AI CUP 2026 圍棋棋力與風格預測競賽
 
 > [English](README.en.md) | **繁體中文**
 
-本 repository 是 TEAM_12242 參加 AI CUP 2026 圍棋競賽的程式碼，從官方教學 repository [AILAB-NDHU/AICup-2026-Tutorial](https://github.com/AILAB-NDHU/AICup-2026-Tutorial) 延伸而來。
+本 repository 是 AI CUP 2026 圍棋競賽的參賽程式碼，從官方教學 repository [AILAB-NDHU/AICup-2026-Tutorial](https://github.com/AILAB-NDHU/AICup-2026-Tutorial) 延伸而來。
 
 ## 競賽題目
 
@@ -24,8 +24,10 @@ aicup-2026-go/
 ├── colab_*.ipynb              # 在 Google Colab GPU 上執行訓練、推論與 KataGo 分析
 ├── network.py                 # 官方：GoRankResNet、GoPlayerResNet
 ├── utils.py                   # 官方：SGF 解析與特徵抽取
-├── rank-prediction.ipynb      # 官方棋力預測教學 notebook，未修改
-├── player-identification.ipynb  # 官方玩家辨識教學 notebook，未修改
+├── rank-prediction.ipynb      # 官方棋力預測教學 notebook
+├── player-identification.ipynb  # 官方玩家辨識教學 notebook
+├── justfile                   # 本機各步驟的指令
+├── requirements.txt           # 本機需要的套件
 └── pytest.ini
 ```
 
@@ -39,10 +41,12 @@ aicup-2026-go/
 - Google Colab：模型訓練、嵌入推論與 KataGo 分析，使用 GPU。
 
 ```bash
-pip install torch numpy pandas scipy scikit-learn matplotlib sgfmill pytest
-pytest
+pip install -r requirements.txt
+just test
 ```
 
+- `requirements.txt` 含 `rust-just`，安裝後即可使用 `just` 指令；各步驟的完整指令寫在根目錄的 `justfile`，`just --list` 列出全部步驟，`just -n <步驟>` 只印出指令不執行。
+- 在 Windows 上 `justfile` 以 PowerShell 執行，其他系統用 `sh`。
 - `unit_tests/conftest.py` 設定 `KMP_DUPLICATE_LIB_OK`，避免 PyTorch 與其他套件重複載入 OpenMP 時中止。
 
 ## 取得資料
@@ -63,11 +67,11 @@ pytest
 ## 玩家切分清單
 
 ```bash
-python -m aicup.val_players --val-size 180000 --out-dir humansl-analysis
+just splits
 ```
 
 - 切分以玩家為單位，用 `(rank, player_id)` 識別玩家，亂數種子固定，重跑得到相同的清單。
-- 輸出目錄已有同名檔案時不覆寫，直接停止。
+- `just splits` 執行 `python -m aicup.val_players --val-size 180000 --out-dir humansl-analysis`，清單已存在時略過。
 - 每份清單的欄位都是 `player_id`、`rank`。
 
 | 檔案 | 內容 | 用途 |
@@ -79,8 +83,12 @@ python -m aicup.val_players --val-size 180000 --out-dir humansl-analysis
 | `val-players-newdev-v180000.csv` | 新增玩家扣掉封存組 | 開發集：選 checkpoint 與融合權重 |
 | `val-players-dev-v180000.csv` | `val-players.csv` 加上 newdev | 競賽二的開發集 |
 | `train-pool-v180000.csv` | `--val-size` 切出的 train 中，局數至少 20 的玩家，每級固定人數 | Human SL 段位模型的擬合資料 |
+| `train-p1-v180000.csv`、`train-p2-v180000.csv` | 全部訓練局中局數至少 20、不在 dev、封存組、train 池、`val-players.csv` 的玩家，每級依 `player_id` 排序後的第 1～100、101～200 位 | 競賽二 Transformer 的 2d 池 |
+| `train-p3-v180000.csv` | 全部訓練局中局數至少 20、不在 val、封存組、`train-p1`、`train-p2` 的玩家，每級用 `random.Random(44)` 抽 100 位 | 同上 |
+| `train-p4.csv` | 不在以上清單、也不在基準切分 val 中局數至少 5 的玩家，HD < 2 的局中同一色至少 10 局 | 同上 |
 
 - 訓練集由 `--val-size` 切出的 train 部分構成，所以上表的 val 玩家都不會出現在訓練資料中。
+- `train-p1`～`train-p4` 從全部訓練局選，不經切分；它們只用於競賽二。
 
 ## 重現競賽一最終版本
 
@@ -92,21 +100,12 @@ python -m aicup.val_players --val-size 180000 --out-dir humansl-analysis
 | Model B | `colab_train.ipynb` 的 `rank_cnn_v180000`，再執行 `colab_player_emb.ipynb` 的 `model_b`、`infer_a`、`infer_b` | `player-trained-models/emb-model-b/emb-cache/` |
 | 序列模型（7 個） | `colab_seq_emb.ipynb`，每個 `ARM` 依序執行 `STAGE` 的 `smoke`、`train`、`infer` | `player-trained-models/seq-<ARM>/emb-cache/` |
 
-- 最終版本的分數是上表各軌相似度的加權和，權重見第 3 步的 `fuse_player` 指令。
+- 最終版本的分數是上表各軌相似度的加權和，權重見 `justfile` 的 `task1-submit`。
 
 ### 1. 本機資料準備
 
 ```bash
-python -m aicup.val_players --val-size 180000 --out-dir humansl-analysis
-python -m aicup.extract_features --train-dir training-v1.1/training
-python -m aicup.extract_features --train-dir training-v1.1/training --val-size 180000 --out rank-features-v180000
-python -m aicup.color --train-dir training-v1.1/training --out rank-features-v180000/hd.npz
-python -m aicup.hsl_games --run trainpool val648 newdev
-python -m aicup.prep_player_hsl --tests-dir tests
-python -m aicup.pack_move_seq --state-feats --out-dir move-seq-state-v180000
-python -m aicup.pack_move_seq --state-feats --extra-split hold=humansl-analysis/holdout-v180000.csv --splits hold --pat3-vocab move-seq-state-v180000/pat3_vocab.npy --out-dir move-seq-state-v180000
-python -m aicup.pack_move_patch --seq-dir move-seq-state-v180000 --out-dir move-seq-patch-v180000
-python -m aicup.pack_move_patch --seq-dir move-seq-state-v180000 --out-dir move-seq-patch-v180000 --splits hold
+just task1-prep
 ```
 
 - `hsl_games` 依玩家清單與 seed 42 抽出 Human SL 分析的局，寫成 `humansl-analysis/hist6d-<run>/games.csv`。
@@ -131,30 +130,72 @@ python -m aicup.pack_move_patch --seq-dir move-seq-state-v180000 --out-dir move-
 ### 3. 本機推論與融合
 
 ```bash
-python -m aicup.infer_player_rank --ckpt rank-trained-models/rank-cnn/best_model.pth
-python -m aicup.infer_player_hsl
-python -m aicup.fuse_player --color-cond --pattern-beta 0.7 \
-  --cand2-cache player-trained-models/hsl-cache/cand2_hsl_ranks.json \
-  --query2-cache player-trained-models/hsl-cache/query2_hsl_ranks.json \
-  --emb-gamma 1.0 --csls-k 5 --emb-top2-weight 0.5 --raw-open \
-  --emb-cache-dir player-trained-models/emb-model-b/emb-cache \
-  --seq-cache-dir player-trained-models/seq-state/emb-cache \
-                  player-trained-models/seq-state_conf/emb-cache \
-                  player-trained-models/seq-patch/emb-cache \
-                  player-trained-models/seq-patch_conv/emb-cache \
-                  player-trained-models/seq-patch_crop/emb-cache \
-                  player-trained-models/seq-patch_d4/emb-cache \
-                  player-trained-models/seq-patch_d4_val648/emb-cache \
-  --seq-groups all --seq-weights 0.5 0.5 0.1 0.1 0.1 0.1 0.1 \
-  --pub2-alpha 0.5 --pub2-emb-gamma 0.6 --pub2-open-weight 0.0 \
-  --pub2-seq-weights 0.3 0.3 0.4 0.4 0.4 0.4 0.4 \
-  --out-csv submission_player.csv
+just task1-submit
 ```
 
 - 執行前從 Drive 下載 `rank-trained-models/rank-cnn/`、`humansl-analysis/hist6d-*/`、`player-trained-models/` 到 repository 根目錄的同名路徑。
 - `infer_player_rank` 用 A 組的 CNN 推論候選與題目的段位分布，寫到 `player-trained-models/rank-cache/`；只用 CPU 時較慢，可改在有 GPU 的環境執行。
 - `infer_player_hsl` 用 trainpool、val648、newdev 的目標側分析擬合段位邏輯回歸，再估計 B 組候選與題目的段位，讀 `humansl-analysis/hist6d-<run>/<run>-p3-hist.jsonl` 與 `player-trained-models/hsl-cache/pub2-p3-hist.jsonl`。
 - KataGo 重跑有小雜訊，GPU 訓練也不是逐位元可重現，所以重跑的提交檔和本隊上傳的版本可能有少數題目不同。
+
+## 重現競賽二最終版本
+
+競賽二最終版本是 (A + B + TF) / 3：A、B 是 Human SL 特徵的段位邏輯回歸，TF 是逐手特徵的 Transformer，三者的 10 級機率平均後用期望得分選等級。
+
+### 1. 本機抽局
+
+```bash
+just task2-games
+```
+
+- `--2d` 的 run 寫到 `humansl-analysis/hist2d-<run>/games.csv`。`train_p4` 每人取 HD < 2 局中多數色的 10 局，`train_p4b` 從同一批玩家的同色未抽局再抽 10 局。
+- 2d 的測試題不需要 games.csv，分析時直接讀 `tests/`。
+- 上傳 `training-v1.1/`、`humansl-analysis/`、`tests/` 到 Drive 的 `MyDrive/aicup-2026/`。
+
+### 2. Colab：Human SL 分析
+
+| 順序 | notebook | `MODE` | 輸出 |
+|---|---|---|---|
+| 1 | `colab_humansl.ipynb` | `val648` | `humansl-analysis/val648-p3.jsonl`，2d MODE 對照組的參考 |
+| 2 | `colab_humansl.ipynb` | `trainpool_hist`、`newdev_hist`、`val648_hist`、`test_hist` 與各自的 `_opp` | `humansl-analysis/hist6d-<run>/` |
+| 3 | `colab_humansl.ipynb` | `train_p1_2d`、`train_p2_2d`、`train_p3_2d`、`train_p4_2d`、`train_p4b_2d`、`val648_2d`、`test_2d` 與各自的 `_opp` | `humansl-analysis/hist2d-<run>/` |
+
+- 2d MODE 分析前先跑 40 局對照組，和 `val648-p3.jsonl` 比對；中位數絕對差超過 0.03 時停止。
+- 對照組只讀 `val648-p3.jsonl` 的前 40 局，`val648` 第一批備份到 Drive 後就可以停止。
+- 2d MODE 用主網路算每手損失，主網路 `kata1-b28c512nbt-s13255194368-d5935380940` 由 notebook 下載。
+
+### 3. 本機打包
+
+```bash
+just task2-pack
+```
+
+- 先從 Drive 下載 `humansl-analysis/hist6d-*/`、`hist2d-*/` 的 jsonl，打包結果 `packed-moves/`、`packed-moves-2d/` 再上傳。
+- `train_p4all` 依序串接 `train_p4` 與 `train_p4b`。
+
+### 4. 本機：A、B 模型
+
+```bash
+just task2-ab
+```
+
+- A 用 6d profile：開發組是 val648 加 newdev，加 train 池擬合。B 用 2d profile 加兩側的每手損失特徵：開發組是 val648，加 train_p1、train_p2 擬合。
+- 兩者都只用第一段邏輯回歸（`--s1-only`），擬合題是同色、HD < 2 的題（`--same-color`），不需要 CNN。
+- 只用 CPU，每個模型數分鐘到數十分鐘。
+
+### 5. Colab：訓練 TF
+
+| notebook | `MODE` | 輸出 |
+|---|---|---|
+| `colab_tf.ipynb` | 先 `smoke`，再 `j30_p4all` | `humansl-analysis/tf-final-j30-p4all/out/final-ts{0,1,2}-test.npy` |
+
+### 6. 本機融合
+
+```bash
+just task2-submit
+```
+
+- `--tf-weight` 預設 1/3，等於三者平均。
 
 ## 實驗性 notebook 與模組
 
@@ -163,10 +204,13 @@ python -m aicup.fuse_player --color-cond --pattern-beta 0.7 \
 | `colab_permove.ipynb` | 微調 KataGo humanv0 的逐手段位模型（`train_permove`、`infer_permove`） |
 | `colab_setmodel.ipynb` | 抽取 humanv0 主幹向量，供 set 模型探針使用（`setmodel_trunk`） |
 | `colab_strength_se.ipynb` | 中研院 strength estimator 推論（`strength_se`） |
+| `colab_trunk.ipynb` | humanv0 主幹判別式微調（`trunk_cls`），題目由 `export_questions`、棋譜由 `trunk_games` 產生 |
 
-- 上表 3 份是競賽二的實驗，不在競賽一最終版本流程內。
+- 上表 4 份是競賽二的實驗，不在兩個競賽的最終版本流程內。
+- `colab_tf.ipynb` 的 `6d`、`2d` 是競賽二較早版本的 TF，不在最終版本流程內。
+- `aicup.export_questions` 產生 val648 的固定評估題，`tf_run.py` 的 `pool`、`cv` 模式要把 `questions-s{47..51}.npz` 放在 `--data` 目錄。
 - 以下 MODE 同樣不在競賽一最終版本流程內：
-  - `colab_humansl.ipynb`：`*_hist_opp`、`pub2_opp`、`val648`、`val648_opp`、`valnew`、`valnew_opp`、`trainpool`、`trainpool_opp`、`test`、`test_opp`、`pilot`、`visits`、`main`。
+  - `colab_humansl.ipynb`：`*_hist_opp`、`pub2_opp`、`val648`、`val648_opp`、`valnew`、`valnew_opp`、`trainpool`、`trainpool_opp`、`test`、`test_opp`、`test_hist*`、`*_2d*`、`pilot`、`visits`、`main`。
   - `colab_train.ipynb`：`e2e_smoke`、`e2e_full`。
   - `colab_player_emb.ipynb`：`full`、`stage2`。
   - `colab_seq_emb.ipynb`：`ARM = 'patch_conv_wide'`。

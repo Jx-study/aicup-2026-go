@@ -1,8 +1,8 @@
-# AI CUP 2026 Go Rank and Style Prediction: TEAM_12242
+# AI CUP 2026 Go Rank and Style Prediction
 
 > **English** | [繁體中文](README.md)
 
-This repository holds the code of TEAM_12242 for the AI CUP 2026 Go competition. It extends the official tutorial repository [AILAB-NDHU/AICup-2026-Tutorial](https://github.com/AILAB-NDHU/AICup-2026-Tutorial).
+This repository holds our code for the AI CUP 2026 Go competition. It extends the official tutorial repository [AILAB-NDHU/AICup-2026-Tutorial](https://github.com/AILAB-NDHU/AICup-2026-Tutorial).
 
 ## Tasks
 
@@ -26,6 +26,8 @@ aicup-2026-go/
 ├── utils.py                   # Official: SGF parsing and feature extraction
 ├── rank-prediction.ipynb      # Official rank prediction tutorial, unchanged
 ├── player-identification.ipynb  # Official player identification tutorial, unchanged
+├── justfile                   # Commands of the local steps
+├── requirements.txt           # Python packages for the local steps
 └── pytest.ini
 ```
 
@@ -39,10 +41,12 @@ aicup-2026-go/
 - Google Colab: model training, embedding inference and KataGo analysis, on GPU.
 
 ```bash
-pip install torch numpy pandas scipy scikit-learn matplotlib sgfmill pytest
-pytest
+pip install -r requirements.txt
+just test
 ```
 
+- `requirements.txt` includes `rust-just`, which provides the `just` command. The full command of each step is in the `justfile` at the repository root: `just --list` lists the steps, and `just -n <step>` prints the commands without running them.
+- On Windows the `justfile` runs its commands in PowerShell; on other systems it uses `sh`.
 - `unit_tests/conftest.py` sets `KMP_DUPLICATE_LIB_OK`, so the tests do not abort when PyTorch and another package both load OpenMP.
 
 ## Getting the data
@@ -63,11 +67,11 @@ pytest
 ## Player split lists
 
 ```bash
-python -m aicup.val_players --val-size 180000 --out-dir humansl-analysis
+just splits
 ```
 
 - Splits are by player. A player is identified by `(rank, player_id)`. The random seed is fixed, so a rerun gives the same lists.
-- The command stops without overwriting if the output folder already has a file with the same name.
+- `just splits` runs `python -m aicup.val_players --val-size 180000 --out-dir humansl-analysis` and skips it when the lists already exist.
 - Every list has the columns `player_id` and `rank`.
 
 | File | Content | Use |
@@ -79,8 +83,12 @@ python -m aicup.val_players --val-size 180000 --out-dir humansl-analysis
 | `val-players-newdev-v180000.csv` | New players minus the holdout set | Development set: checkpoint and fusion weight selection |
 | `val-players-dev-v180000.csv` | `val-players.csv` plus newdev | Development set for Task 2 |
 | `train-pool-v180000.csv` | Players with at least 20 games in the train part split by `--val-size`, a fixed number per rank | Fitting data for the Human SL rank model |
+| `train-p1-v180000.csv`, `train-p2-v180000.csv` | Players with at least 20 games in the whole training set who are not in dev, the holdout set, the train pool or `val-players.csv`; per rank, positions 1–100 and 101–200 after sorting by `player_id` | 2d pool of the Task 2 Transformer |
+| `train-p3-v180000.csv` | Players with at least 20 games in the whole training set who are not in val, the holdout set, `train-p1` or `train-p2`; 100 per rank drawn with `random.Random(44)` | Same as above |
+| `train-p4.csv` | Players in none of the lists above and not among players with at least 5 games in the base split's val, with at least 10 games of one color among games with HD < 2 | Same as above |
 
 - The training set is the train part split by `--val-size`, so no val player in the table appears in the training data.
+- `train-p1` to `train-p4` are drawn from the whole training set without the split; they are used only for Task 2.
 
 ## Reproducing the final Task 1 submission
 
@@ -92,21 +100,12 @@ python -m aicup.val_players --val-size 180000 --out-dir humansl-analysis
 | Model B | `rank_cnn_v180000` in `colab_train.ipynb`, then `model_b`, `infer_a` and `infer_b` in `colab_player_emb.ipynb` | `player-trained-models/emb-model-b/emb-cache/` |
 | Sequence models (7) | `colab_seq_emb.ipynb`, with `STAGE` set to `smoke`, `train` and `infer` in turn for each `ARM` | `player-trained-models/seq-<ARM>/emb-cache/` |
 
-- The final score is a weighted sum of the similarities of the tracks above. The weights are in the `fuse_player` command of step 3.
+- The final score is a weighted sum of the similarities of the tracks above. The weights are in the `task1-submit` recipe of the `justfile`.
 
 ### 1. Local data preparation
 
 ```bash
-python -m aicup.val_players --val-size 180000 --out-dir humansl-analysis
-python -m aicup.extract_features --train-dir training-v1.1/training
-python -m aicup.extract_features --train-dir training-v1.1/training --val-size 180000 --out rank-features-v180000
-python -m aicup.color --train-dir training-v1.1/training --out rank-features-v180000/hd.npz
-python -m aicup.hsl_games --run trainpool val648 newdev
-python -m aicup.prep_player_hsl --tests-dir tests
-python -m aicup.pack_move_seq --state-feats --out-dir move-seq-state-v180000
-python -m aicup.pack_move_seq --state-feats --extra-split hold=humansl-analysis/holdout-v180000.csv --splits hold --pat3-vocab move-seq-state-v180000/pat3_vocab.npy --out-dir move-seq-state-v180000
-python -m aicup.pack_move_patch --seq-dir move-seq-state-v180000 --out-dir move-seq-patch-v180000
-python -m aicup.pack_move_patch --seq-dir move-seq-state-v180000 --out-dir move-seq-patch-v180000 --splits hold
+just task1-prep
 ```
 
 - `hsl_games` draws the games for the Human SL analysis from the player lists with seed 42 and writes `humansl-analysis/hist6d-<run>/games.csv`.
@@ -131,30 +130,72 @@ python -m aicup.pack_move_patch --seq-dir move-seq-state-v180000 --out-dir move-
 ### 3. Local inference and fusion
 
 ```bash
-python -m aicup.infer_player_rank --ckpt rank-trained-models/rank-cnn/best_model.pth
-python -m aicup.infer_player_hsl
-python -m aicup.fuse_player --color-cond --pattern-beta 0.7 \
-  --cand2-cache player-trained-models/hsl-cache/cand2_hsl_ranks.json \
-  --query2-cache player-trained-models/hsl-cache/query2_hsl_ranks.json \
-  --emb-gamma 1.0 --csls-k 5 --emb-top2-weight 0.5 --raw-open \
-  --emb-cache-dir player-trained-models/emb-model-b/emb-cache \
-  --seq-cache-dir player-trained-models/seq-state/emb-cache \
-                  player-trained-models/seq-state_conf/emb-cache \
-                  player-trained-models/seq-patch/emb-cache \
-                  player-trained-models/seq-patch_conv/emb-cache \
-                  player-trained-models/seq-patch_crop/emb-cache \
-                  player-trained-models/seq-patch_d4/emb-cache \
-                  player-trained-models/seq-patch_d4_val648/emb-cache \
-  --seq-groups all --seq-weights 0.5 0.5 0.1 0.1 0.1 0.1 0.1 \
-  --pub2-alpha 0.5 --pub2-emb-gamma 0.6 --pub2-open-weight 0.0 \
-  --pub2-seq-weights 0.3 0.3 0.4 0.4 0.4 0.4 0.4 \
-  --out-csv submission_player.csv
+just task1-submit
 ```
 
 - Before running, download `rank-trained-models/rank-cnn/`, `humansl-analysis/hist6d-*/` and `player-trained-models/` from Drive to the same paths under the repository root.
 - `infer_player_rank` runs the group A CNN on the candidate and question games and writes rank distributions to `player-trained-models/rank-cache/`. It is slow on CPU only; a machine with a GPU is faster.
 - `infer_player_hsl` fits the rank logistic regression on the target-side analysis of trainpool, val648 and newdev, then estimates the ranks of group B candidates and questions. It reads `humansl-analysis/hist6d-<run>/<run>-p3-hist.jsonl` and `player-trained-models/hsl-cache/pub2-p3-hist.jsonl`.
 - A KataGo rerun has small noise and GPU training is not bit-for-bit reproducible, so a rerun submission can differ from the team's upload on a few questions.
+
+## Reproducing the final Task 2 submission
+
+The final Task 2 submission is (A + B + TF) / 3: A and B are rank logistic regressions on Human SL features, and TF is a Transformer on per-move features. Their 10-level probabilities are averaged and the level is chosen by expected score.
+
+### 1. Drawing games locally
+
+```bash
+just task2-games
+```
+
+- Runs with `--2d` are written to `humansl-analysis/hist2d-<run>/games.csv`. `train_p4` takes 10 games of each player's majority color among games with HD < 2, and `train_p4b` draws 10 more unused games of the same color from the same players.
+- The 2d test questions need no games.csv; the analysis reads `tests/` directly.
+- Upload `training-v1.1/`, `humansl-analysis/` and `tests/` to `MyDrive/aicup-2026/` on Google Drive.
+
+### 2. Colab: Human SL analysis
+
+| Order | Notebook | `MODE` | Output |
+|---|---|---|---|
+| 1 | `colab_humansl.ipynb` | `val648` | `humansl-analysis/val648-p3.jsonl`, the reference for the 2d control check |
+| 2 | `colab_humansl.ipynb` | `trainpool_hist`, `newdev_hist`, `val648_hist`, `test_hist` and their `_opp` | `humansl-analysis/hist6d-<run>/` |
+| 3 | `colab_humansl.ipynb` | `train_p1_2d`, `train_p2_2d`, `train_p3_2d`, `train_p4_2d`, `train_p4b_2d`, `val648_2d`, `test_2d` and their `_opp` | `humansl-analysis/hist2d-<run>/` |
+
+- Before the analysis, 2d MODEs run 40 control games and compare them with `val648-p3.jsonl`; they stop when the median absolute difference exceeds 0.03.
+- The control check reads only the first 40 games of `val648-p3.jsonl`, so the `val648` run can be stopped once its first batch is backed up to Drive.
+- 2d MODEs use the main network to compute per-move loss; the notebook downloads `kata1-b28c512nbt-s13255194368-d5935380940`.
+
+### 3. Packing locally
+
+```bash
+just task2-pack
+```
+
+- Download the jsonl files under `humansl-analysis/hist6d-*/` and `hist2d-*/` from Drive first, then upload the packed `packed-moves/` and `packed-moves-2d/`.
+- `train_p4all` concatenates `train_p4` and `train_p4b` in that order.
+
+### 4. Locally: models A and B
+
+```bash
+just task2-ab
+```
+
+- A uses the 6d profiles: the development set is val648 plus newdev, fitted together with the train pool. B uses the 2d profiles plus per-move loss features of both sides: the development set is val648, fitted together with train_p1 and train_p2.
+- Both use only the first-stage logistic regression (`--s1-only`), fitted on same-color questions with HD < 2 (`--same-color`), and need no CNN.
+- CPU only; each model takes minutes to tens of minutes.
+
+### 5. Colab: training TF
+
+| Notebook | `MODE` | Output |
+|---|---|---|
+| `colab_tf.ipynb` | `smoke` first, then `j30_p4all` | `humansl-analysis/tf-final-j30-p4all/out/final-ts{0,1,2}-test.npy` |
+
+### 6. Fusion locally
+
+```bash
+just task2-submit
+```
+
+- `--tf-weight` defaults to 1/3, which is the plain average of the three.
 
 ## Experimental notebooks and modules
 
@@ -163,10 +204,13 @@ python -m aicup.fuse_player --color-cond --pattern-beta 0.7 \
 | `colab_permove.ipynb` | Fine-tunes a per-move rank model on KataGo humanv0 (`train_permove`, `infer_permove`) |
 | `colab_setmodel.ipynb` | Extracts humanv0 trunk vectors for the set model probe (`setmodel_trunk`) |
 | `colab_strength_se.ipynb` | Inference with the Academia Sinica strength estimator (`strength_se`) |
+| `colab_trunk.ipynb` | Discriminative fine-tuning of the humanv0 trunk (`trunk_cls`); questions from `export_questions`, games from `trunk_games` |
 
-- The 3 notebooks above are Task 2 experiments and are not part of the final Task 1 pipeline.
+- The 4 notebooks above are Task 2 experiments and are not part of the final pipeline of either task.
+- `6d` and `2d` in `colab_tf.ipynb` are earlier Task 2 TF versions and are not part of the final pipeline.
+- `aicup.export_questions` generates the fixed val648 evaluation questions; the `pool` and `cv` modes of `tf_run.py` need `questions-s{47..51}.npz` in the `--data` directory.
 - The following MODEs are not part of the final Task 1 pipeline either:
-  - `colab_humansl.ipynb`: `*_hist_opp`, `pub2_opp`, `val648`, `val648_opp`, `valnew`, `valnew_opp`, `trainpool`, `trainpool_opp`, `test`, `test_opp`, `pilot`, `visits`, `main`.
+  - `colab_humansl.ipynb`: `*_hist_opp`, `pub2_opp`, `val648`, `val648_opp`, `valnew`, `valnew_opp`, `trainpool`, `trainpool_opp`, `test`, `test_opp`, `test_hist*`, `*_2d*`, `pilot`, `visits`, `main`.
   - `colab_train.ipynb`: `e2e_smoke`, `e2e_full`.
   - `colab_player_emb.ipynb`: `full`, `stage2`.
   - `colab_seq_emb.ipynb`: `ARM = 'patch_conv_wide'`.
