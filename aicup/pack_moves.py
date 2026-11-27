@@ -1,6 +1,7 @@
 """把 Human SL 逐手分析的 jsonl 打包成緊湊的 .npz，供 tf_run.py 在 GPU 上訓練。
 
-輸入是目標側與對手側各一份 jsonl，以 key 對應。
+輸入是目標側與對手側各一份 jsonl，以 key 對應，路徑是 colab_humansl 的輸出：
+6d 讀 humansl-analysis/hist6d-<run>/，2d 讀 humansl-analysis/hist2d-<run>/；train_p4all 依序串接 train_p4 與 train_p4b。
 輸出每局 (200, 14) 的逐手特徵與長度 200 的 mask，加上 loss 特徵時為 (200, 20)。
 用法：python -m aicup.pack_moves test                  # 2d，寫到 packed-moves-2d
       python -m aicup.pack_moves --loss train_p1       # 2d + loss，寫到 packed-moves-2dl
@@ -161,26 +162,26 @@ def pack_dataset(t_path, o_path, out_npz, max_turns=200, with_loss=False):
     )
     print(f"完成! 打包局數: {N}, 檔案大小: {os.path.getsize(out_npz) / 1e6:.1f} MB")
 
+RUNS_6D = ['val648', 'trainpool', 'newdev', 'test']
+RUNS_2D = ['val648', 'train_p1', 'train_p2', 'test', 'train_p3', 'train_p4', 'train_p4all']
+PARTS = {'train_p4all': ('train_p4', 'train_p4b')}  # 同一批玩家分兩次抽的局，依序串接
+
+
+def jsonl_pair(h, prefix, run):
+    """colab_humansl 寫出的 (目標側, 對手側) jsonl 路徑：<h><prefix><run>/<run>-p3-hist.jsonl 與 -p3-opp-hist.jsonl。"""
+    d = '%s%s%s/%s' % (h, prefix, run, run)
+    return d + '-p3-hist.jsonl', d + '-p3-opp-hist.jsonl'
+
+
 def build_jobs(h, out, six_d=False):
     """回傳 (目標側 jsonl, 對手側 jsonl, 輸出 npz) 的清單；jsonl 可以是路徑 tuple。"""
-    if six_d:
-        return [
-            (h + 'val648-p3-hist.jsonl', h + 'hist-val648_opp/val648-p3-opp-hist-v1.jsonl', out + 'val648_moves.npz'),
-            (h + 'hist-trainpool-v1/trainpool-p3-hist.jsonl', h + 'hist-trainpool_opp-v1/trainpool-p3-opp-hist.jsonl', out + 'trainpool_moves.npz'),
-            (h + 'hist-newdev/newdev-p3-hist.jsonl', h + 'hist-newdev_opp/newdev-p3-opp-hist.jsonl', out + 'newdev_moves.npz'),
-            (h + 'hist-test/test-p3-hist-v1.jsonl', h + 'hist-test_opp/test-p3-opp-hist-v1.jsonl', out + 'test_moves.npz'),
-        ]
-    return [
-        (h + 'hist-val648/val648-p3-hist.jsonl', h + 'hist-val648_opp/val648-p3-opp-hist.jsonl', out + 'val648_moves.npz'),
-        (h + 'hist-train_p1/train-p1-p3-hist.jsonl', h + 'hist-train_p1_opp/train-p1-p3-opp-hist.jsonl', out + 'train_p1_moves.npz'),
-        (h + 'hist-train_p2/train-p2-p3-hist.jsonl', h + 'hist-train_p2_opp/train-p2-p3-opp-hist.jsonl', out + 'train_p2_moves.npz'),
-        (h + 'hist-test/test-p3-hist.jsonl', h + 'hist-test_opp/test-p3-opp-hist.jsonl', out + 'test_moves.npz'),
-        (h + 'hist-train_p3/train-p3-p3-hist.jsonl', h + 'hist-train_p3_opp/train-p3-p3-opp-hist.jsonl', out + 'train_p3_moves.npz'),
-        (h + 'hist-train_p4/train-p4-p3-hist.jsonl', h + 'hist-train_p4_opp/train-p4-p3-opp-hist.jsonl', out + 'train_p4_moves.npz'),
-        ((h + 'hist-train_p4/train-p4-p3-hist.jsonl', h + 'hist-train_p4b/train-p4b-p3-hist.jsonl'),
-         (h + 'hist-train_p4_opp/train-p4-p3-opp-hist.jsonl', h + 'hist-train_p4b_opp/train-p4b-p3-opp-hist.jsonl'),
-         out + 'train_p4all_moves.npz'),
-    ]
+    prefix = 'hist6d-' if six_d else 'hist2d-'
+    jobs = []
+    for name in (RUNS_6D if six_d else RUNS_2D):
+        pairs = [jsonl_pair(h, prefix, r) for r in PARTS.get(name, (name,))]
+        t, o = tuple(p[0] for p in pairs), tuple(p[1] for p in pairs)
+        jobs.append((t if len(t) > 1 else t[0], o if len(o) > 1 else o[0], out + name + '_moves.npz'))
+    return jobs
 
 
 if __name__ == '__main__':

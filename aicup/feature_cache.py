@@ -5,8 +5,8 @@
 欄位是每個新 profile 的每手平均 log 機率；meta 的 extra 記錄特徵群名稱與 profile，concat 時要相同。
 
 用法（在 repo 根目錄）：
-    python -m aicup.feature_cache --target humansl-analysis/hist-val648/val648-p3-hist.jsonl --opp humansl-analysis/hist-val648_opp/val648-p3-opp-hist.jsonl --out humansl-analysis/cache/val648.npz [--profiles rank_11k,rank_1d,rank_6d]
-    python -m aicup.feature_cache --target humansl-analysis/val648-p3-hist.jsonl --opp humansl-analysis/hist-val648_opp/val648-p3-opp-hist-v1.jsonl --profiles rank_11k,rank_1d,rank_6d --opp-extra humansl-analysis/hist-val648_opp/val648-p3-opp-hist.jsonl --extra-group hslx --out humansl-analysis/cache/val648-6dx.npz
+    python -m aicup.feature_cache --target humansl-analysis/hist2d-val648/val648-p3-hist.jsonl --opp humansl-analysis/hist2d-val648/val648-p3-opp-hist.jsonl --out humansl-analysis/cache/val648.npz
+    python -m aicup.feature_cache --target humansl-analysis/hist6d-val648/val648-p3-hist.jsonl --opp humansl-analysis/hist6d-val648/val648-p3-opp-hist.jsonl --profiles rank_11k,rank_1d,rank_6d --opp-extra humansl-analysis/hist2d-val648/val648-p3-opp-hist.jsonl --extra-group hslx --out humansl-analysis/cache/val648-6dx.npz
 """
 import argparse
 import json

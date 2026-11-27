@@ -9,6 +9,11 @@
     val-players-newdev-v<val_size>.csv  新增玩家扣掉封存組
     val-players-dev-v<val_size>.csv     val-players.csv 加上 newdev
     train-pool-v<val_size>.csv      split_by_player(df, --val-size) 的 train 中局數至少 --min-games 的玩家，每級抽 --pool-per-level 位
+以下 4 份不切分，從全部訓練局選，供 2d profile 的 Human SL 分析：
+    train-p1-v<val_size>.csv        排除 dev、封存組、train 池、val-players.csv 的 player_id，每級依 player_id 排序取第 1～100 位
+    train-p2-v<val_size>.csv        同上的第 101～200 位
+    train-p3-v<val_size>.csv        排除 val-players-v<val_size>、封存組、train-p1、train-p2，每級用 random.Random(44) 抽 100 位
+    train-p4.csv                    排除以上清單與基準切分 val 中局數至少 5 的 player_id，HD < 2 的局中同一色至少 10 局的玩家
 另外印出新增玩家與基準玩家等級分布的卡方同質性檢定。
 
 用法（在 repo 根目錄）：
@@ -17,6 +22,8 @@
 import argparse
 import csv
 import os
+import random
+import re
 
 import numpy as np
 import pandas as pd
@@ -27,6 +34,10 @@ from aicup.scoring import LEVELS
 MIN_GAMES = 20
 N_HOLDOUT = 160
 POOL_PER_LEVEL = 100
+PART_PER_LEVEL = 100
+P3_SEED = 44
+SAME_COLOR_GAMES = 10
+WIDE_MIN_GAMES = 5  # train-p4 另外排除基準切分 val 中局數至少 5 的玩家
 
 
 def eligible_players(df, val_size, min_games=MIN_GAMES):
@@ -103,6 +114,53 @@ def train_pool(df, val_size, per_level=POOL_PER_LEVEL, min_games=MIN_GAMES):
     return pd.DataFrame(rows, columns=['player_id', 'rank'])
 
 
+def game_counts(df):
+    """全部訓練局中每位玩家的局數，Series，index 為 (rank, player_id 字串)。"""
+    return df.groupby([df['rank'].astype(str), df['player_id'].astype(str)]).size()
+
+
+def first_parts(df, exclude_ids, per_level=PART_PER_LEVEL, n_parts=2, min_games=MIN_GAMES):
+    """全部訓練局中局數至少 min_games、player_id 不在 exclude_ids 的玩家，每級依 player_id 排序取前 per_level × n_parts 位，依序切成 n_parts 份。"""
+    counts = game_counts(df)
+    parts = [[] for _ in range(n_parts)]
+    for lv in LEVELS:
+        pool = sorted(p for (r, p), n in counts.items() if r == lv and n >= min_games and p not in exclude_ids)
+        if len(pool) < per_level * n_parts:
+            raise ValueError('%s 只有 %d 位' % (lv, len(pool)))
+        for i in range(n_parts):
+            parts[i] += [(p, lv) for p in pool[i * per_level:(i + 1) * per_level]]
+    return [pd.DataFrame(rows, columns=['player_id', 'rank']) for rows in parts]
+
+
+def random_part(df, exclude, seed, per_level=PART_PER_LEVEL, min_games=MIN_GAMES):
+    """全部訓練局中局數至少 min_games、(rank, player_id) 不在 exclude 的玩家，每級用 random.Random(seed) 抽 per_level 位。"""
+    counts = game_counts(df)
+    rng = random.Random(seed)
+    rows = []
+    for lv in LEVELS:
+        pool = sorted(p for (r, p), n in counts.items() if r == lv and n >= min_games and (r, p) not in exclude)
+        rows += [(p, lv) for p in sorted(rng.sample(pool, per_level))]
+    return pd.DataFrame(rows, columns=['player_id', 'rank'])
+
+
+def hd_of(sgf):
+    m = re.search(r'HD\[(\d+)\]', sgf)
+    return int(m.group(1)) if m else 0  # 沒有 HD 標記視為互先
+
+
+def same_color_players(df, exclude_ids, k=SAME_COLOR_GAMES):
+    """HD < 2 的局中，同一色至少 k 局且 player_id 不在 exclude_ids 的玩家，依 rank、player_id 排序。"""
+    ok = df[df['sgf_content'].map(hd_of) < 2]
+    cnt = ok.groupby([ok['player_id'].astype(str), ok['rank'].astype(str), ok['color']]).size().unstack(fill_value=0)
+    cnt = cnt[cnt.max(axis=1) >= k].reset_index()
+    cnt = cnt[~cnt['player_id'].isin(exclude_ids)]
+    return cnt[['player_id', 'rank']].sort_values(['rank', 'player_id']).reset_index(drop=True)
+
+
+def ids_of(*lists):
+    return set().union(*(set(x['player_id'].astype(str)) for x in lists))
+
+
 def write_players(path, players):
     with open(path, 'w', encoding='utf-8', newline='') as f:
         w = csv.writer(f, lineterminator='\n')
@@ -140,6 +198,11 @@ def main():
     pool = train_pool(df, args.val_size, args.pool_per_level, args.min_games)
     if player_set(pool) & player_set(full):
         raise SystemExit('train 池和 val 清單有交集')
+    p1, p2 = first_parts(df, ids_of(dev, hold, pool, base), min_games=args.min_games)
+    p3 = random_part(df, player_set(full) | player_set(hold) | player_set(p1) | player_set(p2), P3_SEED,
+                     min_games=args.min_games)
+    wide = eligible_players(df, args.base_size, WIDE_MIN_GAMES)
+    p4 = same_color_players(df, ids_of(base, wide, full, pool, p1, p2, p3))
 
     tag = 'v%d' % args.val_size
     lists = {
@@ -150,6 +213,10 @@ def main():
         'val-players-newdev-%s.csv' % tag: newdev,
         'val-players-dev-%s.csv' % tag: dev,
         'train-pool-%s.csv' % tag: pool,
+        'train-p1-%s.csv' % tag: p1,
+        'train-p2-%s.csv' % tag: p2,
+        'train-p3-%s.csv' % tag: p3,
+        'train-p4.csv': p4,
     }
     os.makedirs(args.out_dir, exist_ok=True)
     paths = {name: os.path.join(args.out_dir, name) for name in lists}

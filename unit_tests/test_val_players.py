@@ -2,8 +2,8 @@ import pandas as pd
 import pytest
 
 from aicup.scoring import LEVELS
-from aicup.val_players import (eligible_players, holdout_split, homogeneity, new_players, player_set, quotas,
-                               train_pool, write_players)
+from aicup.val_players import (eligible_players, first_parts, hd_of, holdout_split, homogeneity, new_players,
+                               player_set, quotas, random_part, same_color_players, train_pool, write_players)
 
 
 def _fake_df():
@@ -73,3 +73,37 @@ def test_write_players_lf(tmp_path):
     path = tmp_path / 'p.csv'
     write_players(path, pd.DataFrame({'player_id': ['a', 'b'], 'rank': ['D', '1D']}))
     assert path.read_bytes() == b'player_id,rank\na,D\nb,1D\n'
+
+
+def _all_levels_df(n_players=40):
+    return pd.DataFrame([{'player_id': 'p%02d' % p, 'game_id': 'g_%d_%d' % (p, g), 'rank': lv, 'color': 'B',
+                          'sgf_content': ''} for lv in LEVELS for p in range(n_players) for g in range(20 + p % 2)])
+
+
+def test_first_parts_sorted_slices_and_exclude():
+    a, b = first_parts(_all_levels_df(), {'p00', 'p03'}, per_level=3)
+    assert list(a.loc[a['rank'] == 'D', 'player_id']) == ['p01', 'p02', 'p04']
+    assert list(b.loc[b['rank'] == 'D', 'player_id']) == ['p05', 'p06', 'p07']
+    assert list(a['rank'].unique()) == LEVELS
+
+
+def test_random_part_seeded_and_excludes_pairs():
+    df = _all_levels_df()
+    exclude = {('D', 'p%02d' % i) for i in range(30)}
+    x = random_part(df, exclude, 44, per_level=5)
+    assert x.equals(random_part(df, exclude, 44, per_level=5))
+    d = list(x.loc[x['rank'] == 'D', 'player_id'])
+    assert d == sorted(d) and all(int(p[1:]) >= 30 for p in d)
+    assert (x.groupby('rank').size() == 5).all()
+
+
+def test_hd_of():
+    assert hd_of('(;SZ[19]HD[2]KM[0])') == 2
+    assert hd_of('(;SZ[19]KM[6.5])') == 0
+
+
+def test_same_color_players_counts_hd_below_2():
+    rows = [('a', 'D', 'B', '')] * 10 + [('b', 'D', 'B', '')] * 9 + [('b', 'D', 'W', '')] * 9         + [('c', 'D', 'W', 'HD[2]')] * 12 + [('d', '1D', 'W', 'HD[1]')] * 10 + [('e', 'A', 'B', '')] * 10
+    df = pd.DataFrame(rows, columns=['player_id', 'rank', 'color', 'sgf_content'])
+    got = same_color_players(df, {'e'}, k=10)
+    assert list(zip(got['player_id'], got['rank'])) == [('d', '1D'), ('a', 'D')]
